@@ -1,5 +1,7 @@
 #!/usr/bin/env elixir
 
+Mix.install([{:nimble_csv, "~> 1.2"}])
+
 defmodule Onboard do
   @loc_fields ~w(name city_name state district postal_code street_address building_number vat_number company_registration_number)
   @check "✅"
@@ -8,18 +10,16 @@ defmodule Onboard do
   def run(provider_id) do
     IO.puts("""
     -- Purpose: provider onboarding check (db: shedul).
-    -- Step 1: run Q1, paste output → check tax_number + company_registration_number.
-    -- Step 2: run Q2, paste output → per-location field checks + houston task suggestions.
+    -- Step 1: Q1 → check tax_number + company_registration_number.
+    -- Step 2: Q2 → per-location field checks + houston task suggestions.
     """)
 
-    print_q1(provider_id)
-    pbi_text = read_until_end("Paste Q1 output. Type END on its own line when done:")
-    pbi_rows = parse_psql(pbi_text)
+    q1_sql = q1_sql(provider_id)
+    pbi_rows = run_or_paste("Q1", q1_sql)
     show_provider(pbi_rows)
 
-    print_q2(provider_id)
-    loc_text = read_until_end("Paste Q2 output. Type END on its own line when done:")
-    loc_rows = parse_psql(loc_text)
+    q2_sql = q2_sql(provider_id)
+    loc_rows = run_or_paste("Q2", q2_sql)
 
     if loc_rows == [] do
       IO.puts("\n#{@cross} no location rows parsed")
@@ -295,20 +295,94 @@ defmodule Onboard do
     end
   end
 
-  defp print_q1(pid) do
-    IO.puts("")
-    IO.puts(IO.ANSI.format([:bright, :white, "=== Q1: provider_billing_informations ===", :reset]))
-    sql = "SELECT provider_id, tax_number, company_registration_number FROM provider_billing_informations WHERE provider_id = '#{pid}' AND valid_to IS NULL;"
-    IO.puts(IO.ANSI.format([:cyan, sql, :reset]))
-    IO.puts("")
+  defp q1_sql(pid) do
+    "SELECT provider_id, tax_number, company_registration_number FROM provider_billing_informations WHERE provider_id = '#{pid}' AND valid_to IS NULL;"
   end
 
-  defp print_q2(pid) do
+  defp q2_sql(pid) do
+    "SELECT location_id, name, city_name, state, district, postal_code, street_address, building_number, vat_number, company_registration_number FROM location_billing_details WHERE location_id IN (SELECT id FROM locations WHERE provider_id = '#{pid}');"
+  end
+
+  defp run_or_paste(label, sql) do
     IO.puts("")
-    IO.puts(IO.ANSI.format([:bright, :white, "=== Q2: location_billing_details ===", :reset]))
-    sql = "SELECT location_id, name, city_name, state, district, postal_code, street_address, building_number, vat_number, company_registration_number FROM location_billing_details WHERE location_id IN (SELECT id FROM locations WHERE provider_id = '#{pid}');"
+    IO.puts(IO.ANSI.format([:bright, :white, "=== #{label}: SQL ===", :reset]))
     IO.puts(IO.ANSI.format([:cyan, sql, :reset]))
     IO.puts("")
+
+    cmd_args = ["psql", "production", "shedul", "--", "-c", sql, "--csv"]
+    cmd_str = "houston " <> Enum.map_join(cmd_args, " ", &shell_quote/1)
+    IO.puts(IO.ANSI.format([:faint, "Will run: #{cmd_str}", :reset]))
+
+    answer =
+      case IO.gets("Run via houston psql? (y = run, anything else = paste): ") do
+        :eof -> ""
+        {:error, _} -> ""
+        line -> line |> String.trim() |> String.downcase()
+      end
+
+    if answer in ["y", "yes"] do
+      IO.puts(IO.ANSI.format([:faint, "Running...", :reset]))
+      {out, code} = System.cmd("houston", cmd_args, stderr_to_stdout: true)
+      IO.puts(IO.ANSI.format([:faint, "houston exit=#{code}", :reset]))
+
+      if code != 0 do
+        IO.puts(IO.ANSI.format([:red, out, :reset]))
+        IO.puts(IO.ANSI.format([:bright, :red, "❌ houston failed. Falling back to paste.", :reset]))
+        text = read_until_end("Paste #{label} output (psql tabular). Type END:")
+        parse_psql(text)
+      else
+        IO.puts(IO.ANSI.format([:faint, "--- raw output ---", :reset]))
+        IO.puts(out)
+        IO.puts(IO.ANSI.format([:faint, "--- end raw output ---", :reset]))
+        rows = parse_csv(out)
+        IO.puts(IO.ANSI.format([:faint, "Parsed #{length(rows)} row(s) from CSV.", :reset]))
+        rows
+      end
+    else
+      text = read_until_end("Paste #{label} output (psql tabular). Type END:")
+      parse_psql(text)
+    end
+  end
+
+  defp parse_csv(text) do
+    csv_text =
+      text
+      |> String.split("\n")
+      |> Enum.drop_while(fn line ->
+        t = String.trim(line)
+
+        t == "" or
+          Regex.match?(~r/^\d{4}\//, t) or
+          String.starts_with?(t, "correlation_id") or
+          Regex.match?(~r/^\s*correlation_id/, line)
+      end)
+      |> Enum.join("\n")
+
+    case csv_text |> String.trim() do
+      "" ->
+        []
+
+      cleaned ->
+        rows = NimbleCSV.RFC4180.parse_string(cleaned, skip_headers: false)
+
+        case rows do
+          [] ->
+            []
+
+          [headers | data] ->
+            Enum.map(data, fn vals ->
+              headers |> Enum.zip(vals) |> Map.new()
+            end)
+        end
+    end
+  end
+
+  defp shell_quote(s) do
+    if String.contains?(s, [" ", "'", "\"", ";", "(", ")", "*", "$", "`"]) do
+      "'" <> String.replace(s, "'", "'\\''") <> "'"
+    else
+      s
+    end
   end
 
   defp read_until_end(prompt) do
