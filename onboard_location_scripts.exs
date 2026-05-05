@@ -299,7 +299,7 @@ defmodule Onboard do
   end
 
   defp acp_sql(provider_id) do
-    "SELECT ac.provider_id, ac.company_registration_number AS crn, acp.is_default, 'loc_' || acp.id AS loc_acp_id, acp.plugin_status, acp.third_party_integration_status FROM account_configuration_plugins acp LEFT JOIN account_configurations ac ON ac.id = acp.account_configuration_id WHERE ac.provider_id = '#{provider_id}';"
+    "SELECT ac.provider_id, acp.branch_number AS crn, acp.is_default, 'loc_' || acp.id AS loc_acp_id, acp.plugin_status, acp.third_party_integration_status FROM account_configuration_plugins acp LEFT JOIN account_configurations ac ON ac.id = acp.account_configuration_id WHERE ac.provider_id = '#{provider_id}';"
   end
 
   defp prompt_and_poll(label, provider_id, expected_plugin, expected_third_party, target) do
