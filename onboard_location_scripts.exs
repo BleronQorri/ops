@@ -9,9 +9,13 @@ defmodule Onboard do
 
   def run(provider_id) do
     IO.puts("""
-    -- Purpose: provider onboarding check (db: shedul).
-    -- Step 1: Q1 → check tax_number + company_registration_number.
-    -- Step 2: Q2 → per-location field checks + houston task suggestions.
+    -- Purpose: provider onboarding check.
+    -- Databases:
+    --   shedul              → provider_billing_informations, location_billing_details, locations
+    --   accounting-documents → account_configuration_plugins, account_configurations (poll target)
+    -- Step 1: Q1 (shedul) → check tax_number + company_registration_number.
+    -- Step 2: Q2 (shedul) → per-location field checks + houston task suggestions.
+    -- Polling (accounting-documents) → after revoke / onboard tasks.
     """)
 
     q1_sql = q1_sql(provider_id)
@@ -55,6 +59,8 @@ defmodule Onboard do
 
       IO.puts("")
       IO.puts(IO.ANSI.format([:yellow, cmd, :reset]))
+
+      prompt_and_poll("revoke (provider #{provider_id})", provider_id, "disabled", "revoked", :default)
 
       stage_update_provider_crn(provider_id)
       stage_onboard_to_ksa(provider_id, company_name, pbi_rows, loc_rows)
@@ -107,24 +113,10 @@ defmodule Onboard do
       IO.puts("")
       IO.puts(IO.ANSI.format([:yellow, cmd, :reset]))
 
-      gate_provider_onboarded(provider_id, company_name, employee_id, pbi_rows, loc_rows)
-    end
-  end
+      prompt_and_poll("onboard provider #{provider_id}", provider_id, "enabled", "enabled", :default)
 
-  defp gate_provider_onboarded(provider_id, company_name, employee_id, pbi_rows, loc_rows) do
-    answer =
-      case IO.gets("\nProvider onboarding successful? (y/N): ") do
-        :eof -> ""
-        {:error, _} -> ""
-        line -> line |> String.trim() |> String.downcase()
-      end
-
-    if answer in ["y", "yes"] do
-      IO.puts(IO.ANSI.format([:bright, :green, "✅ Provider onboarded. Proceeding to onboard non-default locations.", :reset]))
-      stage_onboard_locations(provider_id, company_name, pbi_rows, loc_rows)
       _ = employee_id
-    else
-      IO.puts(IO.ANSI.format([:bright, :red, "❌ Provider onboarding not successful. Investigate, then re-run.", :reset]))
+      stage_onboard_locations(provider_id, company_name, pbi_rows, loc_rows)
     end
   end
 
@@ -194,6 +186,9 @@ defmodule Onboard do
             """
 
             IO.puts(IO.ANSI.format([:yellow, cmd, :reset]))
+
+            loc_crn = Map.get(row, "company_registration_number", "")
+            prompt_and_poll("onboard location #{loc_id}", provider_id, "enabled", "enabled", {:crn, loc_crn})
           end
         else
           IO.puts(IO.ANSI.format([:faint, "Skipped #{loc_id}.", :reset]))
@@ -301,6 +296,191 @@ defmodule Onboard do
 
   defp q2_sql(pid) do
     "SELECT location_id, name, city_name, state, district, postal_code, street_address, building_number, vat_number, company_registration_number FROM location_billing_details WHERE location_id IN (SELECT id FROM locations WHERE provider_id = '#{pid}');"
+  end
+
+  defp acp_sql(provider_id) do
+    "SELECT ac.provider_id, ac.company_registration_number AS crn, acp.is_default, 'loc_' || acp.id AS loc_acp_id, acp.plugin_status, acp.third_party_integration_status FROM account_configuration_plugins acp LEFT JOIN account_configurations ac ON ac.id = acp.account_configuration_id WHERE ac.provider_id = '#{provider_id}';"
+  end
+
+  defp prompt_and_poll(label, provider_id, expected_plugin, expected_third_party, target) do
+    IO.puts("")
+    IO.puts(IO.ANSI.format([:bright, :white, "=== Poll: #{label} (db: accounting-documents) ===", :reset]))
+    sql = acp_sql(provider_id)
+    IO.puts(IO.ANSI.format([:cyan, sql, :reset]))
+
+    target_label =
+      case target do
+        :default -> "row where is_default=true"
+        {:crn, c} -> "row where crn=#{c}"
+        :all -> "all rows"
+      end
+
+    IO.puts("Target: #{target_label}")
+    IO.puts("Expected: plugin_status=#{expected_plugin}, third_party_integration_status=#{expected_third_party}")
+
+    answer =
+      case IO.gets("Poll account_configuration_plugins (accounting-documents) every 20s? (y/N): ") do
+        :eof -> ""
+        {:error, _} -> ""
+        line -> line |> String.trim() |> String.downcase()
+      end
+
+    if answer in ["y", "yes"] do
+      poll_acp(provider_id, expected_plugin, expected_third_party, target, 1, 30)
+    else
+      manual_confirm(expected_plugin, expected_third_party)
+    end
+  end
+
+  defp manual_confirm(expected_plugin, expected_third_party) do
+    ans =
+      case IO.gets("Has state reached plugin=#{expected_plugin}, third_party=#{expected_third_party}? (y/N): ") do
+        :eof -> ""
+        {:error, _} -> ""
+        line -> line |> String.trim() |> String.downcase()
+      end
+
+    if ans in ["y", "yes"] do
+      IO.puts(IO.ANSI.format([:bright, :green, "✅ Confirmed manually. Proceeding.", :reset]))
+    else
+      IO.puts(IO.ANSI.format([:yellow, "⏳ Still waiting. Re-checking...", :reset]))
+      manual_confirm(expected_plugin, expected_third_party)
+    end
+  end
+
+  defp poll_acp(provider_id, expected_plugin, expected_third_party, target, attempt, max_attempts) do
+    sql = acp_sql(provider_id)
+    cmd_args = ["psql", "production", "accounting-documents", "--", "-c", sql, "--csv"]
+
+    IO.puts("")
+    IO.puts(IO.ANSI.format([:faint, "Poll ##{attempt}/#{max_attempts} — houston psql production accounting-documents...", :reset]))
+    {out, code} = System.cmd("houston", cmd_args, stderr_to_stdout: true)
+
+    if code != 0 do
+      IO.puts(IO.ANSI.format([:red, out, :reset]))
+      IO.puts(IO.ANSI.format([:bright, :red, "❌ houston failed during poll. Aborting.", :reset]))
+    else
+      rows = parse_csv(out)
+      target_rows = filter_target(rows, target)
+
+      cond do
+        rows == [] ->
+          IO.puts(IO.ANSI.format([:yellow, "⚠️  No acp rows returned.", :reset]))
+
+        target_rows == [] ->
+          IO.puts(IO.ANSI.format([:yellow, "⚠️  No row matches target. All rows:", :reset]))
+          Enum.each(rows, &print_row(&1, expected_plugin, expected_third_party))
+
+        true ->
+          Enum.each(target_rows, &print_row(&1, expected_plugin, expected_third_party))
+      end
+
+      all_match =
+        target_rows != [] and
+          Enum.all?(target_rows, &row_matches?(&1, expected_plugin, expected_third_party))
+
+      cond do
+        all_match ->
+          IO.puts(IO.ANSI.format([:bright, :green, "✅ Target row(s) reached expected state.", :reset]))
+
+        attempt >= max_attempts ->
+          IO.puts(IO.ANSI.format([:bright, :red, "❌ Max polls (#{max_attempts}) reached without match.", :reset]))
+          handle_timeout(provider_id, expected_plugin, expected_third_party, target, max_attempts)
+
+        true ->
+          case wait_or_stop(20_000) do
+            :stop ->
+              IO.puts(IO.ANSI.format([:yellow, "⏹  Polling stopped by user.", :reset]))
+
+            :continue ->
+              poll_acp(provider_id, expected_plugin, expected_third_party, target, attempt + 1, max_attempts)
+          end
+      end
+    end
+  end
+
+  defp wait_or_stop(ms) do
+    IO.puts(IO.ANSI.format([:faint, "Sleeping #{div(ms, 1000)}s... (type 'stop' + Enter to stop polling)", :reset]))
+
+    parent = self()
+
+    reader =
+      spawn(fn ->
+        case IO.gets("") do
+          :eof -> send(parent, {:input, :eof})
+          {:error, _} -> send(parent, {:input, :eof})
+          line -> send(parent, {:input, line})
+        end
+      end)
+
+    result =
+      receive do
+        {:input, :eof} ->
+          :continue
+
+        {:input, line} ->
+          cleaned = line |> to_string() |> String.trim() |> String.downcase()
+          if cleaned in ["s", "stop"], do: :stop, else: :continue
+      after
+        ms -> :continue
+      end
+
+    Process.exit(reader, :kill)
+    result
+  end
+
+  defp handle_timeout(provider_id, expected_plugin, expected_third_party, target, max_attempts) do
+    answer =
+      case IO.gets("Timeout — (r)etry / (c)ontinue / (a)bort? ") do
+        :eof -> "a"
+        {:error, _} -> "a"
+        line -> line |> String.trim() |> String.downcase()
+      end
+
+    case answer do
+      "r" ->
+        IO.puts(IO.ANSI.format([:faint, "Retrying poll...", :reset]))
+        poll_acp(provider_id, expected_plugin, expected_third_party, target, 1, max_attempts)
+
+      "c" ->
+        IO.puts(IO.ANSI.format([:yellow, "⚠️  Continuing without expected state.", :reset]))
+
+      "a" ->
+        IO.puts(IO.ANSI.format([:bright, :red, "❌ Aborting.", :reset]))
+        System.halt(1)
+
+      _ ->
+        IO.puts(IO.ANSI.format([:faint, "Unknown — treating as abort.", :reset]))
+        System.halt(1)
+    end
+  end
+
+  defp filter_target(rows, :all), do: rows
+
+  defp filter_target(rows, :default) do
+    Enum.filter(rows, fn r ->
+      String.downcase(String.trim(Map.get(r, "is_default", ""))) in ["t", "true"]
+    end)
+  end
+
+  defp filter_target(rows, {:crn, target_crn}) do
+    Enum.filter(rows, fn r ->
+      String.trim(Map.get(r, "crn", "")) == String.trim(target_crn)
+    end)
+  end
+
+  defp row_matches?(r, expected_plugin, expected_third_party) do
+    String.downcase(Map.get(r, "plugin_status", "")) == String.downcase(expected_plugin) and
+      String.downcase(Map.get(r, "third_party_integration_status", "")) == String.downcase(expected_third_party)
+  end
+
+  defp print_row(r, expected_plugin, expected_third_party) do
+    mark = if row_matches?(r, expected_plugin, expected_third_party), do: @check, else: "⏳"
+    default_marker = if String.downcase(String.trim(Map.get(r, "is_default", ""))) in ["t", "true"], do: " [DEFAULT]", else: ""
+
+    IO.puts(
+      "  #{mark} provider_id=#{Map.get(r, "provider_id", "?")} crn=#{Map.get(r, "crn", "")}#{default_marker} #{Map.get(r, "loc_acp_id", "?")} plugin=#{Map.get(r, "plugin_status", "")} third_party=#{Map.get(r, "third_party_integration_status", "")}"
+    )
   end
 
   defp run_or_paste(label, sql) do
