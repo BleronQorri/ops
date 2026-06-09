@@ -74,13 +74,12 @@ defmodule InvopopSupplierCheck do
 
     summarize(classified)
 
-    plugins_by_tax =
-      if query_db?, do: fetch_plugins(report_tax_codes(classified, problems_only?)), else: nil
+    db = if query_db?, do: build_db_context(classified), else: nil
 
-    grouped_report(classified, problems_only?, plugins_by_tax)
+    grouped_report(classified, problems_only?, db)
 
     if write_report?,
-      do: write_markdown_report(classified, problems_only?, plugins_by_tax, created_after)
+      do: write_markdown_report(classified, problems_only?, db, created_after)
   end
 
   defp print_legend(query_db?) do
@@ -100,9 +99,10 @@ defmodule InvopopSupplierCheck do
     IO.puts("    stale pending (→ok)    an older pending entry followed by a successful one")
 
     if query_db? do
-      IO.puts("  DB (plugin by tax, is_default):")
-      IO.puts("    DB ▸ …                 default plugin row (acct_config / plugin / provider / status)")
+      IO.puts("  DB (per supplier / per entry):")
+      IO.puts("    DB   …                 default plugin row for the supplier (plugin/third_party status, ids)")
       IO.puts(IO.ANSI.format([:red, "    DB #{@cross} …", :reset, "                 no default plugin row found"]))
+      IO.puts("    req=type/status        the einvoice request matching that silo entry (req=— if none)")
     end
   end
 
@@ -327,39 +327,59 @@ defmodule InvopopSupplierCheck do
     end)
   end
 
-  defp grouped_report(classified, problems_only?, plugins_by_tax) do
+  defp grouped_report(classified, problems_only?, db) do
     groups = build_groups(classified, problems_only?)
     request_count = groups |> Enum.map(fn {items, _} -> length(items) end) |> Enum.sum()
 
-    print_legend(plugins_by_tax != nil)
+    print_legend(db != nil)
 
     IO.puts("")
     title = if problems_only?, do: "Report — problematic suppliers", else: "Report — all suppliers"
-    IO.puts(IO.ANSI.format([:bright, :white, "=== #{title} (#{length(groups)} suppliers, #{request_count} requests) ===", :reset]))
+    IO.puts(IO.ANSI.format([:bright, :white, "=== #{title} (#{length(groups)} suppliers, #{request_count} entries) ===", :reset]))
 
     if groups == [] do
       IO.puts(IO.ANSI.format([:green, "  #{@check} nothing to report", :reset]))
     else
-      Enum.each(groups, fn {items, _latest} ->
+      Enum.each(groups, fn {items, _sort_key} ->
         {_c, first} = hd(items)
-        reasons = problem_reasons(items)
-        plural = if length(items) == 1, do: "", else: "s"
-        header = [:bright, :cyan, "▸ #{supplier_label(first)}  (#{length(items)} request#{plural})", :reset]
-        flag = if reasons == "", do: [], else: [:bright, :red, "  ⚠️  #{reasons}", :reset]
+        tax = supplier_fields(first).tax
 
-        IO.puts("")
-        IO.puts(IO.ANSI.format(header ++ flag))
-        print_plugins_inline(supplier_fields(first).tax, plugins_by_tax)
-        Enum.each(items, fn {class, e} -> print_entry(class, e) end)
+        print_supplier_header(first, length(items), problem_reasons(items))
+        print_db_inline(tax, db)
+        print_entries(items, db)
       end)
 
       unless problems_only?, do: IO.puts(IO.ANSI.format([:faint, "\n(pass --problems to show only problematic suppliers)", :reset]))
     end
   end
 
+  defp print_supplier_header(first, count, reasons) do
+    entries = if count == 1, do: "entry", else: "entries"
+    header = [:bright, :cyan, "▸ #{supplier_label(first)}   (#{count} #{entries})", :reset]
+    flag = if reasons == "", do: [], else: [:bright, :red, "   ⚠️  #{reasons}", :reset]
+
+    IO.puts("")
+    IO.puts(IO.ANSI.format(header ++ flag))
+  end
+
+  # Non-void entries listed individually (newest first); voids collapsed to one summary line.
+  defp print_entries(items, db) do
+    {voids, rest} = Enum.split_with(items, fn {c, _} -> c == :voided end)
+    Enum.each(rest, fn {class, e} -> print_entry(class, e, db) end)
+    print_void_summary(voids)
+  end
+
+  defp print_void_summary([]), do: :ok
+
+  defp print_void_summary(voids) do
+    dates = voids |> Enum.map(fn {_c, e} -> to_string(e["created_at"]) end) |> Enum.sort()
+    range = if hd(dates) == List.last(dates), do: short_ts(hd(dates)), else: "#{short_ts(hd(dates))} → #{short_ts(List.last(dates))}"
+    IO.puts(IO.ANSI.format([:light_black, "    #{@void} #{length(voids)} void   #{range}", :reset]))
+  end
+
   # --- Markdown report export ---
 
-  defp write_markdown_report(classified, problems_only?, plugins_by_tax, created_after) do
+  defp write_markdown_report(classified, problems_only?, db, created_after) do
     groups = build_groups(classified, problems_only?)
     counts = Enum.frequencies_by(classified, fn {c, _} -> c end)
     now = DateTime.utc_now()
@@ -373,7 +393,7 @@ defmodule InvopopSupplierCheck do
       "- Generated: #{DateTime.to_iso8601(now)} (UTC)\n",
       "- Date range: #{if created_after, do: "created_at >= #{created_after}", else: "all time"}\n",
       "- Filter: #{if problems_only?, do: "problematic suppliers only", else: "all suppliers"}\n",
-      "- DB lookup: #{if plugins_by_tax, do: "yes", else: "no"}\n",
+      "- DB lookup: #{if db, do: "yes", else: "no"}\n",
       "- Suppliers: #{length(groups)} — Requests: #{request_count}\n",
       "- Totals: ok #{Map.get(counts, :ok, 0)}, pending #{Map.get(counts, :pending, 0)}, " <>
         "error #{Map.get(counts, :error, 0)}, voided #{Map.get(counts, :voided, 0)}, " <>
@@ -383,7 +403,7 @@ defmodule InvopopSupplierCheck do
     body =
       if groups == [],
         do: ["_Nothing to report._\n"],
-        else: Enum.map(groups, fn {items, _} -> md_supplier(items, plugins_by_tax) end)
+        else: Enum.map(groups, fn {items, _} -> md_supplier(items, db) end)
 
     case File.write(path, IO.iodata_to_binary([head, body])) do
       :ok ->
@@ -395,8 +415,9 @@ defmodule InvopopSupplierCheck do
     end
   end
 
-  defp md_supplier(items, plugins_by_tax) do
+  defp md_supplier(items, db) do
     {_c, first} = hd(items)
+    tax = supplier_fields(first).tax
     reasons = problem_reasons(items)
     flag = if reasons == "", do: "", else: " — ⚠️ #{reasons}"
 
@@ -408,45 +429,54 @@ defmodule InvopopSupplierCheck do
             _ -> ""
           end
 
-        "| #{e["state"]} | #{e["created_at"]} | #{length(e["faults"] || [])} | #{e["id"]} | #{md_escape(msg)} |\n"
+        "| #{e["state"]} | #{short_ts(e["created_at"])} | #{length(e["faults"] || [])} | #{short_id(e["id"])} | #{md_request(e, db)} | #{md_escape(msg)} |\n"
       end)
 
     [
       "## #{md_escape(supplier_label(first))}#{flag}\n\n",
-      md_db(supplier_fields(first).tax, plugins_by_tax),
-      "| state | created | faults | id | first fault |\n",
-      "|---|---|---|---|---|\n",
+      md_db(tax, db),
+      "| state | created | faults | id | request | first fault |\n",
+      "|---|---|---|---|---|---|\n",
       rows,
       "\n"
     ]
   end
 
+  defp md_request(_e, nil), do: ""
+
+  defp md_request(e, %{requests_by_entry: by_entry}) do
+    case Map.get(by_entry, to_string(e["id"])) do
+      nil -> "—"
+      r -> "#{r["application_type"]}/#{r["status"]}"
+    end
+  end
+
   defp md_db(_tax, nil), do: ""
 
-  defp md_db(tax, by_tax) do
-    cond do
-      not filled?(tax) ->
-        "_DB: no tax id to look up_\n\n"
+  defp md_db(tax, db) do
+    plugin =
+      cond do
+        not filled?(tax) ->
+          "_DB: no tax id to look up_\n"
 
-      true ->
-        case Map.get(by_tax, tax) do
-          rows when rows in [nil, []] ->
-            "**DB: ❌ no default plugin row found**\n\n"
+        true ->
+          case Map.get(db.plugins, tax) do
+            rows when rows in [nil, []] ->
+              "**DB: ❌ no default plugin row found**\n"
 
-          rows ->
-            lines =
+            rows ->
               Enum.map(rows, fn r ->
-                "- DB: acct_config_id=#{Map.get(r, "account_configuration_id", "?")} " <>
+                "- DB: provider_id=#{Map.get(r, "provider_id", "?")} " <>
+                  "acct_config_id=#{Map.get(r, "account_configuration_id", "?")} " <>
                   "plugin_id=#{Map.get(r, "plugin_id", "?")} " <>
-                  "provider_id=#{Map.get(r, "provider_id", "?")} " <>
                   "country=#{Map.get(r, "country_code", "")} " <>
                   "plugin=#{Map.get(r, "plugin_status", "")} " <>
                   "third_party=#{Map.get(r, "third_party_integration_status", "")}\n"
               end)
+          end
+      end
 
-            [lines, "\n"]
-        end
-    end
+    [plugin, "\n"]
   end
 
   defp md_escape(s), do: s |> to_string() |> String.replace("|", "\\|")
@@ -550,7 +580,7 @@ defmodule InvopopSupplierCheck do
 
   defp first_filled(values), do: Enum.find(values, &filled?/1)
 
-  defp print_entry(class, e) do
+  defp print_entry(class, e, db) do
     {color, mark} =
       case class do
         :ok -> {:green, @check}
@@ -561,64 +591,108 @@ defmodule InvopopSupplierCheck do
       end
 
     faults = e["faults"] || []
-
-    flags =
-      [truthy?(e["invalid"]) && "invalid", truthy?(e["draft"]) && "draft"]
-      |> Enum.filter(& &1)
-      |> case do
-        [] -> ""
-        list -> " [#{Enum.join(list, ",")}]"
-      end
+    state = String.pad_trailing(to_string(e["state"] || "?"), 11)
+    fault_suffix = if faults == [], do: "", else: "   faults=#{length(faults)}"
 
     IO.puts(
       IO.ANSI.format([
         color,
-        "  #{mark} #{short_id(e["id"])}  state=#{e["state"] || "?"}#{flags}  faults=#{length(faults)}  key=#{e["key"]}  created=#{e["created_at"]}  upd=#{e["updated_at"]}",
+        "    #{mark} #{state} #{short_id(e["id"])}   #{short_ts(e["created_at"])}#{fault_suffix}#{request_suffix(e, db)}",
         :reset
       ])
     )
 
     # error → list every fault under the entry
     Enum.each(faults, fn f ->
-      IO.puts(IO.ANSI.format([:red, "      ↳ [#{f["provider"]}] #{f["code"]}: #{truncate(f["message"], 120)}", :reset]))
+      IO.puts(IO.ANSI.format([:red, "        ↳ [#{f["provider"]}] #{f["code"]}: #{truncate(f["message"], 120)}", :reset]))
     end)
   end
 
-  # --- Optional: look up account_configuration_plugins by tax id via houston psql ---
+  # The einvoice request whose external_correlation_id == this silo entry id, if any.
+  defp request_suffix(_e, nil), do: ""
 
-  # tax ids of the suppliers shown in the report (problematic ones if filtered)
-  defp report_tax_codes(classified, problems_only?) do
-    classified
-    |> Enum.group_by(fn {_c, e} -> supplier_key(e) end)
-    |> Enum.filter(fn {_k, items} -> not problems_only? or problematic_supplier?(items) end)
-    |> Enum.map(fn {_k, items} -> items |> hd() |> elem(1) |> supplier_fields() |> Map.get(:tax) end)
-    |> Enum.filter(&filled?/1)
-    |> Enum.uniq()
+  defp request_suffix(e, %{requests_by_entry: by_entry}) do
+    case Map.get(by_entry, to_string(e["id"])) do
+      nil -> "   req=—"
+      r -> "   req=#{r["application_type"]}/#{r["status"]}"
+    end
   end
 
-  # Runs one houston psql query for all tax codes and returns a %{tax => [rows]} map
-  # (so the report can show each supplier's plugin row inline). Returns %{} on failure.
-  defp fetch_plugins([]) do
-    IO.puts("")
-    IO.puts(IO.ANSI.format([:yellow, "No tax ids available to look up in the DB.", :reset]))
-    %{}
+  # ISO-8601 → "YYYY-MM-DD HH:MM"
+  defp short_ts(nil), do: ""
+
+  defp short_ts(ts) do
+    case ts |> to_string() |> String.split("T") do
+      [d, t] -> d <> " " <> String.slice(t, 0, 5)
+      _ -> to_string(ts)
+    end
   end
+
+  # --- DB context: default plugin per tax + the einvoice request per silo entry ---
+
+  # Builds %{plugins: %{tax=>[rows]}, requests_by_entry: %{silo_entry_id=>row}}.
+  defp build_db_context(classified) do
+    tax_codes =
+      classified
+      |> Enum.map(fn {_c, e} -> supplier_fields(e).tax end)
+      |> Enum.filter(&filled?/1)
+      |> Enum.uniq()
+
+    entry_ids =
+      classified
+      |> Enum.map(fn {_c, e} -> to_string(e["id"]) end)
+      |> Enum.filter(&(&1 != ""))
+      |> Enum.uniq()
+
+    %{
+      plugins: fetch_plugins(tax_codes),
+      requests_by_entry: fetch_requests_by_entry(entry_ids)
+    }
+  end
+
+  # Default plugin per tax: %{parent_number => [rows]}.
+  defp fetch_plugins([]), do: %{}
 
   defp fetch_plugins(tax_codes) do
-    tax_list = Enum.map_join(tax_codes, ",", & &1)
-
     sql =
-      "SELECT acp.account_configuration_id, acp.id AS plugin_id, acp.provider_id, " <>
+      "SELECT acp.account_configuration_id, acp.id AS plugin_id, ac.provider_id, " <>
         "acp.country_code, acp.parent_number, acp.plugin_status, acp.third_party_integration_status " <>
         "FROM account_configuration_plugins acp " <>
-        "WHERE acp.parent_number = ANY('{#{tax_list}}') AND acp.is_default IS TRUE " <>
+        "JOIN account_configurations ac ON ac.id = acp.account_configuration_id " <>
+        "WHERE acp.parent_number = ANY('{#{pg_array(tax_codes)}}') AND acp.is_default IS TRUE " <>
         "ORDER BY acp.parent_number;"
 
+    run_psql("Plugin lookup by tax id (#{length(tax_codes)})", sql)
+    |> Enum.group_by(fn r -> Map.get(r, "parent_number", "") end)
+  end
+
+  # The einvoice request for each silo entry, keyed by silo entry id
+  # (external_correlation_id). Latest wins if an entry has more than one.
+  defp fetch_requests_by_entry([]), do: %{}
+
+  defp fetch_requests_by_entry(entry_ids) do
+    sql =
+      "SELECT DISTINCT ON (eiar.external_correlation_id) eiar.external_correlation_id, " <>
+        "eiar.status, eiar.application_type, ac.provider_id " <>
+        "FROM einvoice_integration_application_requests eiar " <>
+        "JOIN account_configuration_plugins acp ON acp.id = eiar.account_configuration_plugin_id " <>
+        "JOIN account_configurations ac ON ac.id = acp.account_configuration_id " <>
+        "WHERE eiar.external_correlation_id = ANY('{#{pg_array(entry_ids)}}') " <>
+        "ORDER BY eiar.external_correlation_id, eiar.id DESC;"
+
+    run_psql("einvoice request per silo entry (#{length(entry_ids)})", sql)
+    |> Map.new(fn r -> {Map.get(r, "external_correlation_id", ""), r} end)
+  end
+
+  defp pg_array(values), do: Enum.map_join(values, ",", & &1)
+
+  # Show the query, run it via houston, parse the CSV. Returns [] on failure.
+  defp run_psql(label, sql) do
     cmd_args = ["psql", "production", "accounting-documents", "--", "-c", sql, "--csv"]
     cmd_str = "houston " <> Enum.map_join(cmd_args, " ", &shell_quote/1)
 
     IO.puts("")
-    IO.puts(IO.ANSI.format([:bright, :white, "=== Plugin lookup by tax id (#{length(tax_codes)}) ===", :reset]))
+    IO.puts(IO.ANSI.format([:bright, :white, "=== #{label} ===", :reset]))
     IO.puts(IO.ANSI.format([:cyan, sql, :reset]))
     IO.puts(IO.ANSI.format([:faint, "Running: #{cmd_str}", :reset]))
 
@@ -627,53 +701,47 @@ defmodule InvopopSupplierCheck do
     if code != 0 do
       IO.puts(IO.ANSI.format([:red, out, :reset]))
       IO.puts(IO.ANSI.format([:bright, :red, "#{@cross} houston failed (exit #{code}).", :reset]))
-      %{}
+      []
     else
-      out |> parse_csv() |> Enum.group_by(fn r -> Map.get(r, "parent_number", "") end)
+      parse_csv(out)
     end
   end
 
   # nil = DB lookup wasn't requested → print nothing.
-  defp print_plugins_inline(_tax, nil), do: :ok
+  defp print_db_inline(_tax, nil), do: :ok
 
-  defp print_plugins_inline(tax, by_tax) do
-    cond do
-      not filled?(tax) ->
-        IO.puts(IO.ANSI.format([:faint, "  DB —  (no tax id to look up)", :reset]))
+  defp print_db_inline(tax, db), do: print_plugin_lines(tax, db.plugins)
 
-      true ->
-        case Map.get(by_tax, tax) do
-          rows when rows in [nil, []] ->
-            IO.puts(IO.ANSI.format([:bright, :red, "  DB #{@cross} NO default plugin row found", :reset]))
+  defp print_plugin_lines(tax, _plugins) when not is_binary(tax) or tax == "",
+    do: IO.puts(IO.ANSI.format([:faint, "    DB —  (no tax id to look up)", :reset]))
 
-          rows ->
-            Enum.each(rows, &print_plugin_row/1)
-        end
+  defp print_plugin_lines(tax, plugins) do
+    case Map.get(plugins, tax) do
+      rows when rows in [nil, []] ->
+        IO.puts(IO.ANSI.format([:bright, :red, "    DB #{@cross} no default plugin row found", :reset]))
+
+      rows ->
+        Enum.each(rows, fn r ->
+          status = Map.get(r, "plugin_status", "")
+
+          color =
+            cond do
+              status == "enabled" -> :green
+              status == "pending" -> :yellow
+              status in ["failed", "disabled"] -> :red
+              true -> :faint
+            end
+
+          IO.puts(
+            IO.ANSI.format([
+              color,
+              "    DB   plugin=#{status}  third_party=#{Map.get(r, "third_party_integration_status", "")}" <>
+                "   provider=#{Map.get(r, "provider_id", "")} acct_cfg=#{Map.get(r, "account_configuration_id", "?")} plugin_id=#{Map.get(r, "plugin_id", "?")} (#{Map.get(r, "country_code", "")})",
+              :reset
+            ])
+          )
+        end)
     end
-  end
-
-  defp print_plugin_row(r) do
-    status = Map.get(r, "plugin_status", "")
-    color =
-      cond do
-        status == "enabled" -> :green
-        status == "pending" -> :yellow
-        status in ["failed", "disabled"] -> :red
-        true -> :faint
-      end
-
-    IO.puts(
-      IO.ANSI.format([
-        color,
-        "  DB ▸ acct_config_id=#{Map.get(r, "account_configuration_id", "?")} " <>
-          "plugin_id=#{Map.get(r, "plugin_id", "?")} " <>
-          "provider_id=#{Map.get(r, "provider_id", "?")} " <>
-          "country=#{Map.get(r, "country_code", "")} " <>
-          "plugin=#{status} " <>
-          "third_party=#{Map.get(r, "third_party_integration_status", "")}",
-        :reset
-      ])
-    )
   end
 
   # CSV parser for houston psql --csv output (drops the correlation_id / timestamp preamble).
