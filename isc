@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# isc — invopop_supplier_check wrapper
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+exec elixir "$DIR/invopop_supplier_check.exs" "$@"

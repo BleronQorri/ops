@@ -1,0 +1,6 @@
+# Generated reports / exports
+invopop_report_*.md
+invopop_entries_*.csv
+
+# Elixir crash dumps
+erl_crash.dump
