@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# csu — confirm_sent_uat wrapper (Comarch UAT queue unblocker)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+exec node "$DIR/confirm_sent_uat.js" "$@"
