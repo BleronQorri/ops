@@ -52,7 +52,7 @@ defmodule InvopopSupplierCheck do
     client = build_client(base_url, token)
     IO.puts(IO.ANSI.format([:faint, "Base URL: #{base_url}", :reset]))
 
-    show_workspace(client)
+    workspace = show_workspace(client)
 
     created_after = prompt_date_range()
     problems_only? = flag_problems? or prompt_problems_filter()
@@ -79,7 +79,7 @@ defmodule InvopopSupplierCheck do
     grouped_report(classified, problems_only?, db)
 
     if write_report?,
-      do: write_markdown_report(classified, problems_only?, db, created_after)
+      do: write_markdown_report(classified, problems_only?, db, created_after, workspace)
   end
 
   defp print_legend(query_db?) do
@@ -188,11 +188,15 @@ defmodule InvopopSupplierCheck do
         IO.puts("  id:      #{w["id"]}")
         IO.puts(IO.ANSI.format([:faint, "  created: #{w["created_at"]}", :reset]))
 
+        %{slug: w["slug"], name: w["name"], country: w["country"]}
+
       {:ok, %{status: s, body: body}} ->
         IO.puts(IO.ANSI.format([:yellow, "⚠️  Could not fetch workspace (HTTP #{s}): #{inspect(body)}", :reset]))
+        nil
 
       {:error, reason} ->
         IO.puts(IO.ANSI.format([:yellow, "⚠️  Could not fetch workspace: #{inspect(reason)}", :reset]))
+        nil
     end
   end
 
@@ -380,17 +384,23 @@ defmodule InvopopSupplierCheck do
 
   # --- Markdown report export ---
 
-  defp write_markdown_report(classified, problems_only?, db, created_after) do
+  defp write_markdown_report(classified, problems_only?, db, created_after, workspace) do
     groups = build_groups(classified, problems_only?)
     counts = Enum.frequencies_by(classified, fn {c, _} -> c end)
     now = DateTime.utc_now()
     stamp = now |> DateTime.to_iso8601() |> String.replace(~r/[:.]/, "-")
-    path = "invopop_report_#{stamp}.md"
+    regime = detect_regime(classified)
+    dir = Path.join(System.tmp_dir!(), "invopop_reports")
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "#{report_basename(workspace, regime)}_#{stamp}.md")
 
     request_count = groups |> Enum.map(fn {items, _} -> length(items) end) |> Enum.sum()
 
     head = [
       "# Invopop supplier report\n\n",
+      "- Workspace: #{workspace_label(workspace)}\n",
+      "- Country: #{(workspace && workspace[:country]) || "(unknown)"}\n",
+      "- Regime: #{if regime == "", do: "(undetermined)", else: regime}\n",
       "- Generated: #{DateTime.to_iso8601(now)} (UTC)\n",
       "- Date range: #{if created_after, do: "created_at >= #{created_after}", else: "all time"}\n",
       "- Filter: #{if problems_only?, do: "problematic suppliers only", else: "all suppliers"}\n",
@@ -416,6 +426,80 @@ defmodule InvopopSupplierCheck do
     end
   end
 
+  # "Name (slug)" when a name is present, else the slug, else "(unknown)".
+  defp workspace_label(nil), do: "(unknown)"
+
+  defp workspace_label(ws) do
+    cond do
+      filled?(ws[:name]) and filled?(ws[:slug]) -> "#{ws[:name]} (#{ws[:slug]})"
+      filled?(ws[:slug]) -> ws[:slug]
+      filled?(ws[:name]) -> ws[:name]
+      true -> "(unknown)"
+    end
+  end
+
+  # Filename base from the workspace + detected regime: "<slug>_<country>_<regime>"
+  # (e.g. "fresha_production_es_verifactu"), so each workspace's report is saved
+  # separately. Tokens already present in the slug are skipped so a descriptive slug
+  # like "invopop_es_verifactu_etec" isn't duplicated.
+  defp report_basename(nil, _regime), do: "invopop_report"
+
+  defp report_basename(ws, regime) do
+    slug = sanitize_token(ws[:slug])
+
+    extras =
+      [sanitize_token(ws[:country]), sanitize_token(regime)]
+      |> Enum.reject(fn t -> t == "" or (slug != "" and String.contains?(slug, t)) end)
+
+    case Enum.reject([slug | extras], &(&1 == "")) do
+      [] -> "invopop_report"
+      parts -> Enum.join(parts, "_")
+    end
+  end
+
+  # Detect the e-invoicing regime from the entries themselves (ES can be VeriFactu OR
+  # TicketBAI, so we don't assume from country). Signals: fault provider/codes
+  # (e.g. "verifactu.wait.upload", "tbai.*") and GOBL $addons ("es-verifactu-v1",
+  # "es-tbai-v1"). Returns "" when there's no signal or both appear (don't guess).
+  defp detect_regime(classified) do
+    signals = classified |> Enum.flat_map(fn {_c, e} -> regime_signals(e) end) |> Enum.uniq()
+
+    cond do
+      "verifactu" in signals and "tbai" not in signals -> "verifactu"
+      "tbai" in signals and "verifactu" not in signals -> "tbai"
+      true -> ""
+    end
+  end
+
+  defp regime_signals(e) do
+    fault_text =
+      (e["faults"] || [])
+      |> Enum.flat_map(fn f -> [to_string(f["provider"]), to_string(f["code"])] end)
+
+    data = unwrap_doc(e["data"] || %{})
+
+    addon_text =
+      case data["$addons"] || data["addons"] do
+        list when is_list(list) -> Enum.map(list, &to_string/1)
+        _ -> []
+      end
+
+    (fault_text ++ addon_text)
+    |> Enum.flat_map(fn s ->
+      s = String.downcase(s)
+
+      [
+        String.contains?(s, "verifactu") && "verifactu",
+        (String.contains?(s, "tbai") or String.contains?(s, "ticketbai")) && "tbai"
+      ]
+    end)
+    |> Enum.filter(& &1)
+  end
+
+  defp sanitize_token(v) do
+    v |> to_string() |> String.downcase() |> String.replace(~r/[^a-z0-9]+/, "_") |> String.trim("_")
+  end
+
   defp md_supplier(items, db) do
     {_c, first} = hd(items)
     tax = supplier_fields(first).tax
@@ -423,20 +507,20 @@ defmodule InvopopSupplierCheck do
     flag = if reasons == "", do: "", else: " — ⚠️ #{reasons}"
 
     rows =
-      Enum.map(items, fn {_class, e} ->
+      Enum.map(items, fn {class, e} ->
         msg =
           case e["faults"] || [] do
             [f | _] -> "#{f["provider"]}/#{f["code"]}: #{truncate(f["message"], 80)}"
             _ -> ""
           end
 
-        "| #{e["state"]} | #{short_ts(e["created_at"])} | #{length(e["faults"] || [])} | #{short_id(e["id"])} | #{md_request(e, db)} | #{md_escape(msg)} |\n"
+        "| #{class_mark(class)} #{e["state"]} | #{short_ts(e["created_at"])} | #{length(e["faults"] || [])} | #{md_escape(to_string(e["id"]))} | #{md_request(e, db)} | #{md_escape(msg)} |\n"
       end)
 
     [
       "## #{md_escape(supplier_label(first))}#{flag}\n\n",
       md_db(tax, db),
-      "| state | created | faults | id | request | first fault |\n",
+      "| state | created | faults | silo id | request | first fault |\n",
       "|---|---|---|---|---|---|\n",
       rows,
       "\n"
@@ -467,7 +551,8 @@ defmodule InvopopSupplierCheck do
 
             rows ->
               Enum.map(rows, fn r ->
-                "- DB: provider_id=#{Map.get(r, "provider_id", "?")} " <>
+                "- DB: #{status_dot(Map.get(r, "plugin_status", ""))} " <>
+                  "provider_id=#{Map.get(r, "provider_id", "?")} " <>
                   "acct_config_id=#{Map.get(r, "account_configuration_id", "?")} " <>
                   "plugin_id=#{Map.get(r, "plugin_id", "?")} " <>
                   "country=#{Map.get(r, "country_code", "")} " <>
@@ -483,8 +568,17 @@ defmodule InvopopSupplierCheck do
           ""
 
         reqs ->
-          latest = reqs |> Enum.map(&Map.get(&1, "created_at", "")) |> Enum.max()
-          "- req: #{request_breakdown_text(request_counts(reqs))} (latest #{short_ts(latest)})\n"
+          summary = "- req: #{request_breakdown_text(request_counts(reqs))}\n"
+
+          # Each request with the date/time it was made, newest first.
+          list =
+            reqs
+            |> Enum.sort_by(&Map.get(&1, "created_at", ""), :desc)
+            |> Enum.map(fn r ->
+              "  - #{status_dot(to_string(r["status"]))} #{r["application_type"]}/#{r["status"]} — #{short_ts(Map.get(r, "created_at"))}\n"
+            end)
+
+          [summary, list]
       end
 
     [plugin, requests, "\n"]
@@ -591,16 +685,24 @@ defmodule InvopopSupplierCheck do
 
   defp first_filled(values), do: Enum.find(values, &filled?/1)
 
+  # Status emoji for an entry classification — shared by the console and the markdown report.
+  defp class_mark(:ok), do: @check
+  defp class_mark(:pending), do: @wait
+  defp class_mark(:error), do: @cross
+  defp class_mark(:voided), do: @void
+  defp class_mark(_), do: "❔"
+
   defp print_entry(class, e, db) do
-    {color, mark} =
+    color =
       case class do
-        :ok -> {:green, @check}
-        :pending -> {:yellow, @wait}
-        :error -> {:red, @cross}
-        :voided -> {:light_black, @void}
-        _ -> {:faint, "?"}
+        :ok -> :green
+        :pending -> :yellow
+        :error -> :red
+        :voided -> :light_black
+        _ -> :faint
       end
 
+    mark = class_mark(class)
     faults = e["faults"] || []
     state = String.pad_trailing(to_string(e["state"] || "?"), 11)
     fault_suffix = if faults == [], do: "", else: "   faults=#{length(faults)}"
@@ -781,9 +883,19 @@ defmodule InvopopSupplierCheck do
     |> Enum.intersperse("  ")
   end
 
-  # Markdown: plain "register/approved ×2, register/rejected ×1".
+  # Markdown: emoji-dotted "🟢 register/approved ×2, 🔴 register/rejected ×1" (md has no color).
   defp request_breakdown_text(counts) do
-    Enum.map_join(counts, ", ", fn {{type, status}, n} -> "#{type}/#{status} ×#{n}" end)
+    Enum.map_join(counts, ", ", fn {{type, status}, n} -> "#{status_dot(status)} #{type}/#{status} ×#{n}" end)
+  end
+
+  # Emoji proxy for status color in markdown reports (green=ok, red=bad, yellow=in-progress).
+  defp status_dot(status) do
+    cond do
+      status in ["approved", "enabled"] -> "🟢"
+      status in ["rejected", "failed", "disabled"] -> "🔴"
+      String.contains?(status, ["waiting", "pending"]) -> "🟡"
+      true -> "⚪"
+    end
   end
 
   defp request_status_color(status) do
