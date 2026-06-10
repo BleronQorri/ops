@@ -102,7 +102,8 @@ defmodule InvopopSupplierCheck do
       IO.puts("  DB (per supplier / per entry):")
       IO.puts("    DB   …                 default plugin row for the supplier (plugin/third_party status, ids)")
       IO.puts(IO.ANSI.format([:red, "    DB #{@cross} …", :reset, "                 no default plugin row found"]))
-      IO.puts("    req=type/status        the einvoice request matching that silo entry (req=— if none)")
+      IO.puts("    req  type/status ×N     register/deregister requests for the supplier's account config")
+      IO.puts("    req=type/status        a request matching that silo entry by external_correlation_id")
     end
   end
 
@@ -476,7 +477,17 @@ defmodule InvopopSupplierCheck do
           end
       end
 
-    [plugin, "\n"]
+    requests =
+      case acct_requests(tax, db) do
+        [] ->
+          ""
+
+        reqs ->
+          latest = reqs |> Enum.map(&Map.get(&1, "created_at", "")) |> Enum.max()
+          "- req: #{request_breakdown_text(request_counts(reqs))} (latest #{short_ts(latest)})\n"
+      end
+
+    [plugin, requests, "\n"]
   end
 
   defp md_escape(s), do: s |> to_string() |> String.replace("|", "\\|")
@@ -630,7 +641,10 @@ defmodule InvopopSupplierCheck do
 
   # --- DB context: default plugin per tax + the einvoice request per silo entry ---
 
-  # Builds %{plugins: %{tax=>[rows]}, requests_by_entry: %{silo_entry_id=>row}}.
+  # Builds %{plugins: %{tax=>[rows]}, requests_by_entry: %{external_correlation_id=>row},
+  #          requests_by_acct: %{account_configuration_id=>[rows]}}.
+  # Requests are joined to suppliers by account_configuration_id (the reliable FK we get
+  # from the plugin lookup), then matched per silo entry by external_correlation_id.
   defp build_db_context(classified) do
     tax_codes =
       classified
@@ -638,15 +652,22 @@ defmodule InvopopSupplierCheck do
       |> Enum.filter(&filled?/1)
       |> Enum.uniq()
 
-    entry_ids =
-      classified
-      |> Enum.map(fn {_c, e} -> to_string(e["id"]) end)
-      |> Enum.filter(&(&1 != ""))
+    plugins = fetch_plugins(tax_codes)
+
+    acct_ids =
+      plugins
+      |> Map.values()
+      |> List.flatten()
+      |> Enum.map(&Map.get(&1, "account_configuration_id"))
+      |> Enum.filter(&filled?/1)
       |> Enum.uniq()
 
+    requests = fetch_requests_by_acct(acct_ids)
+
     %{
-      plugins: fetch_plugins(tax_codes),
-      requests_by_entry: fetch_requests_by_entry(entry_ids)
+      plugins: plugins,
+      requests_by_entry: Map.new(requests, fn r -> {Map.get(r, "external_correlation_id", ""), r} end),
+      requests_by_acct: Enum.group_by(requests, &Map.get(&1, "account_configuration_id", ""))
     }
   end
 
@@ -666,22 +687,22 @@ defmodule InvopopSupplierCheck do
     |> Enum.group_by(fn r -> Map.get(r, "parent_number", "") end)
   end
 
-  # The einvoice request for each silo entry, keyed by silo entry id
-  # (external_correlation_id). Latest wins if an entry has more than one.
-  defp fetch_requests_by_entry([]), do: %{}
+  # All einvoice requests for the suppliers' account configurations (register/deregister),
+  # newest first per account config. external_correlation_id is NOT the silo entry id in
+  # general (mostly internal numeric ids), so we join by account_configuration_id and let
+  # build_db_context match per entry by external_correlation_id where it happens to line up.
+  defp fetch_requests_by_acct([]), do: []
 
-  defp fetch_requests_by_entry(entry_ids) do
+  defp fetch_requests_by_acct(acct_ids) do
     sql =
-      "SELECT DISTINCT ON (eiar.external_correlation_id) eiar.external_correlation_id, " <>
-        "eiar.status, eiar.application_type, ac.provider_id " <>
+      "SELECT eiar.account_configuration_id, eiar.external_correlation_id, " <>
+        "eiar.application_type, eiar.status, eiar.created_at, ac.provider_id " <>
         "FROM einvoice_integration_application_requests eiar " <>
-        "JOIN account_configuration_plugins acp ON acp.id = eiar.account_configuration_plugin_id " <>
-        "JOIN account_configurations ac ON ac.id = acp.account_configuration_id " <>
-        "WHERE eiar.external_correlation_id = ANY('{#{pg_array(entry_ids)}}') " <>
-        "ORDER BY eiar.external_correlation_id, eiar.id DESC;"
+        "JOIN account_configurations ac ON ac.id = eiar.account_configuration_id " <>
+        "WHERE eiar.account_configuration_id = ANY('{#{pg_array(acct_ids)}}') " <>
+        "ORDER BY eiar.account_configuration_id, eiar.id DESC;"
 
-    run_psql("einvoice request per silo entry (#{length(entry_ids)})", sql)
-    |> Map.new(fn r -> {Map.get(r, "external_correlation_id", ""), r} end)
+    run_psql("einvoice requests by account configuration (#{length(acct_ids)})", sql)
   end
 
   defp pg_array(values), do: Enum.map_join(values, ",", & &1)
@@ -710,7 +731,69 @@ defmodule InvopopSupplierCheck do
   # nil = DB lookup wasn't requested → print nothing.
   defp print_db_inline(_tax, nil), do: :ok
 
-  defp print_db_inline(tax, db), do: print_plugin_lines(tax, db.plugins)
+  defp print_db_inline(tax, db) do
+    print_plugin_lines(tax, db.plugins)
+    print_request_summary(tax, db)
+  end
+
+  # Summarize the register/deregister requests tied to this supplier's account config(s),
+  # so they show even when no individual silo entry matches by external_correlation_id.
+  defp print_request_summary(tax, db) do
+    case acct_requests(tax, db) do
+      [] ->
+        :ok
+
+      reqs ->
+        counts = request_counts(reqs)
+        latest = reqs |> Enum.map(&Map.get(&1, "created_at", "")) |> Enum.max()
+
+        IO.puts(
+          IO.ANSI.format(
+            [:faint, "    req  ", :reset] ++
+              request_breakdown_ansi(counts) ++
+              [:faint, "   latest #{short_ts(latest)}", :reset]
+          )
+        )
+    end
+  end
+
+  # Request rows for every account configuration on this supplier's default plugin rows.
+  defp acct_requests(tax, db) do
+    (Map.get(db.plugins, tax) || [])
+    |> Enum.map(&Map.get(&1, "account_configuration_id"))
+    |> Enum.flat_map(fn id -> Map.get(db.requests_by_acct, to_string(id), []) end)
+  end
+
+  # Counts grouped by {application_type, status}, most frequent first.
+  defp request_counts(reqs) do
+    reqs
+    |> Enum.frequencies_by(fn r -> {to_string(r["application_type"]), to_string(r["status"])} end)
+    |> Enum.sort_by(fn {_k, n} -> -n end)
+  end
+
+  # Console: each "type/status ×N" segment colored by status so they're easy to tell apart
+  # (rejected → red, approved → green, waiting → yellow). Returns IO.ANSI chardata.
+  defp request_breakdown_ansi(counts) do
+    counts
+    |> Enum.map(fn {{type, status}, n} ->
+      [request_status_color(status), "#{type}/#{status} ×#{n}", :reset]
+    end)
+    |> Enum.intersperse("  ")
+  end
+
+  # Markdown: plain "register/approved ×2, register/rejected ×1".
+  defp request_breakdown_text(counts) do
+    Enum.map_join(counts, ", ", fn {{type, status}, n} -> "#{type}/#{status} ×#{n}" end)
+  end
+
+  defp request_status_color(status) do
+    cond do
+      status == "approved" -> :green
+      status == "rejected" -> :red
+      String.contains?(status, "waiting") -> :yellow
+      true -> :faint
+    end
+  end
 
   defp print_plugin_lines(tax, _plugins) when not is_binary(tax) or tax == "",
     do: IO.puts(IO.ANSI.format([:faint, "    DB —  (no tax id to look up)", :reset]))
