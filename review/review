@@ -2,59 +2,203 @@
 #
 # review — caveman-style PR review from anywhere in the terminal.
 #
-# Prompts for an Orion app, cd's into ~/desktop/repos/orion/<app>, prompts for a
-# PR (URL / number / #n), then runs Claude Code headlessly with the caveman-review
-# skill and prints the terse findings.
+# Prompts for an Orion app, cd's into ~/desktop/repos/orion/<app>, resolves a PR
+# (by number/URL, or by browsing authors who have open PRs), then runs Claude Code
+# headlessly with the caveman-review skill and prints the terse findings.
+#
+# Every interactive menu has a "← Back" entry; the top app menu has "✕ Quit".
 #
 # Usage:
-#   review                          # interactive: pick app, then enter PR
-#   review <app>                    # pick app, then prompted for PR
-#   review <app> <pr-url-or-number> # fully non-interactive
+#   review                          # pick app, then resolve a PR interactively
+#   review <app>                    # pick app, then resolve a PR interactively
+#   review <app> <pr>               # <pr> = number | #n | full PR URL
+#   review <app> <author>           # browse that author's open PRs and pick one
 #
 set -euo pipefail
 
 ORION_DIR="$HOME/desktop/repos/orion"
+BACK="← Back"
+QUIT="✕ Quit"
 
 err() { printf '%s\n' "$*" >&2; }
+
+# Is the argument a PR reference (bare number, #number, or a .../pull/<n> URL)?
+is_pr_ref() {
+  case "$1" in
+    *github.com*/pull/[0-9]*) return 0 ;;
+  esac
+  local n="${1#\#}"
+  case "$n" in
+    '' | *[!0-9]*) return 1 ;;   # empty or contains a non-digit -> not a PR number
+    *) return 0 ;;
+  esac
+}
+
+# Pick an Orion app. Sets global `app`. Returns 1 if the user chose Quit.
+choose_app() {
+  local apps=() d choice
+  while IFS= read -r d; do
+    apps+=("$(basename "$d")")
+  done < <(find "$ORION_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort)
+  [ "${#apps[@]}" -gt 0 ] || { err "No app directories under $ORION_DIR"; exit 1; }
+
+  echo "Select an app:"
+  PS3="app> "
+  select choice in "${apps[@]}" "$QUIT"; do
+    [ "${choice:-}" = "$QUIT" ] && return 1
+    if [ -n "${choice:-}" ]; then app="$choice"; return 0; fi
+    err "Pick a number from the list."
+  done
+}
+
+# Pick an author who has open PRs in the current repo (bots filtered out).
+# Sets global `author`. Returns 1 if the user chose Back.
+choose_author() {
+  author=""
+  local authors=() logins=() line cnt login pick
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    cnt="${line%% *}"        # leading count
+    login="${line#* }"       # rest is the login
+    logins+=("$login")
+    authors+=("$login ($cnt open)")
+  done < <(
+    gh pr list --state open --limit 300 --json author --jq '.[].author.login' \
+      | grep -vE '^app/|\[bot\]' \
+      | sort | uniq -c | sort -rn | sed 's/^ *//'
+  )
+
+  if [ "${#logins[@]}" -eq 0 ]; then
+    err "No authors with open PRs in this repo."
+    return 1
+  fi
+
+  echo "Authors with open PRs:" >&2
+  PS3="author> "
+  select pick in "${authors[@]}" "$BACK"; do
+    [ "${pick:-}" = "$BACK" ] && return 1
+    if [ -n "${pick:-}" ]; then author="${logins[$((REPLY - 1))]}"; return 0; fi
+    err "Pick a number from the list."
+  done
+}
+
+# List an author's open PRs in the current repo. Sets global `pr`.
+# Returns 1 if the user chose Back (or the author has no open PRs).
+pick_pr_by_author() {
+  local who="$1"
+  local nums=() labels=() num label
+  while IFS=$'\t' read -r num label; do
+    [ -n "$num" ] || continue
+    nums+=("$num")
+    labels+=("$label")
+  done < <(
+    gh pr list --author "$who" --state open --limit 100 \
+      --json number,title,createdAt \
+      --template '{{range .}}{{printf "%v\t#%v · %s · %s\n" .number .number (timefmt "2006-01-02" .createdAt) (truncate 90 .title)}}{{end}}'
+  )
+
+  if [ "${#nums[@]}" -eq 0 ]; then
+    err "No open PRs found for '${who}' in this repo."
+    return 1
+  fi
+
+  echo "Open PRs by ${who}:" >&2
+  PS3="pr> "
+  select label in "${labels[@]}" "$BACK"; do
+    [ "${label:-}" = "$BACK" ] && return 1
+    if [ -n "${label:-}" ]; then pr="${nums[$((REPLY - 1))]}"; return 0; fi
+    err "Pick a number from the list."
+  done
+}
+
+# Resolve a raw token (non-interactive): PR ref -> use directly; else treat as an
+# author handle and browse their open PRs.
+resolve_pr() {
+  local input="$1"
+  if is_pr_ref "$input"; then
+    pr="$input"
+  else
+    pick_pr_by_author "$input" || true
+  fi
+}
+
+# Interactive PR finder. Sets global `pr`. Returns 1 to go back to app selection.
+find_pr() {
+  pr=""
+  local how ans
+  while true; do
+    echo "Find a PR by:"
+    PS3="find> "
+    select how in "PR number / URL" "Author (pick from those with open PRs)" "My open PRs" "$BACK"; do
+      case "${REPLY:-}" in
+        1)
+          printf 'PR number / URL (blank to go back): '
+          read -r ans
+          [ -z "$ans" ] && break               # blank -> re-show find menu
+          resolve_pr "$ans"
+          [ -n "$pr" ] && return 0
+          break                                # backed out / nothing -> find menu
+          ;;
+        2)
+          while true; do
+            choose_author || break             # Back -> out to find menu
+            pick_pr_by_author "$author" && return 0
+            # PR-list Back -> loop, re-show author list
+          done
+          break
+          ;;
+        3)
+          pick_pr_by_author "@me" && return 0
+          break
+          ;;
+        4) return 1 ;;                          # Back -> app selection
+        *) err "Pick 1-4." ;;
+      esac
+    done
+  done
+}
 
 [ -d "$ORION_DIR" ] || { err "Orion dir not found: $ORION_DIR"; exit 1; }
 command -v claude >/dev/null || { err "claude CLI not found on PATH"; exit 1; }
 command -v gh     >/dev/null || { err "gh CLI not found on PATH"; exit 1; }
 
-# 1. Resolve the app -----------------------------------------------------------
-app="${1:-}"
+enter_app() {
+  app_dir="$ORION_DIR/$1"
+  [ -d "$app_dir" ] || { err "No such app: $app_dir"; exit 1; }
+  cd "$app_dir"
+  echo "→ $app_dir"
+}
 
-if [ -z "$app" ]; then
-  # List immediate subdirectories named like apps (skip files and dotdirs).
-  apps=()
-  while IFS= read -r d; do
-    apps+=("$(basename "$d")")
-  done < <(find "$ORION_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort)
+pr=""
+arg_app="${1:-}"
+arg_pr="${2:-}"
 
-  [ "${#apps[@]}" -gt 0 ] || { err "No app directories under $ORION_DIR"; exit 1; }
+if [ -n "$arg_pr" ]; then
+  # Non-interactive: review <app> <pr-or-author>
+  enter_app "$arg_app"
+  resolve_pr "$arg_pr"
+  [ -n "$pr" ] || { err "No PR selected."; exit 1; }
+else
+  # Interactive, with back-navigation between app -> find -> author -> PR.
+  while true; do
+    if [ -n "$arg_app" ]; then
+      app="$arg_app"
+    else
+      choose_app || exit 0
+    fi
+    enter_app "$app"
 
-  echo "Select an app:"
-  PS3="app> "
-  select choice in "${apps[@]}"; do
-    if [ -n "${choice:-}" ]; then app="$choice"; break; fi
-    err "Pick a number from the list."
+    if find_pr; then
+      break
+    fi
+    # find_pr asked to go back: if the app was fixed by arg there's nothing above.
+    [ -n "$arg_app" ] && exit 0
   done
 fi
 
-app_dir="$ORION_DIR/$app"
-[ -d "$app_dir" ] || { err "No such app: $app_dir"; exit 1; }
-cd "$app_dir"
-echo "→ $app_dir"
+echo "→ reviewing PR ${pr}"
 
-# 2. Resolve the PR ------------------------------------------------------------
-pr="${2:-}"
-if [ -z "$pr" ]; then
-  printf 'PR URL or number: '
-  read -r pr
-fi
-[ -n "$pr" ] || { err "No PR given."; exit 1; }
-
-# 3. Run the caveman review (read-only: gh + file reads) -----------------------
+# Run the caveman review (read-only: gh + file reads).
 prompt="Use the caveman-review skill to review pull request: ${pr}
 Fetch it with gh, map line numbers from the diff hunks, and output the terse
 caveman-style findings ready to paste into the PR. Do not post anything to GitHub."
