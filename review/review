@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# review — caveman-style PR review from anywhere in the terminal.
+#
+# Prompts for an Orion app, cd's into ~/desktop/repos/orion/<app>, prompts for a
+# PR (URL / number / #n), then runs Claude Code headlessly with the caveman-review
+# skill and prints the terse findings.
+#
+# Usage:
+#   review                          # interactive: pick app, then enter PR
+#   review <app>                    # pick app, then prompted for PR
+#   review <app> <pr-url-or-number> # fully non-interactive
+#
+set -euo pipefail
+
+ORION_DIR="$HOME/desktop/repos/orion"
+
+err() { printf '%s\n' "$*" >&2; }
+
+[ -d "$ORION_DIR" ] || { err "Orion dir not found: $ORION_DIR"; exit 1; }
+command -v claude >/dev/null || { err "claude CLI not found on PATH"; exit 1; }
+command -v gh     >/dev/null || { err "gh CLI not found on PATH"; exit 1; }
+
+# 1. Resolve the app -----------------------------------------------------------
+app="${1:-}"
+
+if [ -z "$app" ]; then
+  # List immediate subdirectories named like apps (skip files and dotdirs).
+  apps=()
+  while IFS= read -r d; do
+    apps+=("$(basename "$d")")
+  done < <(find "$ORION_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort)
+
+  [ "${#apps[@]}" -gt 0 ] || { err "No app directories under $ORION_DIR"; exit 1; }
+
+  echo "Select an app:"
+  PS3="app> "
+  select choice in "${apps[@]}"; do
+    if [ -n "${choice:-}" ]; then app="$choice"; break; fi
+    err "Pick a number from the list."
+  done
+fi
+
+app_dir="$ORION_DIR/$app"
+[ -d "$app_dir" ] || { err "No such app: $app_dir"; exit 1; }
+cd "$app_dir"
+echo "→ $app_dir"
+
+# 2. Resolve the PR ------------------------------------------------------------
+pr="${2:-}"
+if [ -z "$pr" ]; then
+  printf 'PR URL or number: '
+  read -r pr
+fi
+[ -n "$pr" ] || { err "No PR given."; exit 1; }
+
+# 3. Run the caveman review (read-only: gh + file reads) -----------------------
+prompt="Use the caveman-review skill to review pull request: ${pr}
+Fetch it with gh, map line numbers from the diff hunks, and output the terse
+caveman-style findings ready to paste into the PR. Do not post anything to GitHub."
+
+exec claude -p "$prompt" \
+  --allowedTools "Bash(gh:*) Bash(find:*) Read Grep Glob"
