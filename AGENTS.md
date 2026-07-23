@@ -18,7 +18,6 @@ top-of-file comment with the details.
 | [invopop_supplier_check](invopop_supplier_check/) | `isc` | `isc` | prod (read) | List Invopop "suppliers" silo entries, diagnose ones in problem states. Optional provider cross-ref via psql. Read-only. |
 | [onboard_location_scripts](onboard_location_scripts/) | `ols` | `ols <provider_id>` | prod (read) | Provider onboarding check across `shedul` + `accounting-documents` DBs; suggests the Houston onboarding tasks to run. Read-only + polling. |
 | [confirm_sent_uat](confirm_sent_uat/) | `csu` | `csu` | UAT | Process Comarch UAT queue — confirm-sent for invoice / onboarding queues via the edoc-online UAT REST API. |
-| [deploy](deploy/) | `dep`* | `dep <branch> [namespace]` | staging/**prod** | Thin wrapper over `houston x deploy` for accounting-documents. Defaults app name; `-n` = skiff render dry-run. |
 
 \* wrapper exists but no `~/.zshrc` alias yet — run via `./<wrapper>` from the
 dir, or add an alias (see below).
@@ -26,7 +25,7 @@ dir, or add an alias (see below).
 ## Danger tiers
 
 - **Read-only:** `isc`, `ols` (plus any `--dry-run` / `preview` path).
-- **Prod writes (gated, reversible-ish):** `pms`, `ri`, `dep production`.
+- **Prod writes (gated, reversible-ish):** `pms`, `ri`.
 - **Sandbox / external:** `ds` (Invopop sandbox), `csu` (Comarch UAT).
 
 ## Prereqs (most scripts)
@@ -34,8 +33,9 @@ dir, or add an alias (see below).
 - **VPN up** + `houston` authenticated. Prod DB reads use the
   `fresha-production-developer` profile; some writes need a stronger role
   (e.g. `pms` uploads to S3 with `fresha-production-team-orion`).
-- Language runtimes are pinned via `.tool-versions` (asdf). Elixir scripts
-  auto-install deps via `Mix.install`; Node scripts are dependency-free.
+- Language runtimes are pinned via `.tool-versions` (asdf). Elixir scripts that
+  need deps auto-install them via `Mix.install` (e.g. `Req`); `pms` and the Node
+  scripts are dependency-free.
 
 ## Aliases (`~/.zshrc`)
 
@@ -49,10 +49,10 @@ alias isc='cd .../scripts/invopop_supplier_check && elixir invopop_supplier_chec
 alias force_retry_invoices='cd .../scripts/retry_invoices && node retry_invoices.js'
 ```
 
-To add a wrapper that has none (e.g. `dep`, `ds`):
+To add a wrapper that has none (e.g. `ds`):
 
 ```sh
-alias dep='.../scripts/deploy/dep'
+alias ds='.../scripts/deregister_suppliers/ds'
 ```
 
 ## Adding a new script
