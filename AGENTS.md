@@ -1,62 +1,65 @@
 # scripts — operational toolbox
 
 Ad-hoc operational scripts for Orion (accounting-documents / e-invoicing and
-friends). Each lives in its own directory with a wrapper you can run directly;
-most also have a short shell alias in `~/.zshrc`.
+friends). Scripts are grouped by the environment they act on:
 
-**How to recall a script:** skim the table, run the alias (or `./<wrapper> -h`
-for full help). Every script's own directory has an `AGENTS.md`/`README.md` or a
-top-of-file comment with the details.
+- **[production/](production/)** — touch real production data (writes or reads).
+- **[staging/](staging/)** — non-prod: Invopop sandbox + Comarch UAT.
 
-## Quick index
+Each script is a single executable file (`.exs` or `.js`) in its own directory
+alongside an `AGENTS.md` explaining it. Run the file directly — there are no
+wrappers.
 
-| Script | Alias | Run | Env | What it does |
-|--------|-------|-----|-----|--------------|
-| [process_missing_sales](process_missing_sales/) | `pms` | `pms <provider_id> <sale_ids>` | **prod** | Export sales to CSV → upload to S3 → run `process_missing_sales_events` task to backfill invoices/credit notes. Step-gated. Skips sales that already have a document. |
-| [retry_invoices](retry_invoices/) | `ri`, `force_retry_invoices` | `ri <tracker_ids>` | **prod** | Re-drive stuck KSA e-invoices: flip tracker statuses to retry-eligible, then force-retry sending via Houston tasks. |
-| [deregister_suppliers](deregister_suppliers/) | `ds` | `ds [--dry-run]` | sandbox | Fire Invopop supplier-deregistration workflow — one Transform job per supplier in a workspace. Refuses non-sandbox tokens. |
-| [invopop_supplier_check](invopop_supplier_check/) | `isc` | `isc` | prod (read) | List Invopop "suppliers" silo entries, diagnose ones in problem states. Optional provider cross-ref via psql. Read-only. |
-| [onboard_location_scripts](onboard_location_scripts/) | `ols` | `ols <provider_id>` | prod (read) | Provider onboarding check across `shedul` + `accounting-documents` DBs; suggests the Houston onboarding tasks to run. Read-only + polling. |
-| [confirm_sent_uat](confirm_sent_uat/) | `csu` | `csu` | UAT | Process Comarch UAT queue — confirm-sent for invoice / onboarding queues via the edoc-online UAT REST API. |
+**How to recall a script:** skim the tables, then run `./<script> --help` or read
+the script's own `AGENTS.md`.
 
-\* wrapper exists but no `~/.zshrc` alias yet — run via `./<wrapper>` from the
-dir, or add an alias (see below).
+## production/
+
+| Script | Run | Access | What it does |
+|--------|-----|--------|--------------|
+| [process_missing_sales](production/process_missing_sales/) | `./process_missing_sales.exs <provider_id> <sale_ids>` | **write** | Export sales to CSV → upload to S3 → run `process_missing_sales_events` task to backfill invoices/credit notes. Step-gated. Skips sales that already have a document. |
+| [retry_invoices](production/retry_invoices/) | `./retry_invoices.js <tracker_ids>` | **write** | Re-drive stuck KSA e-invoices: flip tracker statuses to retry-eligible, then force-retry sending via Houston tasks. |
+| [invopop_supplier_check](production/invopop_supplier_check/) | `./invopop_supplier_check.exs` | read-only | List Invopop "suppliers" silo entries, diagnose ones in problem states. Optional provider cross-ref via psql. |
+| [onboard_location_scripts](production/onboard_location_scripts/) | `./onboard_location_scripts.exs <provider_id>` | read + poll | Provider onboarding check across `shedul` + `accounting-documents` DBs; suggests the Houston onboarding tasks to run. |
+
+## staging/
+
+| Script | Run | Env | What it does |
+|--------|-----|-----|--------------|
+| [deregister_suppliers](staging/deregister_suppliers/) | `./deregister_suppliers.exs [--dry-run]` | Invopop sandbox | Fire Invopop supplier-deregistration workflow — one Transform job per supplier in a workspace. Refuses non-sandbox tokens. |
+| [confirm_sent_uat](staging/confirm_sent_uat/) | `./confirm_sent_uat.js` | Comarch UAT | Process Comarch UAT queue — confirm-sent for invoice / onboarding queues via the edoc-online UAT REST API. |
 
 ## Danger tiers
 
-- **Read-only:** `isc`, `ols` (plus any `--dry-run` / `preview` path).
-- **Prod writes (gated, reversible-ish):** `pms`, `ri`.
-- **Sandbox / external:** `ds` (Invopop sandbox), `csu` (Comarch UAT).
+- **Read-only:** `invopop_supplier_check`, `onboard_location_scripts` (plus any `--dry-run` path).
+- **Prod writes (gated, reversible-ish):** `process_missing_sales`, `retry_invoices`.
+- **Sandbox / external:** `deregister_suppliers` (Invopop sandbox), `confirm_sent_uat` (Comarch UAT).
 
 ## Prereqs (most scripts)
 
 - **VPN up** + `houston` authenticated. Prod DB reads use the
   `fresha-production-developer` profile; some writes need a stronger role
-  (e.g. `pms` uploads to S3 with `fresha-production-team-orion`).
+  (e.g. `process_missing_sales` uploads to S3 with `fresha-production-team-orion`).
 - Language runtimes are pinned via `.tool-versions` (asdf). Elixir scripts that
-  need deps auto-install them via `Mix.install` (e.g. `Req`); `pms` and the Node
-  scripts are dependency-free.
+  need deps auto-install them via `Mix.install` (e.g. `Req`);
+  `process_missing_sales` and the Node scripts are dependency-free.
 
-## Aliases (`~/.zshrc`)
+## Aliases (`~/.zshrc`, optional)
 
-Existing:
-
-```sh
-alias pms='cd .../scripts/process_missing_sales && ./pms'
-alias ols='cd .../scripts/onboard_location_scripts && elixir onboard_location_scripts.exs'
-alias csu='cd .../scripts/confirm_sent_uat && node confirm_sent_uat.js'
-alias isc='cd .../scripts/invopop_supplier_check && elixir invopop_supplier_check.exs'
-alias force_retry_invoices='cd .../scripts/retry_invoices && node retry_invoices.js'
-```
-
-To add a wrapper that has none (e.g. `ds`):
+Scripts run directly, but short aliases are convenient:
 
 ```sh
-alias ds='.../scripts/deregister_suppliers/ds'
+alias pms='.../scripts/production/process_missing_sales/process_missing_sales.exs'
+alias ri='.../scripts/production/retry_invoices/retry_invoices.js'
+alias isc='.../scripts/production/invopop_supplier_check/invopop_supplier_check.exs'
+alias ols='.../scripts/production/onboard_location_scripts/onboard_location_scripts.exs'
+alias ds='.../scripts/staging/deregister_suppliers/deregister_suppliers.exs'
+alias csu='.../scripts/staging/confirm_sent_uat/confirm_sent_uat.js'
 ```
 
 ## Adding a new script
 
-Follow the pattern: one directory, a main script + a symlink-safe `bash`
-wrapper (see `process_missing_sales/pms`), a directory `AGENTS.md`, then a row
-in the table above and an alias in `~/.zshrc`.
+Follow the pattern: pick `production/` or `staging/`, one directory per script,
+a single executable entrypoint (`.exs` with `#!/usr/bin/env elixir`, or `.js`
+with `#!/usr/bin/env node`), and a directory `AGENTS.md`. Then add a row to the
+right table above.

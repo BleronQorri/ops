@@ -27,10 +27,10 @@ token points at a **sandbox** workspace. The script **refuses to run unless
 cd scripts/deregister_suppliers
 
 # 1. Dry run first — walks the whole flow but POSTs nothing:
-INVOPOP_API_TOKEN=<staging-token> ./ds --dry-run
+INVOPOP_API_TOKEN=<staging-token> ./deregister_suppliers.exs --dry-run
 
 # 2. Real run — same flow + a final "yes" gate before firing:
-INVOPOP_API_TOKEN=<staging-token> ./ds
+INVOPOP_API_TOKEN=<staging-token> ./deregister_suppliers.exs
 ```
 
 No token set? It prompts you to paste one. Or `export INVOPOP_API_TOKEN=...` once for the session.

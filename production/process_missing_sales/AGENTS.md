@@ -40,16 +40,16 @@ in prod).
 cd scripts/process_missing_sales
 
 # Interactive — prompts for provider_id, sale ids:
-./pms
+./process_missing_sales.exs
 
 # Full run (args on the CLI, prompts before each step):
-./pms 646845 123,456,789
+./process_missing_sales.exs 646845 123,456,789
 
 # Generate + upload CSV, print the task command, but don't run it:
-./pms 646845 123,456 --dry-run
+./process_missing_sales.exs 646845 123,456 --dry-run
 
 # Just build the CSV locally (no S3, no task); keeps + prints the path:
-./pms 646845 123,456 --skip-upload
+./process_missing_sales.exs 646845 123,456 --skip-upload
 ```
 
 ## Flags
