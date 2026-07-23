@@ -136,6 +136,17 @@ defmodule InvopopSupplierCheck do
   end
 
   defp prompt_db_lookup do
+    IO.puts(
+      IO.ANSI.format([
+        :yellow,
+        "\n⚠️  The DB cross-reference queries account_configurations / " <>
+          "account_configuration_plugins keyed on account_configuration_id — the " <>
+          "pre-Billing-Profiles schema. It will return nothing / drift once the " <>
+          "Billing Profiles migration lands. The Invopop API check above is unaffected.",
+        :reset
+      ])
+    )
+
     ans = prompt_value("Also look up plugin statuses in the DB (houston psql)? (y/N): ") |> String.downcase()
     ans in ["y", "yes"]
   end
@@ -782,7 +793,7 @@ defmodule InvopopSupplierCheck do
         "acp.country_code, acp.parent_number, acp.plugin_status, acp.third_party_integration_status " <>
         "FROM account_configuration_plugins acp " <>
         "JOIN account_configurations ac ON ac.id = acp.account_configuration_id " <>
-        "WHERE acp.parent_number = ANY('{#{pg_array(tax_codes)}}') AND acp.is_default IS TRUE " <>
+        "WHERE acp.parent_number = ANY(#{pg_array_literal(tax_codes)}) AND acp.is_default IS TRUE " <>
         "ORDER BY acp.parent_number;"
 
     run_psql("Plugin lookup by tax id (#{length(tax_codes)})", sql)
@@ -801,13 +812,31 @@ defmodule InvopopSupplierCheck do
         "eiar.application_type, eiar.status, eiar.created_at, ac.provider_id " <>
         "FROM einvoice_integration_application_requests eiar " <>
         "JOIN account_configurations ac ON ac.id = eiar.account_configuration_id " <>
-        "WHERE eiar.account_configuration_id = ANY('{#{pg_array(acct_ids)}}') " <>
+        "WHERE eiar.account_configuration_id = ANY(#{pg_array_literal(acct_ids)}) " <>
         "ORDER BY eiar.account_configuration_id, eiar.id DESC;"
 
     run_psql("einvoice requests by account configuration (#{length(acct_ids)})", sql)
   end
 
-  defp pg_array(values), do: Enum.map_join(values, ",", & &1)
+  # Build a safe Postgres array literal (e.g. '{"a","b"}') from untrusted values
+  # (tax codes come straight from the Invopop API). Each element is double-quoted
+  # with " and \ escaped so commas/braces/quotes can't break the array; the whole
+  # literal is single-quoted with ' doubled so nothing can break out of the SQL
+  # string. Left untyped so Postgres casts it to the column's type (int/text).
+  defp pg_array_literal(values) do
+    inner =
+      Enum.map_join(values, ",", fn v ->
+        escaped =
+          v
+          |> to_string()
+          |> String.replace("\\", "\\\\")
+          |> String.replace("\"", "\\\"")
+
+        "\"" <> escaped <> "\""
+      end)
+
+    "'" <> String.replace("{" <> inner <> "}", "'", "''") <> "'"
+  end
 
   # Show the query, run it via houston, parse the CSV. Returns [] on failure.
   defp run_psql(label, sql) do
