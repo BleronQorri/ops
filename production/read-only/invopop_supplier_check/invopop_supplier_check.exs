@@ -2,6 +2,44 @@
 
 Mix.install([{:req, "~> 0.5"}, {:nimble_csv, "~> 1.2"}])
 
+defmodule Dotenv do
+  @moduledoc false
+  # Load KEY=VALUE pairs from the repo-root `.env` into the environment, without
+  # overriding anything already set (real env wins). Repo root = nearest ancestor
+  # dir containing `.env.example`. Silent no-op if there's no `.env`.
+
+  def load do
+    with root when is_binary(root) <- find_root(Path.dirname(__ENV__.file)),
+         path = Path.join(root, ".env"),
+         true <- File.exists?(path) do
+      path |> File.stream!() |> Enum.each(&put_line/1)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp put_line(line) do
+    line = String.trim(line)
+
+    with false <- line == "" or String.starts_with?(line, "#"),
+         [k, v] <- String.split(line, "=", parts: 2) do
+      key = String.trim(k)
+      val = v |> String.trim() |> String.trim("\"") |> String.trim("'")
+      if System.get_env(key) in [nil, ""], do: System.put_env(key, val)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp find_root(dir) do
+    cond do
+      File.exists?(Path.join(dir, ".env.example")) -> dir
+      Path.dirname(dir) == dir -> nil
+      true -> find_root(Path.dirname(dir))
+    end
+  end
+end
+
 defmodule InvopopSupplierCheck do
   @moduledoc false
   # -- Purpose: list Invopop "suppliers" silo entries and diagnose ones in problem states.
@@ -34,6 +72,8 @@ defmodule InvopopSupplierCheck do
   @token_env "INVOPOP_API_TOKEN"
 
   def run(argv) do
+    Dotenv.load()
+
     flag_problems? = "--problems" in argv
     flag_report? = "--report" in argv
     debug? = "--debug" in argv

@@ -2,12 +2,50 @@
 
 Mix.install([{:req, "~> 0.5"}])
 
+defmodule Dotenv do
+  @moduledoc false
+  # Load KEY=VALUE pairs from the repo-root `.env` into the environment, without
+  # overriding anything already set (real env wins). Repo root = nearest ancestor
+  # dir containing `.env.example`. Silent no-op if there's no `.env`.
+
+  def load do
+    with root when is_binary(root) <- find_root(Path.dirname(__ENV__.file)),
+         path = Path.join(root, ".env"),
+         true <- File.exists?(path) do
+      path |> File.stream!() |> Enum.each(&put_line/1)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp put_line(line) do
+    line = String.trim(line)
+
+    with false <- line == "" or String.starts_with?(line, "#"),
+         [k, v] <- String.split(line, "=", parts: 2) do
+      key = String.trim(k)
+      val = v |> String.trim() |> String.trim("\"") |> String.trim("'")
+      if System.get_env(key) in [nil, ""], do: System.put_env(key, val)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp find_root(dir) do
+    cond do
+      File.exists?(Path.join(dir, ".env.example")) -> dir
+      Path.dirname(dir) == dir -> nil
+      true -> find_root(Path.dirname(dir))
+    end
+  end
+end
+
 defmodule DeregisterSuppliers do
   @moduledoc false
   # -- Purpose: trigger the Invopop "supplier deregistration" workflow for every supplier
   # --          in a workspace (one Transform job per supplier).
   # -- Transport: Invopop REST API (https://api.invopop.com) via Req. No houston needed.
-  # -- Auth: Bearer token from INVOPOP_API_TOKEN, else paste prompt. The token itself
+  # -- Auth: Bearer token from INVOPOP_SANDBOX_API_TOKEN, else paste prompt. The token itself
   # --       determines which integration/workspace (ES VeriFactu, ES TicketBAI, IT
   # --       SmartReceipts, ...) we act on.
   # --
@@ -28,31 +66,42 @@ defmodule DeregisterSuppliers do
   @default_base_url "https://api.invopop.com"
   @suppliers_folder "suppliers"
   @page_limit 100
-  @token_env "INVOPOP_API_TOKEN"
+  # Staging-specific vars: this script REQUIRES a sandbox workspace, so its token
+  # is kept separate from the production INVOPOP_API_TOKEN used by read-only tools.
+  @token_env "INVOPOP_SANDBOX_API_TOKEN"
+  @base_url_env "INVOPOP_SANDBOX_API_BASE_URL"
 
   # Small delay between job POSTs so we don't hammer the API on large workspaces.
   @job_delay_ms 200
 
-  # Known STAGING deregister workflow IDs, taken from
-  # app-accounting-documents/deploy/apps/staging/values.yaml
+  # STAGING deregister workflows: the STRUCTURE (name + env var) lives here; the
+  # UUID VALUES live in the repo-root .env (see .env.example), sourced originally
+  # from app-accounting-documents/deploy/apps/staging/values.yaml
   # (INVOPOP_ES_CONFIG / INVOPOP_IT_CONFIG -> <authority>.deregister).
-  # These are sandbox-workspace-specific; the token you use must belong to the matching workspace.
-  # DRIFT WARNING: these are a hardcoded COPY of values.yaml — not validated at
-  # runtime. If the workflows are re-created/renamed in Invopop, these IDs go
-  # stale and a job can be POSTed against a non-existent/wrong workflow. If a
-  # deregister run stops working, re-copy the current IDs from values.yaml, or
-  # pass the right one with --workflow-id.
-  @staging_deregister_workflows [
-    {"ES VeriFactu", "9a5ecade-0e0a-49b0-a847-dfcef78d9d62"},
-    {"ES TicketBAI", "7c72c919-052c-4964-9ffe-e33caa0c56be"},
-    {"IT SmartReceipts", "a97ef713-764d-4e4e-9b3f-2e1139cde719"}
+  # They are sandbox-workspace-specific; the token you use must belong to the
+  # matching workspace. Not validated at runtime — if a workflow is re-created or
+  # renamed in Invopop, refresh the value in .env (or pass --workflow-id).
+  @workflow_specs [
+    {"ES VeriFactu", "INVOPOP_DEREGISTER_WORKFLOW_ES_VERIFACTU"},
+    {"ES TicketBAI", "INVOPOP_DEREGISTER_WORKFLOW_ES_TICKETBAI"},
+    {"IT SmartReceipts", "INVOPOP_DEREGISTER_WORKFLOW_IT_SMARTRECEIPTS"}
   ]
+
+  # Runtime list of {name, uuid} from env (.env is auto-loaded). Entries whose
+  # env var is unset are dropped — pass --workflow-id to use one not listed.
+  defp staging_deregister_workflows do
+    @workflow_specs
+    |> Enum.map(fn {name, key} -> {name, System.get_env(key)} end)
+    |> Enum.reject(fn {_name, id} -> id in [nil, ""] end)
+  end
 
   # Silo states that mean the supplier is already gone — skipped unless --include-void.
   @voided_states ~w(void voided cancelled canceled deregistered)
 
   def run(argv) do
     if "--help" in argv or "-h" in argv, do: (usage(); System.halt(0))
+
+    Dotenv.load()
 
     opts = %{
       dry_run?: "--dry-run" in argv,
@@ -70,7 +119,7 @@ defmodule DeregisterSuppliers do
     IO.puts(hl("=== Invopop supplier deregistration ==="))
     if opts.dry_run?, do: IO.puts(IO.ANSI.format([:bright, :yellow, "[DRY RUN] no jobs will be created", :reset]))
 
-    base_url = System.get_env("INVOPOP_API_BASE_URL") || @default_base_url
+    base_url = System.get_env(@base_url_env) || @default_base_url
     token = resolve_token()
 
     unless filled?(token) do
@@ -303,7 +352,7 @@ defmodule DeregisterSuppliers do
     IO.puts("")
     IO.puts(hl("=== Deregistration workflow (staging) ==="))
 
-    @staging_deregister_workflows
+    staging_deregister_workflows()
     |> Enum.with_index(1)
     |> Enum.each(fn {{name, id}, i} ->
       tag = if i == suggested, do: IO.ANSI.format([:green, "  ← suggested for country=#{workspace.country}", :reset]), else: ""
@@ -311,7 +360,7 @@ defmodule DeregisterSuppliers do
     end)
 
     default_hint = if suggested, do: " [default #{suggested}]", else: ""
-    raw = prompt_value("Select workflow (1-#{length(@staging_deregister_workflows)})#{default_hint}, or paste a UUID: ") |> String.trim()
+    raw = prompt_value("Select workflow (1-#{length(staging_deregister_workflows())})#{default_hint}, or paste a UUID: ") |> String.trim()
 
     resolve_workflow_choice(raw, suggested)
   end
@@ -324,7 +373,7 @@ defmodule DeregisterSuppliers do
       raw =~ ~r/^\d+$/ ->
         idx = String.to_integer(raw)
 
-        if idx >= 1 and idx <= length(@staging_deregister_workflows),
+        if idx >= 1 and idx <= length(staging_deregister_workflows()),
           do: nth_workflow(idx),
           else: (IO.puts(err("Invalid selection.")); System.halt(1))
 
@@ -339,16 +388,27 @@ defmodule DeregisterSuppliers do
   end
 
   defp nth_workflow(idx) do
-    {_name, id} = Enum.at(@staging_deregister_workflows, idx - 1)
+    {_name, id} = Enum.at(staging_deregister_workflows(), idx - 1)
     id
   end
 
   # Suggest a workflow index from the workspace country. ES is ambiguous (VeriFactu vs
-  # TicketBAI) so we suggest VeriFactu (index 1) but leave the choice to the user.
+  # TicketBAI) so we suggest VeriFactu but leave the choice to the user. Resolved by
+  # NAME against the runtime list so it stays correct even if some workflows are
+  # unset (and the list is shorter).
   defp suggest_index(%{country: country}) do
-    case country |> to_string() |> String.upcase() do
-      "ES" -> 1
-      "IT" -> 3
+    name =
+      case country |> to_string() |> String.upcase() do
+        "ES" -> "ES VeriFactu"
+        "IT" -> "IT SmartReceipts"
+        _ -> nil
+      end
+
+    with true <- is_binary(name),
+         i when is_integer(i) <-
+           Enum.find_index(staging_deregister_workflows(), fn {n, _id} -> n == name end) do
+      i + 1
+    else
       _ -> nil
     end
   end
@@ -494,7 +554,7 @@ defmodule DeregisterSuppliers do
 
     Auth / target:
       Token comes from $#{@token_env} (else you're prompted). The token decides the
-      workspace. Base URL from $INVOPOP_API_BASE_URL (default #{@default_base_url}).
+      workspace. Base URL from $#{@base_url_env} (default #{@default_base_url}).
       REFUSES to run unless the workspace is a sandbox (staging).
 
     Flags:

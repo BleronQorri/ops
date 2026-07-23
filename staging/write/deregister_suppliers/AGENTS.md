@@ -27,13 +27,13 @@ token points at a **sandbox** workspace. The script **refuses to run unless
 cd scripts/deregister_suppliers
 
 # 1. Dry run first — walks the whole flow but POSTs nothing:
-INVOPOP_API_TOKEN=<staging-token> ./deregister_suppliers.exs --dry-run
+INVOPOP_SANDBOX_API_TOKEN=<staging-token> ./deregister_suppliers.exs --dry-run
 
 # 2. Real run — same flow + a final "yes" gate before firing:
-INVOPOP_API_TOKEN=<staging-token> ./deregister_suppliers.exs
+INVOPOP_SANDBOX_API_TOKEN=<staging-token> ./deregister_suppliers.exs
 ```
 
-No token set? It prompts you to paste one. Or `export INVOPOP_API_TOKEN=...` once for the session.
+No token set? It prompts you to paste one. Or `export INVOPOP_SANDBOX_API_TOKEN=...` once for the session.
 
 ## Interactive prompts
 
@@ -53,23 +53,25 @@ No token set? It prompts you to paste one. Or `export INVOPOP_API_TOKEN=...` onc
 | `--workflow-id UUID` | Override the workflow id (see caveat below). |
 | `-h`, `--help` | Full help. |
 
-Env: `INVOPOP_API_TOKEN` (required), `INVOPOP_API_BASE_URL` (default `https://api.invopop.com`).
+## Config (repo-root `.env`)
 
-## Known staging deregister workflow IDs
+All values are read from the repo-root `.env` (auto-loaded; copy from `.env.example`).
+Anything already in your shell env overrides `.env`.
 
-From `app-accounting-documents/deploy/apps/staging/values.yaml`
-(`INVOPOP_ES_CONFIG` / `INVOPOP_IT_CONFIG` → `<authority>.deregister`):
+| Var | Purpose |
+|-----|---------|
+| `INVOPOP_SANDBOX_API_TOKEN` | **Required** sandbox Bearer token (or you're prompted). |
+| `INVOPOP_SANDBOX_API_BASE_URL` | Optional, default `https://api.invopop.com`. |
+| `INVOPOP_DEREGISTER_WORKFLOW_ES_VERIFACTU` | Workflow UUID (staging). |
+| `INVOPOP_DEREGISTER_WORKFLOW_ES_TICKETBAI` | Workflow UUID (staging). |
+| `INVOPOP_DEREGISTER_WORKFLOW_IT_SMARTRECEIPTS` | Workflow UUID (staging). |
 
-| Integration | Workflow ID |
-|-------------|-------------|
-| ES VeriFactu | `9a5ecade-0e0a-49b0-a847-dfcef78d9d62` |
-| ES TicketBAI | `7c72c919-052c-4964-9ffe-e33caa0c56be` |
-| IT SmartReceipts | `a97ef713-764d-4e4e-9b3f-2e1139cde719` |
+The workflow UUIDs populate the numbered picker. Any unset one just drops out of the
+list — pass `--workflow-id <uuid>` to use one that isn't configured.
 
-**Caveat:** these IDs are workspace-specific to Fresha's staging workspaces. If your token
-points at a different sandbox workspace, pass the correct one with `--workflow-id`.
-
-**Drift warning:** the IDs above are a hardcoded **copy** of `values.yaml` and are **not
-validated at runtime**. If the deregister workflows are re-created or renamed in Invopop,
-these IDs go stale and a job could be POSTed against a wrong/non-existent workflow. If a
-run stops deregistering, re-copy the current IDs from `values.yaml` (or pass `--workflow-id`).
+**Origin / drift:** the workflow UUIDs originate from
+`app-accounting-documents/deploy/apps/staging/values.yaml`
+(`INVOPOP_ES_CONFIG` / `INVOPOP_IT_CONFIG` → `<authority>.deregister`). They are
+workspace-specific and **not validated at runtime** — if a workflow is re-created or
+renamed in Invopop, refresh the value in `.env` (the shipped defaults live in
+`.env.example`).

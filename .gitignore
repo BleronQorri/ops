@@ -7,3 +7,6 @@ erl_crash.dump
 
 # macOS junk
 .DS_Store
+
+# Local secrets — real env file (copy from .env.example). Never commit.
+.env

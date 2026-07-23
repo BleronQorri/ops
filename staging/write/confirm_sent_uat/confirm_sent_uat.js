@@ -2,6 +2,32 @@
 
 const readline = require("readline/promises");
 const { stdin: input, stdout: output } = require("process");
+const fs = require("fs");
+const path = require("path");
+
+// Load KEY=VALUE pairs from the repo-root .env into process.env, without
+// overriding anything already set (real env wins). Repo root = nearest ancestor
+// dir containing .env.example. Silent no-op if there's no .env.
+function loadDotenv() {
+  let dir = __dirname;
+  while (!fs.existsSync(path.join(dir, ".env.example"))) {
+    const parent = path.dirname(dir);
+    if (parent === dir) return; // reached filesystem root, no marker
+    dir = parent;
+  }
+  const envPath = path.join(dir, ".env");
+  if (!fs.existsSync(envPath)) return;
+  for (const raw of fs.readFileSync(envPath, "utf8").split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    if (!process.env[key]) process.env[key] = val;
+  }
+}
+loadDotenv();
 
 const BASE_URL = "https://edi-uat.edoc-online.com/EdiRest";
 const CONFIG_TYPE = 1;
@@ -89,7 +115,9 @@ async function main() {
   const rl = readline.createInterface({ input, output });
   try {
     const queueType = await promptQueueType(rl);
-    const token = await promptToken(rl);
+    const token = process.env.COMARCH_UAT_JWT
+      ? (console.log("Using Comarch JWT from $COMARCH_UAT_JWT."), process.env.COMARCH_UAT_JWT)
+      : await promptToken(rl);
     const configId = CONFIG_IDS[queueType];
     const headers = buildHeaders(token);
     console.log(`Base URL: ${BASE_URL}`);
