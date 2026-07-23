@@ -115,9 +115,13 @@ async function main() {
   const rl = readline.createInterface({ input, output });
   try {
     const queueType = await promptQueueType(rl);
-    const token = process.env.COMARCH_UAT_JWT
-      ? (console.log("Using Comarch JWT from $COMARCH_UAT_JWT."), process.env.COMARCH_UAT_JWT)
-      : await promptToken(rl);
+    let token;
+    if (process.env.COMARCH_UAT_JWT) {
+      console.log("Using Comarch JWT from $COMARCH_UAT_JWT.");
+      token = process.env.COMARCH_UAT_JWT;
+    } else {
+      token = await promptToken(rl);
+    }
     const configId = CONFIG_IDS[queueType];
     const headers = buildHeaders(token);
     console.log(`Base URL: ${BASE_URL}`);
@@ -152,5 +156,3 @@ main().catch((err) => {
   console.error("Error:", err.message);
   process.exit(1);
 });
-
-// node confirm_sent_uat.js

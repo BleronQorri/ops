@@ -227,7 +227,7 @@ defmodule DeregisterSuppliers do
 
     Enum.each(targets, fn {label, id, state} ->
       mark = if state in @voided_states, do: @void, else: @wait
-      IO.puts(IO.ANSI.format([:cyan, "  #{mark} #{label}", :reset, faint_str("   entry=#{short_id(id)}  state=#{state}")]))
+      IO.puts(IO.ANSI.format([:cyan, "  #{mark} #{label}", :reset, faint("   entry=#{short_id(id)}  state=#{state}")]))
     end)
   end
 
@@ -356,7 +356,7 @@ defmodule DeregisterSuppliers do
     |> Enum.with_index(1)
     |> Enum.each(fn {{name, id}, i} ->
       tag = if i == suggested, do: IO.ANSI.format([:green, "  ← suggested for country=#{workspace.country}", :reset]), else: ""
-      IO.puts("  #{i}) #{String.pad_trailing(name, 18)} #{faint_str(id)}#{tag}")
+      IO.puts("  #{i}) #{String.pad_trailing(name, 18)} #{faint(id)}#{tag}")
     end)
 
     default_hint = if suggested, do: " [default #{suggested}]", else: ""
@@ -586,7 +586,6 @@ defmodule DeregisterSuppliers do
 
   defp hl(s), do: IO.ANSI.format([:bright, :white, s, :reset])
   defp faint(s), do: IO.ANSI.format([:faint, s, :reset])
-  defp faint_str(s), do: IO.ANSI.format([:faint, s, :reset])
   defp err(s), do: IO.ANSI.format([:bright, :red, s, :reset])
 
   defp filled?(nil), do: false

@@ -43,15 +43,6 @@ const REVIEW_STATUSES = [
   "corrected",
   "failed",
 ];
-const UPLOAD_STATUSES = [
-  "not_started",
-  "ready_to_send",
-  "sending_in_progress",
-  "sent",
-  "failed_to_send",
-  "rejected",
-];
-
 const TARGET_UPLOAD_STATUS = "failed_to_send";
 
 // --- arg parsing -----------------------------------------------------------
@@ -204,6 +195,17 @@ async function confirmRun(label, cmd, args) {
   return ans === "yes" || ans === "y";
 }
 
+// Run a houston task, or under --dry-run just print it. Confirms before running.
+async function runOrPlan(label, args, opts) {
+  if (opts.dryRun) {
+    console.log(`\n[dry-run] houston ${args.join(" ")}`);
+  } else if (await confirmRun(label, "houston", args)) {
+    runInherit("houston", args);
+  } else {
+    console.log(`Skipped ${label}.`);
+  }
+}
+
 // Always prompt for a single review_status applied to the whole list.
 async function promptReviewStatus() {
   console.log("\nWhat review_status should be set for ALL of the trackers above?");
@@ -296,13 +298,7 @@ async function main() {
       "--no-tui",
       "-w",
     ];
-    if (opts.dryRun) {
-      console.log(`\n[dry-run] houston ${updateArgs.join(" ")}`);
-    } else if (await confirmRun("the tracker status update", "houston", updateArgs)) {
-      runInherit("houston", updateArgs);
-    } else {
-      console.log("Skipped the tracker status update.");
-    }
+    await runOrPlan("the tracker status update", updateArgs, opts);
   }
 
   // 3. Force retry ----------------------------------------------------------
@@ -332,13 +328,7 @@ async function main() {
     "--no-tui",
     "-w",
   ];
-  if (opts.dryRun) {
-    console.log(`\n[dry-run] houston ${retryArgs.join(" ")}`);
-  } else if (await confirmRun("the FORCE retry", "houston", retryArgs)) {
-    runInherit("houston", retryArgs);
-  } else {
-    console.log("Skipped the force retry.");
-  }
+  await runOrPlan("the FORCE retry", retryArgs, opts);
 
   console.log("\n✓ Done.");
 }
