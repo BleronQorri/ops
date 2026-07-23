@@ -4,3 +4,6 @@ invopop_entries_*.csv
 
 # Elixir crash dumps
 erl_crash.dump
+
+# macOS junk
+.DS_Store
