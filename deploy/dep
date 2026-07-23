@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# dep — deploy wrapper (deploy an accounting-documents branch via Houston)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+exec bash "$DIR/deploy.sh" "$@"

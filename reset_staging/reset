@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#
+# reset — reset STAGING (eng-orion) to a pristine state for one country.
+#
+#   Step 1 (Invopop): deregister ALL suppliers (every silo entry, every state) in the
+#                     sandbox workspace(s) for the country. Silo entries are left in place
+#                     (deregister-only). Uses ../deregister_suppliers/ds.
+#   Step 2 (DB):      wipe the whole accounting-documents / e-invoicing cluster for that
+#                     country_code. Uses ../wipe_workspace/{preview,wipe}.sql via houston.
+#
+# Country code is the GATE: you must pass one, and it scopes everything.
+# STAGING ONLY — the DB env is hardcoded to eng-orion; there is no production path.
+#
+# Usage:
+#   ./reset <COUNTRY_CODE> [--dry-run] [--db-only] [--invopop-only]
+#
+#   --dry-run        Plan only: Invopop deregister runs in --dry-run, DB runs preview only.
+#   --db-only        Skip the Invopop step; only wipe the DB.
+#   --invopop-only   Skip the DB step; only deregister in Invopop.
+
+set -euo pipefail
+
+# --- resolve sibling scripts ------------------------------------------------
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+SCRIPTS_ROOT="$(cd "$DIR/.." && pwd)"
+
+DS="$SCRIPTS_ROOT/deregister_suppliers/ds"
+WIPE_DIR="$SCRIPTS_ROOT/wipe_workspace"
+
+DB_ENV="eng-orion"          # STAGING ONLY — never production
+DB_NAME="accounting-documents"
+
+# --- args -------------------------------------------------------------------
+COUNTRY=""
+DRY_RUN=0
+DB_ONLY=0
+INVOPOP_ONLY=0
+
+for a in "$@"; do
+  case "$a" in
+    --dry-run)      DRY_RUN=1 ;;
+    --db-only)      DB_ONLY=1 ;;
+    --invopop-only) INVOPOP_ONLY=1 ;;
+    -h|--help)      grep '^#' "$0" | grep -v '^#!' | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)             echo "Unknown flag: $a" >&2; exit 1 ;;
+    *)              COUNTRY="$(echo "$a" | tr '[:lower:]' '[:upper:]')" ;;
+  esac
+done
+
+if [[ -z "$COUNTRY" ]]; then
+  echo "ERROR: country code is required (the gate). e.g. ./reset ES" >&2
+  exit 1
+fi
+
+# Country -> Invopop sandbox workspaces (integrations) to deregister.
+case "$COUNTRY" in
+  ES) INTEGRATIONS=("ES VeriFactu" "ES TicketBAI") ;;
+  IT) INTEGRATIONS=("IT SmartReceipts") ;;
+  *)  echo "ERROR: unsupported country '$COUNTRY' (allowed: ES, IT)." >&2; exit 1 ;;
+esac
+
+if [[ $DB_ONLY -eq 1 && $INVOPOP_ONLY -eq 1 ]]; then
+  echo "ERROR: --db-only and --invopop-only are mutually exclusive." >&2
+  exit 1
+fi
+
+# --- banner + top-level confirmation ---------------------------------------
+echo
+echo "============================================================"
+echo "  RESET STAGING  —  country gate: $COUNTRY"
+echo "  DB env:  $DB_ENV / $DB_NAME  (staging only)"
+[[ $DB_ONLY -eq 0 ]]      && echo "  Invopop: deregister ALL suppliers in: ${INTEGRATIONS[*]}"
+[[ $INVOPOP_ONLY -eq 0 ]] && echo "  DB:      wipe accounting-documents cluster WHERE country_code=$COUNTRY"
+[[ $DRY_RUN -eq 1 ]]      && echo "  MODE:    DRY RUN (no jobs fired, no rows deleted)"
+echo "============================================================"
+echo
+if [[ $DRY_RUN -eq 0 ]]; then
+  read -r -p "This is destructive. Type the country code '$COUNTRY' to proceed: " CONFIRM
+  if [[ "$CONFIRM" != "$COUNTRY" ]]; then
+    echo "Aborted."
+    exit 1
+  fi
+fi
+
+# --- Step 1: Invopop deregister --------------------------------------------
+if [[ $DB_ONLY -eq 0 ]]; then
+  echo
+  echo "### Step 1 — Invopop deregistration ($COUNTRY) ###"
+  for integ in "${INTEGRATIONS[@]}"; do
+    echo
+    echo ">>> Workspace: $integ"
+    echo "    ds will prompt for the sandbox token for THIS workspace, confirm the"
+    echo "    workspace, and let you pick the deregister workflow."
+    read -r -p "    Run deregister for '$integ' now? (y to run, s to skip): " ANS
+    case "$ANS" in
+      y|Y)
+        if [[ $DRY_RUN -eq 1 ]]; then
+          "$DS" --dry-run
+        else
+          "$DS"
+        fi
+        ;;
+      *) echo "    Skipped $integ." ;;
+    esac
+  done
+fi
+
+# --- Step 2: DB wipe --------------------------------------------------------
+if [[ $INVOPOP_ONLY -eq 0 ]]; then
+  echo
+  echo "### Step 2 — DB wipe ($COUNTRY) ###"
+  echo
+  echo "Preview (read-only) of rows that will be deleted:"
+  houston psql "$DB_ENV" "$DB_NAME" -- -v cc="$COUNTRY" -f "$WIPE_DIR/preview.sql"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo
+    echo "[DRY RUN] Skipping the actual wipe. Re-run without --dry-run to delete."
+  else
+    echo
+    read -r -p "Delete all the above for country '$COUNTRY'? Type 'yes' to wipe: " ANS
+    if [[ "$ANS" == "yes" ]]; then
+      houston psql "$DB_ENV" "$DB_NAME" --write -- -v cc="$COUNTRY" -f "$WIPE_DIR/wipe.sql"
+    else
+      echo "Skipped the DB wipe."
+    fi
+  fi
+fi
+
+echo
+echo "✓ reset ($COUNTRY) complete."

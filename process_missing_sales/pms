@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# pms — process_missing_sales wrapper (export sales CSV → S3 → backfill task)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+exec bash "$DIR/process_missing_sales.sh" "$@"

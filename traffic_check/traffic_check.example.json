@@ -1,0 +1,7 @@
+{
+  "googleMapsApiKey": "YOUR_GOOGLE_MAPS_API_KEY",
+  "slackWebhookUrl": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
+  "origin": "42.656545, 21.150597",
+  "destination": "42.637476, 20.899150",
+  "label": "Evening commute"
+}

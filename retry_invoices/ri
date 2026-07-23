@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ri — retry_invoices wrapper (re-drive stuck KSA e-invoices via Houston)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+exec node "$DIR/retry_invoices.js" "$@"

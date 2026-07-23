@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# tc — traffic_check wrapper (daily commute traffic → Slack)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+exec node "$DIR/traffic_check.js" "$@"

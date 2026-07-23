@@ -3,16 +3,23 @@
 # review — caveman-style PR review from anywhere in the terminal.
 #
 # Prompts for an Orion app, cd's into ~/desktop/repos/orion/<app>, resolves a PR
-# (by number/URL, or by browsing authors who have open PRs), then runs Claude Code
-# headlessly with the caveman-review skill and prints the terse findings.
+# (by number/URL, or by browsing authors who have open PRs — optionally filtered
+# to a Houston team), then runs Claude Code headlessly with the caveman-review
+# skill and prints the terse findings.
 #
 # Every interactive menu has a "← Back" entry; the top app menu has "✕ Quit".
+#
+# Before launching it asks whether to run an interactive session (so you can ask
+# follow-up questions about the review — explain a finding, show the code, etc.)
+# or just print the review and exit. Pass -p/--print to skip the prompt and print.
 #
 # Usage:
 #   review                          # pick app, then resolve a PR interactively
 #   review <app>                    # pick app, then resolve a PR interactively
 #   review <app> <pr>               # <pr> = number | #n | full PR URL
 #   review <app> <author>           # browse that author's open PRs and pick one
+#   review [<app>] --team <team>    # browse open PRs of that Houston team's members
+#   review ... -p|--print           # print the review and exit (no follow-up)
 #
 set -euo pipefail
 
@@ -21,6 +28,22 @@ BACK="← Back"
 QUIT="✕ Quit"
 
 err() { printf '%s\n' "$*" >&2; }
+
+# --- arg parsing: pull out --team/-t and -p/--print, keep the rest positional
+team=""
+print_mode=0
+positional=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t | --team) team="${2:-}"; shift 2 ;;
+    --team=*)    team="${1#*=}"; shift ;;
+    -p | --print) print_mode=1; shift ;;
+    *)           positional+=("$1"); shift ;;
+  esac
+done
+set -- ${positional[@]+"${positional[@]}"}
+arg_app="${1:-}"
+arg_pr="${2:-}"
 
 # Is the argument a PR reference (bare number, #number, or a .../pull/<n> URL)?
 is_pr_ref() {
@@ -32,6 +55,13 @@ is_pr_ref() {
     '' | *[!0-9]*) return 1 ;;   # empty or contains a non-digit -> not a PR number
     *) return 0 ;;
   esac
+}
+
+# Print "<count> <login>" per author with open PRs in the current repo (bots out).
+open_pr_authors() {
+  gh pr list --state open --limit 300 --json author --jq '.[].author.login' \
+    | grep -vE '^app/|\[bot\]' \
+    | sort | uniq -c | sort -rn | sed 's/^ *//'
 }
 
 # Pick an Orion app. Sets global `app`. Returns 1 if the user chose Quit.
@@ -51,22 +81,16 @@ choose_app() {
   done
 }
 
-# Pick an author who has open PRs in the current repo (bots filtered out).
-# Sets global `author`. Returns 1 if the user chose Back.
+# Pick any author who has open PRs. Sets global `author`. Returns 1 on Back.
 choose_author() {
   author=""
   local authors=() logins=() line cnt login pick
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    cnt="${line%% *}"        # leading count
-    login="${line#* }"       # rest is the login
+    cnt="${line%% *}"; login="${line#* }"
     logins+=("$login")
     authors+=("$login ($cnt open)")
-  done < <(
-    gh pr list --state open --limit 300 --json author --jq '.[].author.login' \
-      | grep -vE '^app/|\[bot\]' \
-      | sort | uniq -c | sort -rn | sed 's/^ *//'
-  )
+  done < <(open_pr_authors)
 
   if [ "${#logins[@]}" -eq 0 ]; then
     err "No authors with open PRs in this repo."
@@ -82,8 +106,56 @@ choose_author() {
   done
 }
 
+# Pick an author who has open PRs AND belongs to a Houston team. $1 = team query.
+# Sets global `author`. Returns 1 on Back / unknown team / no matching members.
+choose_team_member() {
+  author=""
+  local query="$1"
+  command -v houston >/dev/null || { err "houston CLI not found — cannot filter by team."; return 1; }
+  command -v jq >/dev/null      || { err "jq not found — cannot filter by team."; return 1; }
+
+  # Validate the team and get its canonical name via Houston.
+  local tjson canonical
+  tjson="$(houston who "$query" --json 2>/dev/null || true)"
+  canonical="$(printf '%s' "$tjson" | jq -r '.name // empty' 2>/dev/null || true)"
+  if [ -z "$canonical" ] || ! printf '%s' "$tjson" | jq -e '.members' >/dev/null 2>&1; then
+    err "'$query' is not a team known to Houston."
+    return 1
+  fi
+
+  local want
+  want="$(printf '%s' "$canonical" | tr '[:upper:]' '[:lower:]')"
+
+  echo "Resolving ${canonical} members among open-PR authors…" >&2
+  local mlogins=() mlabels=() line cnt login pjson pteam pname
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    cnt="${line%% *}"; login="${line#* }"
+    pjson="$(houston who is "$login" --json 2>/dev/null || true)"
+    pteam="$(printf '%s' "$pjson" | jq -r '.team // empty' 2>/dev/null || true)"
+    [ "$(printf '%s' "$pteam" | tr '[:upper:]' '[:lower:]')" = "$want" ] || continue
+    pname="$(printf '%s' "$pjson" | jq -r '.name // empty' 2>/dev/null || true)"
+    mlogins+=("$login")
+    mlabels+=("${pname:-$login} ($login · $cnt open)")
+  done < <(open_pr_authors)
+
+  if [ "${#mlogins[@]}" -eq 0 ]; then
+    err "No ${canonical} members have open PRs in this repo."
+    return 1
+  fi
+
+  echo "${canonical} members with open PRs:" >&2
+  PS3="member> "
+  local pick
+  select pick in "${mlabels[@]}" "$BACK"; do
+    [ "${pick:-}" = "$BACK" ] && return 1
+    if [ -n "${pick:-}" ]; then author="${mlogins[$((REPLY - 1))]}"; return 0; fi
+    err "Pick a number from the list."
+  done
+}
+
 # List an author's open PRs in the current repo. Sets global `pr`.
-# Returns 1 if the user chose Back (or the author has no open PRs).
+# Returns 1 on Back (or when the author has no open PRs).
 pick_pr_by_author() {
   local who="$1"
   local nums=() labels=() num label
@@ -111,6 +183,16 @@ pick_pr_by_author() {
   done
 }
 
+# Browse loop: <chooser> picks an author (back-aware), then pick one of their PRs.
+# Back from the PR list returns to the chooser; back from the chooser returns 1.
+browse_with() {
+  local chooser="$1"; shift
+  while true; do
+    "$chooser" "$@" || return 1
+    pick_pr_by_author "$author" && return 0
+  done
+}
+
 # Resolve a raw token (non-interactive): PR ref -> use directly; else treat as an
 # author handle and browse their open PRs.
 resolve_pr() {
@@ -125,34 +207,34 @@ resolve_pr() {
 # Interactive PR finder. Sets global `pr`. Returns 1 to go back to app selection.
 find_pr() {
   pr=""
-  local how ans
+  local how ans t
   while true; do
     echo "Find a PR by:"
     PS3="find> "
-    select how in "PR number / URL" "Author (pick from those with open PRs)" "My open PRs" "$BACK"; do
+    select how in "PR number / URL" "Author (open PRs)" "My open PRs" "Team members (open PRs)" "$BACK"; do
       case "${REPLY:-}" in
         1)
           printf 'PR number / URL (blank to go back): '
           read -r ans
-          [ -z "$ans" ] && break               # blank -> re-show find menu
+          [ -z "$ans" ] && break
           resolve_pr "$ans"
           [ -n "$pr" ] && return 0
-          break                                # backed out / nothing -> find menu
-          ;;
-        2)
-          while true; do
-            choose_author || break             # Back -> out to find menu
-            pick_pr_by_author "$author" && return 0
-            # PR-list Back -> loop, re-show author list
-          done
           break
           ;;
-        3)
-          pick_pr_by_author "@me" && return 0
+        2) browse_with choose_author && return 0; break ;;
+        3) pick_pr_by_author "@me" && return 0; break ;;
+        4)
+          t="$team"
+          if [ -z "$t" ]; then
+            printf 'Team (blank = orion): '
+            read -r t
+            [ -z "$t" ] && t="orion"
+          fi
+          browse_with choose_team_member "$t" && return 0
           break
           ;;
-        4) return 1 ;;                          # Back -> app selection
-        *) err "Pick 1-4." ;;
+        5) return 1 ;;
+        *) err "Pick 1-5." ;;
       esac
     done
   done
@@ -170,8 +252,6 @@ enter_app() {
 }
 
 pr=""
-arg_app="${1:-}"
-arg_pr="${2:-}"
 
 if [ -n "$arg_pr" ]; then
   # Non-interactive: review <app> <pr-or-author>
@@ -179,7 +259,7 @@ if [ -n "$arg_pr" ]; then
   resolve_pr "$arg_pr"
   [ -n "$pr" ] || { err "No PR selected."; exit 1; }
 else
-  # Interactive, with back-navigation between app -> find -> author -> PR.
+  # Interactive, with back-navigation between app -> find -> author/team -> PR.
   while true; do
     if [ -n "$arg_app" ]; then
       app="$arg_app"
@@ -188,20 +268,49 @@ else
     fi
     enter_app "$app"
 
-    if find_pr; then
-      break
+    if [ -n "$team" ]; then
+      # --team given: go straight to that team's members with open PRs.
+      browse_with choose_team_member "$team" && break
+    else
+      find_pr && break
     fi
-    # find_pr asked to go back: if the app was fixed by arg there's nothing above.
+    # Asked to go back: if the app was fixed by arg there's nothing above.
     [ -n "$arg_app" ] && exit 0
   done
 fi
 
 echo "→ reviewing PR ${pr}"
 
+# Choose run mode unless -p/--print already forced it. No TTY -> just print.
+if [ "$print_mode" -eq 0 ]; then
+  if [ -t 0 ]; then
+    echo "Run mode:"
+    PS3="mode> "
+    select _m in "Interactive (ask follow-ups after the review)" "Print and exit"; do
+      case "${REPLY:-}" in
+        1) print_mode=0; break ;;
+        2) print_mode=1; break ;;
+        *) err "Pick 1 or 2." ;;
+      esac
+    done
+  else
+    print_mode=1
+  fi
+fi
+
 # Run the caveman review (read-only: gh + file reads).
 prompt="Use the caveman-review skill to review pull request: ${pr}
 Fetch it with gh, map line numbers from the diff hunks, and output the terse
-caveman-style findings ready to paste into the PR. Do not post anything to GitHub."
+caveman-style findings ready to paste into the PR. Do not post anything to GitHub.
+After the review, stay available for follow-up questions about it."
 
-exec claude -p "$prompt" \
-  --allowedTools "Bash(gh:*) Bash(find:*) Read Grep Glob"
+allowed="Bash(gh:*) Bash(find:*) Read Grep Glob"
+
+if [ "$print_mode" -eq 1 ]; then
+  # One-shot: print the review and exit.
+  exec claude -p "$prompt" --allowedTools "$allowed"
+else
+  # Interactive: review prints first, then you can ask follow-up questions.
+  echo "(interactive — ask follow-ups after the review; /exit or Ctrl-D to quit)"
+  exec claude "$prompt" --allowedTools "$allowed"
+fi
