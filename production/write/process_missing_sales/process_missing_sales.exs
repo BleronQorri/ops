@@ -63,6 +63,10 @@ defmodule ProcessMissingSales do
 
     workdir = Path.join(System.tmp_dir!(), "pms_#{stamp}")
     File.mkdir_p!(workdir)
+    # Register the workdir so `halt/1` can remove it on EVERY exit path —
+    # System.halt/1 bypasses the `after` block below (that only fires on normal
+    # return or a raised exception), and this dir holds production sale data.
+    Process.put(:pms_cleanup, {workdir, opts.keep_csv?})
     csv_path = Path.join(workdir, filename)
     sql_path = Path.join(workdir, "export.sql")
 
@@ -99,7 +103,7 @@ defmodule ProcessMissingSales do
       if opts.skip_upload? do
         IO.puts("--skip-upload set. CSV kept at: #{csv_path}")
         IO.puts("Would upload to: #{s3_uri}")
-        System.halt(0)
+        halt(0)
       end
 
       # --- step 2: upload to S3 ----------------------------------------------
@@ -127,7 +131,7 @@ defmodule ProcessMissingSales do
       if opts.dry_run? do
         IO.puts(warn("[DRY RUN] Not running the task. Re-run without --dry-run to execute."))
         IO.puts("CSV S3_KEY: #{s3_key}")
-        System.halt(0)
+        halt(0)
       end
 
       case prompt_value("Run this PRODUCTION task now? Type 'yes' to proceed: ") do
@@ -138,7 +142,7 @@ defmodule ProcessMissingSales do
 
         _ ->
           IO.puts("Aborted. CSV already uploaded at #{s3_uri} (S3_KEY: #{s3_key}).")
-          System.halt(1)
+          halt(1)
       end
     after
       unless opts.keep_csv?, do: File.rm_rf(workdir)
@@ -298,7 +302,7 @@ defmodule ProcessMissingSales do
   defp confirm!(prompt) do
     case prompt_value("#{prompt} (y to proceed, anything else aborts): ") do
       ans when ans in ["y", "Y"] -> :ok
-      _ -> IO.puts("Aborted."); System.halt(1)
+      _ -> IO.puts("Aborted."); halt(1)
     end
   end
 
@@ -312,7 +316,19 @@ defmodule ProcessMissingSales do
 
   defp die(msg) do
     IO.puts(:stderr, err("#{@cross} ERROR: #{msg}"))
-    System.halt(1)
+    halt(1)
+  end
+
+  # Cleanup-safe halt: removes the registered workdir (unless --keep-csv) before
+  # halting, because System.halt/1 skips the `after` block in run/1. Safe to call
+  # before the workdir is registered (no-op if nothing to clean).
+  defp halt(code) do
+    case Process.get(:pms_cleanup) do
+      {workdir, false} -> File.rm_rf(workdir)
+      _ -> :ok
+    end
+
+    System.halt(code)
   end
 
   defp usage do
