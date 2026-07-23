@@ -37,6 +37,11 @@ defmodule DeregisterSuppliers do
   # app-accounting-documents/deploy/apps/staging/values.yaml
   # (INVOPOP_ES_CONFIG / INVOPOP_IT_CONFIG -> <authority>.deregister).
   # These are sandbox-workspace-specific; the token you use must belong to the matching workspace.
+  # DRIFT WARNING: these are a hardcoded COPY of values.yaml — not validated at
+  # runtime. If the workflows are re-created/renamed in Invopop, these IDs go
+  # stale and a job can be POSTed against a non-existent/wrong workflow. If a
+  # deregister run stops working, re-copy the current IDs from values.yaml, or
+  # pass the right one with --workflow-id.
   @staging_deregister_workflows [
     {"ES VeriFactu", "9a5ecade-0e0a-49b0-a847-dfcef78d9d62"},
     {"ES TicketBAI", "7c72c919-052c-4964-9ffe-e33caa0c56be"},

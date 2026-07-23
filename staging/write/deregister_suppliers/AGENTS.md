@@ -68,3 +68,8 @@ From `app-accounting-documents/deploy/apps/staging/values.yaml`
 
 **Caveat:** these IDs are workspace-specific to Fresha's staging workspaces. If your token
 points at a different sandbox workspace, pass the correct one with `--workflow-id`.
+
+**Drift warning:** the IDs above are a hardcoded **copy** of `values.yaml` and are **not
+validated at runtime**. If the deregister workflows are re-created or renamed in Invopop,
+these IDs go stale and a job could be POSTed against a wrong/non-existent workflow. If a
+run stops deregistering, re-copy the current IDs from `values.yaml` (or pass `--workflow-id`).
