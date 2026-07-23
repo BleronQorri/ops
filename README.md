@@ -40,13 +40,69 @@ never commit it. See `.env.example` for every variable.
 
 ## Running
 
+Run each script directly (all are executable). Every one prompts for anything
+you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
+`.exs`/`.js` for its full options. Fuller detail lives in each script's own
+`AGENTS.md`.
+
+### production/read-only
+
+**invopop_supplier_check** — list + diagnose Invopop supplier silo entries.
 ```sh
-./production/write/process_missing_sales/process_missing_sales.exs --help
 ./production/read-only/invopop_supplier_check/invopop_supplier_check.exs
+#   --problems   only entries in a problem state
+#   --report     also write a Markdown report file
+#   --debug      verbose
+# Needs INVOPOP_API_TOKEN (prod workspace). The optional DB cross-ref prompt is
+# deprecated (Billing Profiles migration).
 ```
 
-Each script supports `--help`. Full per-script detail is in the `AGENTS.md`
-inside each script's directory; the top-level `AGENTS.md` has the index tables.
+**onboard_location_scripts** — ⚠️ _deprecated (Billing Profiles migration)._
+```sh
+./production/read-only/onboard_location_scripts/onboard_location_scripts.exs <provider_id>
+# Prompts a "still deprecated, continue? (y/N)" gate on startup.
+```
+
+### production/write
+
+**process_missing_sales** — backfill invoices/credit notes for sales missing them.
+```sh
+./production/write/process_missing_sales/process_missing_sales.exs <provider_id> <sale_id1,sale_id2,...>
+#   --dry-run        export + upload, print the task cmd, don't run it
+#   --skip-upload    only build the CSV (implies --dry-run, --keep-csv)
+#   --keep-csv       keep the generated CSV
+#   --profile NAME   AWS profile (default fresha-production-team-orion)
+# Interactive: run with no args and it prompts for provider_id + sale ids.
+```
+
+**retry_invoices** — re-drive stuck KSA e-invoices.
+```sh
+./production/write/retry_invoices/retry_invoices.js <tracker_id1,tracker_id2,...>
+#   -n, --namespace NAME   target namespace (default: production)
+#   --dry-run              plan only, no writes
+#   --skip-update          skip the tracker-status update step
+#   --skip-retry           skip the force-retry step
+```
+
+### staging/write
+
+**deregister_suppliers** — fire Invopop deregistration for a sandbox workspace.
+```sh
+./staging/write/deregister_suppliers/deregister_suppliers.exs
+#   --dry-run              plan only, POST nothing
+#   --latest-only          one job per supplier (default: one per silo entry)
+#   --skip-void            skip already-void entries (default: include them)
+#   --wait N               block up to N seconds per job
+#   --workflow-id UUID     override the workflow id
+# Needs INVOPOP_SANDBOX_API_TOKEN; refuses non-sandbox workspaces.
+```
+
+**confirm_sent_uat** — process the Comarch UAT "sent" queue.
+```sh
+./staging/write/confirm_sent_uat/confirm_sent_uat.js
+# Fully interactive: prompts for queue type (invoice/onboarding) and, unless
+# COMARCH_UAT_JWT is set, the Comarch JWT.
+```
 
 ## Requirements
 
