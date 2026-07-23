@@ -64,6 +64,8 @@ cd scripts/process_missing_sales
 
 ## Prereqs
 
+- Elixir on PATH (script is `process_missing_sales.exs`; no external deps, so no
+  `Mix.install` — starts instantly).
 - VPN + `houston` auth (production-developer profile for the psql read + S3
   upload).
 - `aws` CLI on PATH (used inside `houston aws-shell`).
