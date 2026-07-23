@@ -25,14 +25,18 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 
 ## Setup
 
-Secrets and config live in a repo-root `.env` (auto-loaded by the scripts that
-need it; anything in your shell env wins over `.env`):
+Run the setup script — it scaffolds `.env`, tells you which secrets to fill, and
+checks the runtimes (`node`, `elixir`, `houston`) are on PATH:
 
 ```sh
-cp .env.example .env    # then fill in your values
+./setup-script-env.js
 ```
 
-`.env` is gitignored — never commit it. See `.env.example` for every variable.
+Then fill the secrets it flags in `.env`. (Manual equivalent: `cp .env.example .env`.)
+
+Secrets and config live in a repo-root `.env`, auto-loaded by the scripts that
+need it (anything in your shell env wins over `.env`). `.env` is gitignored —
+never commit it. See `.env.example` for every variable.
 
 ## Running
 
