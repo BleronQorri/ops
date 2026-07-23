@@ -1,5 +1,12 @@
 #!/usr/bin/env elixir
 
+# DEPRECATED — Billing Profiles migration.
+# The onboarding model this checks (per-location billing details on shedul +
+# account_configurations) is being replaced by Billing Profiles in
+# app-accounting-documents. The Q1/Q2 checks and task suggestions target the
+# pre-migration schema. Kept for reference / legacy providers only — do not rely
+# on it for new onboarding. Remove once the migration completes.
+
 Mix.install([{:nimble_csv, "~> 1.2"}])
 
 defmodule Onboard do
@@ -8,6 +15,8 @@ defmodule Onboard do
   @cross "❌"
 
   def run(provider_id) do
+    deprecation_gate()
+
     IO.puts("""
     -- Purpose: provider onboarding check.
     -- Databases:
@@ -33,6 +42,26 @@ defmodule Onboard do
       gate_next_stage(loc_rows)
       verify_default_location(pbi_rows, loc_rows)
       gate_revoke_onboarding(provider_id, pbi_rows, loc_rows)
+    end
+  end
+
+  defp deprecation_gate do
+    IO.puts(IO.ANSI.format([:bright, :yellow, "\n" <> String.duplicate("=", 60), :reset]))
+    IO.puts(IO.ANSI.format([:bright, :yellow, "  ⚠️  DEPRECATED — Billing Profiles migration", :reset]))
+    IO.puts(IO.ANSI.format([:yellow, "  This checks the pre-migration onboarding model. It does not", :reset]))
+    IO.puts(IO.ANSI.format([:yellow, "  reflect Billing Profiles. Reference / legacy providers only.", :reset]))
+    IO.puts(IO.ANSI.format([:bright, :yellow, String.duplicate("=", 60), :reset]))
+
+    answer =
+      case IO.gets("Continue anyway? (y/N): ") do
+        :eof -> ""
+        {:error, _} -> ""
+        line -> line |> String.trim() |> String.downcase()
+      end
+
+    unless answer in ["y", "yes"] do
+      IO.puts("Aborted.")
+      System.halt(0)
     end
   end
 

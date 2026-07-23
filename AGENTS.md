@@ -21,7 +21,7 @@ the script's own `AGENTS.md`.
 | Script | Run | What it does |
 |--------|-----|--------------|
 | [invopop_supplier_check](production/read-only/invopop_supplier_check/) | `./invopop_supplier_check.exs` | List Invopop "suppliers" silo entries, diagnose ones in problem states. Optional provider cross-ref via psql. |
-| [onboard_location_scripts](production/read-only/onboard_location_scripts/) | `./onboard_location_scripts.exs <provider_id>` | Provider onboarding check across `shedul` + `accounting-documents` DBs; reads + polls, and prints the Houston onboarding tasks to run (never runs them). |
+| [onboard_location_scripts](production/read-only/onboard_location_scripts/) ⚠️ **DEPRECATED** | `./onboard_location_scripts.exs <provider_id>` | **Deprecated — Billing Profiles migration** (checks the pre-migration onboarding model; legacy/reference only). Provider onboarding check across `shedul` + `accounting-documents` DBs; reads + polls, and prints the Houston onboarding tasks to run (never runs them). |
 
 ## production/write/
 

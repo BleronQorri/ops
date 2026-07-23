@@ -1,5 +1,14 @@
 # onboard_location_scripts
 
+> ⚠️ **DEPRECATED — Billing Profiles migration.**
+> The onboarding model this checks (per-location billing details on `shedul` +
+> `account_configurations`) is being replaced by **Billing Profiles** in
+> app-accounting-documents. Its Q1/Q2 field checks and task suggestions
+> (`revoke_onboarding`, `onboard_*`) target the pre-migration schema and no
+> longer reflect how onboarding works once a provider is on billing profiles.
+> Kept for reference / legacy providers only — **do not rely on it for new
+> onboarding.** Remove once the migration completes.
+
 **Env: production (read + polling; task suggestions only).** Provider onboarding
 check across the `shedul` and `accounting-documents` databases.
 
