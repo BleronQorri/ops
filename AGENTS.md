@@ -19,10 +19,6 @@ top-of-file comment with the details.
 | [onboard_location_scripts](onboard_location_scripts/) | `ols` | `ols <provider_id>` | prod (read) | Provider onboarding check across `shedul` + `accounting-documents` DBs; suggests the Houston onboarding tasks to run. Read-only + polling. |
 | [confirm_sent_uat](confirm_sent_uat/) | `csu` | `csu` | UAT | Process Comarch UAT queue — confirm-sent for invoice / onboarding queues via the edoc-online UAT REST API. |
 | [deploy](deploy/) | `dep`* | `dep <branch> [namespace]` | staging/**prod** | Thin wrapper over `houston x deploy` for accounting-documents. Defaults app name; `-n` = skiff render dry-run. |
-| [review](review/) | `review`* | `review [app] [pr]` | n/a | Caveman-style PR review from the terminal — pick app, resolve/browse a PR, run Claude Code with the caveman-review skill. |
-| [traffic_check](traffic_check/) | `tc`* | `tc` | n/a | Personal: Google Maps commute travel-time vs baseline → posts a one-line summary to Slack. |
-| [reset_staging](reset_staging/) | `reset`* | `reset <COUNTRY> [--dry-run]` | **staging only** | Reset staging (eng-orion) for one country: deregister all Invopop suppliers, then wipe the accounting-documents DB. Destructive, country-gated. |
-| [wipe_workspace](wipe_workspace/) | — | `houston psql … -f wipe.sql` | **staging only** | SQL to delete accounting-documents/e-invoicing data for one `provider_id`. Used by `reset_staging`; `preview.sql` first. |
 
 \* wrapper exists but no `~/.zshrc` alias yet — run via `./<wrapper>` from the
 dir, or add an alias (see below).
@@ -31,10 +27,7 @@ dir, or add an alias (see below).
 
 - **Read-only:** `isc`, `ols` (plus any `--dry-run` / `preview` path).
 - **Prod writes (gated, reversible-ish):** `pms`, `ri`, `dep production`.
-- **Destructive / staging-only:** `reset`, `wipe_workspace`. Country/provider
-  gated; never a production path.
-- **Sandbox / external:** `ds` (Invopop sandbox), `csu` (Comarch UAT), `tc`
-  (personal Slack).
+- **Sandbox / external:** `ds` (Invopop sandbox), `csu` (Comarch UAT).
 
 ## Prereqs (most scripts)
 
@@ -56,7 +49,7 @@ alias isc='cd .../scripts/invopop_supplier_check && elixir invopop_supplier_chec
 alias force_retry_invoices='cd .../scripts/retry_invoices && node retry_invoices.js'
 ```
 
-To add a wrapper that has none (e.g. `dep`, `ds`, `reset`, `tc`, `review`):
+To add a wrapper that has none (e.g. `dep`, `ds`):
 
 ```sh
 alias dep='.../scripts/deploy/dep'

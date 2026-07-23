@@ -4,6 +4,3 @@ invopop_entries_*.csv
 
 # Elixir crash dumps
 erl_crash.dump
-
-# Local secrets — traffic_check config (API key + Slack webhook)
-traffic_check/traffic_check.json
