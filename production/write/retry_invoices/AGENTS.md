@@ -10,8 +10,11 @@ retry-eligible, then force-retries sending the underlying accounting documents.
 1. **Read** — `houston psql accounting_documents` (read-only) pulls the given
    trackers to learn their `accounting_document_id` + current statuses.
 2. **Make eligible** — `update_einvoice_trackers_status` Houston task sets
-   `upload_status -> failed_to_send` (always) and `review_status -> rejected`
-   (only if already rejected; otherwise prompts).
+   `upload_status -> failed_to_send` (always) and `review_status -> <prompted>`.
+   You are always prompted for a single `review_status` (any value from the
+   enum) and it is applied **uniformly to every pulled tracker**, regardless of
+   each one's current state — pick `rejected` to make them retry-eligible.
+   (Note: it does not per-tracker preserve or branch on the existing status.)
 3. **Retry** — `retry_sending_failed_accounting_documents` Houston task force-
    retries sending.
 

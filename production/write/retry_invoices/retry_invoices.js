@@ -5,11 +5,15 @@
 // Given a list of e_invoice_tracker IDs, this:
 //   1. Pulls those trackers from the accounting_documents DB (read-only psql)
 //      to learn their accounting_document_id and current statuses.
-//   2. Updates the trackers so they become eligible for retry:
+//   2. Updates the trackers so they become eligible for retry, via the
+//      `update_einvoice_trackers_status` Houston task:
 //        upload_status -> failed_to_send   (always)
-//        review_status -> rejected         (only if already rejected;
-//                                           otherwise you are prompted)
-//      via the `update_einvoice_trackers_status` Houston task.
+//        review_status -> prompted          (you pick ONE value from
+//                                            REVIEW_STATUSES; it is applied
+//                                            uniformly to every pulled tracker,
+//                                            regardless of each one's current
+//                                            state — set `rejected` to make them
+//                                            retry-eligible)
 //   3. Force-retries sending of the underlying accounting documents via the
 //      `retry_sending_failed_accounting_documents` Houston task.
 //
@@ -18,9 +22,9 @@
 // step 2 runs first — it puts the trackers into that eligible state.
 //
 // Usage:
-//   ./ri 123,456
-//   ./ri --namespace eng-orion 123,456
-//   ./ri --dry-run 123,456
+//   ./retry_invoices.js 123,456
+//   ./retry_invoices.js --namespace eng-orion 123,456
+//   ./retry_invoices.js --dry-run 123,456
 
 const readline = require("readline/promises");
 const { stdin: input, stdout: output } = require("process");
