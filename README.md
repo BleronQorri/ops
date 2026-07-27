@@ -22,6 +22,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 **write**
 - **deregister_suppliers** — fires the Invopop supplier-deregistration workflow for a sandbox workspace. Refuses non-sandbox tokens.
 - **confirm_sent_uat** — processes the Comarch UAT queue (confirms "sent" items) via the edoc-online UAT API.
+- **clear_provider_einvoicing** — ⚠️ _destructive._ Wipes all of a provider's e-invoicing data (account config, plugins, accounting documents, trackers, logs) from the staging `accounting_documents` DB, in FK order, in one transaction. Refuses production.
 
 ## Setup
 
@@ -102,6 +103,17 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ./staging/write/confirm_sent_uat/confirm_sent_uat.js
 # Fully interactive: prompts for queue type (invoice/onboarding) and, unless
 # COMARCH_UAT_JWT is set, the Comarch JWT.
+```
+
+**clear_provider_einvoicing** — ⚠️ _destructive._ wipe a provider's e-invoicing data (staging only).
+```sh
+./staging/write/clear_provider_einvoicing/clear_provider_einvoicing.js <provider_id>
+#   -n, --namespace NAME   staging namespace (default: eng-orion); production refused
+#   --dry-run              preview row counts + print the SQL, write nothing
+# Shows a per-table row-count preview, requires you to type the provider_id back
+# then "yes", and runs all deletes as one transaction (rolls back on any error).
+# Scope: e-invoicing domain only — does NOT touch the invoicing/ (periodic
+# billing) domain or rows keyed only by invoice_entity_id.
 ```
 
 ## Requirements
