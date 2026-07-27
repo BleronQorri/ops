@@ -15,13 +15,23 @@ It walks you through the whole thing:
 
 | Step | Prompt | Default |
 |------|--------|---------|
-| 1 | **Which environment?** staging (`eng-orion`) / production / other namespace | staging |
-| 2 | **Read from these databases?** — target shown, approved *before any query runs* | — |
-| 3 | **Which providers?** every provider with an account configuration / a list you type | all |
-| 4 | *(reads both DBs, prints the resolution report + exempt roster)* | — |
-| 5 | **Dry run or apply?** — asked with the report on screen | dry run |
-| 6 | **Approve the run** — non-prod one `yes`; **production** makes you type the namespace back, *then* `yes` | — |
-| 7 | *(prints the exact command, runs it, then verifies)* | — |
+| 1 | **What do you want to do?** verify (audit only) / link plugins | **verify** |
+| 2 | **Which environment?** staging (`eng-orion`) / production / other namespace | staging |
+| 3 | **Read from these databases?** — target shown, approved *before any query runs* | — |
+| 4 | **Which providers?** every provider with an account configuration / a list you type | all |
+| 5 | *(reads both DBs)* | — |
+
+**If you chose verify, it stops there** with the audit table and exits 1 on drift.
+If you chose link, it continues:
+
+| Step | Prompt | Default |
+|------|--------|---------|
+| 6 | *(prints the resolution report + exempt roster)* | — |
+| 7 | **Dry run or apply?** — asked with the report on screen | dry run |
+| 8 | **Approve the run** — non-prod one `yes`; **production** makes you type the namespace back, *then* `yes` | — |
+| 9 | *(prints the exact command, runs it, then verifies)* | — |
+
+The first prompt defaults to **verify** — the mode that cannot change anything.
 
 Menus take the number, a name (`prod`, `staging`, `all`, `list`, `apply`), or
 blank for the default. Every flag below is only a shortcut for pre-answering one
@@ -153,6 +163,48 @@ skip the rest. The verification pass below is what catches which one lost.
 
 ## Verification
 
+Two forms: a standalone audit you can run any time, and an automatic read-back
+after an apply.
+
+### Verify mode — audit on demand
+
+**Pick it at the first prompt** (it's the default), or skip the prompt with
+`--verify`. Answers "is this namespace correctly linked *right now?*" Runs no
+task, prints no command, writes nothing:
+
+```sh
+./plugin_legal_entity_updates.js            # then just press Enter twice
+./plugin_legal_entity_updates.js --verify --all
+```
+
+```
+   PROVIDER  PLUGIN  EXPECTED (primary LE)  ACTUAL (plugin LE)  STATUS
+─  ────────  ──────  ─────────────────────  ──────────────────  ─────────────────────────────────────────
+✓  18        1       019fa326-f225…         019fa326-f225…      linked correctly
+–  102       —       019f…                  —                   no plugins — no e-invoicing config
+✗  104       —       019f…                  —                   not linked — 2 candidates
+✗  106       9007    019f…-666              019f…-999           MISMATCH — holds a different legal entity
+✗  107       9008    019f…-aaa              ∅                   not linked
+```
+
+| Symbol | State | Meaning |
+|---|---|---|
+| `✓` | ok | the plugin holds its provider's primary legal entity |
+| `–` | exempt | nothing to check — no primary LE, or no plugins |
+| `✗` | drift | not linked, ambiguous, or linked to the *wrong* legal entity |
+
+Exits **1** if anything is in drift, so it works as a check in a runbook.
+
+It costs no extra queries — the plugin read already returns `legal_entity_id`, so
+this is pure comparison over what the script fetches anyway.
+
+**A `MISMATCH` is not something this script fixes.** The task only fills NULLs and
+never overwrites, so a plugin pointing at the wrong legal entity needs a human
+decision. Plain `not linked` rows are just pending work: re-run without `--verify`
+and choose apply.
+
+### Automatic read-back after an apply
+
 After the task runs, the script **reads the rows back** and prints a table:
 
 ```
@@ -213,6 +265,7 @@ stream into your terminal; the full argv is echoed before the spawn.
 ./plugin_legal_entity_updates.js [provider_ids]
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
+#       --verify           audit only — report link state, run nothing, exit 1 on drift
 #   -f, --file PATH        read provider IDs from a file (# starts a comment)
 #       --apply            DRY_RUN="false" — actually write
 #       --dry-run          DRY_RUN="true" — logs only (the default)

@@ -65,6 +65,7 @@
 //
 // Usage:
 //   ./plugin_legal_entity_updates.js                        # guided — just run it
+//   ./plugin_legal_entity_updates.js --verify --all         # audit only: is it linked?
 //   ./plugin_legal_entity_updates.js 12345,67890            # skip the provider prompt
 //   ./plugin_legal_entity_updates.js --all                  # every provider with a config
 //   ./plugin_legal_entity_updates.js -n production --apply 12345
@@ -99,6 +100,7 @@ function parseArgs(argv) {
     json: false,
     printOnly: false,
     all: false,
+    verify: false,
     file: null,
     providerIds: null,
     help: false,
@@ -121,6 +123,7 @@ function parseArgs(argv) {
       opts.apply = false;
       opts.modeGiven = true;
     } else if (a === "--all") opts.all = true;
+    else if (a === "--verify") opts.verify = true;
     else if (a === "--print-only") opts.printOnly = true;
     else if (a === "--json") opts.json = true;
     else if (a === "--help" || a === "-h") opts.help = true;
@@ -150,6 +153,9 @@ Flags (each one just pre-answers a prompt):
       --all              Every provider in account_configurations
   -f, --file PATH        Read provider IDs from a file (one per line, or any
                          comma/whitespace-separated mix; # starts a comment)
+      --verify           AUDIT ONLY. Compare what each plugin holds against its
+                         provider's primary legal entity and report. Runs no
+                         task, writes nothing. Exits 1 if anything is off.
       --apply            DRY_RUN="false" — actually write
       --dry-run          DRY_RUN="true" — logs only (the default)
   -s, --service NAME     Houston service (default: ${DEFAULT_SERVICE})
@@ -163,19 +169,24 @@ REQUIRES A TERMINAL. If stdin is not a TTY the script refuses to run — a piped
 "yes" is not explicit approval, so cron/CI cannot drive it. No --force escape.
 
 The guided flow:
-  1. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
-  2. APPROVE READS    — the target is shown and confirmed before ANY query runs
-  3. providers        — all of them, or a list you type
-  4. reads (read-only) houston psql <env> ${SHEDUL_DB}
+  1. VERIFY OR LINK?  — verify (audit only, the default) or link plugins
+  2. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
+  3. APPROVE READS    — the target is shown and confirmed before ANY query runs
+  4. providers        — all of them, or a list you type
+  5. reads (read-only) houston psql <env> ${SHEDUL_DB}
                        → provider_purchases_primary_legal_entities
                        houston psql <env> ${AD_DB}
                        → account_configurations + account_configuration_plugins
-  5. report           — what resolved, and which providers are exempt
-  6. dry run or apply — asked with the report on screen
-  7. APPROVE THE RUN  — non-prod: one "yes". PRODUCTION: type the namespace
+
+  If you chose VERIFY it stops here with the audit table (exit 1 on drift).
+  If you chose LINK it continues:
+
+  6. report           — what resolved, and which providers are exempt
+  7. dry run or apply — asked with the report on screen
+  8. APPROVE THE RUN  — non-prod: one "yes". PRODUCTION: type the namespace
                         back, THEN "yes".
-  8. runs the task    — the exact command is printed before it runs
-  9. verifies         — reads the rows back and prints a per-plugin table plus
+  9. runs the task    — the exact command is printed before it runs
+ 10. verifies         — reads the rows back and prints a per-plugin table plus
                         the psql commands to cross-check it yourself. Exits 1
                         if anything didn't land.
 
@@ -571,6 +582,111 @@ function buildCommand(opts, updates) {
   );
 }
 
+// --- audit (--verify) --------------------------------------------------------
+//
+// Standalone verification: for every requested provider, compare what its plugin
+// actually holds against the primary legal entity that owns it. Runs nothing and
+// writes nothing — it answers "is this namespace correctly linked right now?"
+//
+// Needs no extra queries: the plugin read already returns legal_entity_id, so
+// this is pure comparison over data we've already fetched.
+
+// One row per provider. `state` drives both the symbol and the exit code:
+// "ok" and "exempt" pass, "drift" fails.
+function auditProviders(providerIds, primaryByProvider, pluginsByProvider) {
+  return providerIds.map((providerId) => {
+    const expected = primaryByProvider.get(providerId) || null;
+    const plugins = pluginsByProvider.get(providerId) || [];
+    const row = { providerId, expected, plugins };
+
+    if (!expected) {
+      return { ...row, state: "exempt", status: "no primary legal entity — nothing to link" };
+    }
+    if (!plugins.length) {
+      return { ...row, state: "exempt", status: "no plugins — no e-invoicing config" };
+    }
+
+    const holder = plugins.find((p) => p.legalEntityId === expected);
+    if (holder) {
+      return { ...row, state: "ok", plugin: holder, status: "linked correctly" };
+    }
+
+    // Nothing holds the expected value. Distinguish "never linked" from "linked
+    // to the wrong thing" — the first is pending work, the second is real drift.
+    const wrong = plugins.filter((p) => p.legalEntityId);
+    const unlinked = plugins.filter((p) => !p.legalEntityId);
+
+    if (wrong.length) {
+      return {
+        ...row,
+        state: "drift",
+        plugin: wrong[0],
+        status: "MISMATCH — holds a different legal entity",
+      };
+    }
+    if (unlinked.length > 1) {
+      return { ...row, state: "drift", status: `not linked — ${unlinked.length} candidates` };
+    }
+    return { ...row, state: "drift", plugin: unlinked[0], status: "not linked" };
+  });
+}
+
+const AUDIT_SYMBOL = { ok: "✓", exempt: "–", drift: "✗" };
+
+function printAudit(opts, audit) {
+  const short = (uuid) => uuid || "∅";
+
+  console.log("\n── Verification ────────────────────────────────────────");
+  console.log(
+    renderTable(
+      ["", "PROVIDER", "PLUGIN", "EXPECTED (primary LE)", "ACTUAL (plugin LE)", "STATUS"],
+      audit.map((a) => [
+        AUDIT_SYMBOL[a.state],
+        a.providerId,
+        a.plugin ? a.plugin.id : "—",
+        short(a.expected),
+        a.plugin ? short(a.plugin.legalEntityId) : "—",
+        a.status,
+      ])
+    )
+  );
+
+  const ok = audit.filter((a) => a.state === "ok");
+  const exempt = audit.filter((a) => a.state === "exempt");
+  const drift = audit.filter((a) => a.state === "drift");
+
+  console.log(
+    `\n  Method: compared account_configuration_plugins.legal_entity_id (${AD_DB}) ` +
+      `against the active row in\n  provider_purchases_primary_legal_entities ` +
+      `(${SHEDUL_DB}) for each provider. Both reads, no writes.`
+  );
+  console.log(
+    `\n  ✓ ${ok.length} linked correctly   ` +
+      `– ${exempt.length} exempt   ` +
+      `✗ ${drift.length} need attention`
+  );
+
+  if (drift.length) {
+    const mismatches = drift.filter((a) => a.status.startsWith("MISMATCH"));
+    if (mismatches.length) {
+      console.log(
+        `\n  ⚠  ${mismatches.length} MISMATCH(es) — a plugin holds a legal entity that is not\n` +
+          `     its provider's primary. This script will NOT fix those: the task only\n` +
+          `     fills NULLs and never overwrites. Investigate before changing anything.`
+      );
+    }
+    const fixable = drift.filter((a) => a.status === "not linked");
+    if (fixable.length) {
+      console.log(
+        `\n  ${fixable.length} provider(s) simply not linked yet. To link them, re-run without\n` +
+          `  --verify and choose apply:  ${fixable.map((a) => a.providerId).join(",")}`
+      );
+    }
+  }
+
+  return drift.length;
+}
+
 // --- verification -----------------------------------------------------------
 
 // Compare what we intended against what the DB actually holds now. `applied` is
@@ -705,6 +821,24 @@ function printExemptProviders(skipped) {
 }
 
 // --- interactive steps ------------------------------------------------------
+
+// What are we here to do? Asked first, because it decides the whole flow.
+// Verify is the default: it's the one that can't change anything.
+async function askMode() {
+  return askChoice("What do you want to do?", [
+    {
+      label: "Verify — check what's linked, change nothing",
+      aliases: ["verify", "check", "audit", "read"],
+      value: "verify",
+      default: true,
+    },
+    {
+      label: "Link plugins to their primary legal entity",
+      aliases: ["link", "apply", "run", "fix"],
+      value: "link",
+    },
+  ]);
+}
 
 // Which environment. Returns a namespace string. "Other" lets you name any
 // namespace without having to remember the -n flag.
@@ -857,23 +991,30 @@ async function main() {
   }
 
   if (!opts.json) {
-    console.log("plugin_legal_entity_updates — link plugins to their primary legal entity");
+    console.log("plugin_legal_entity_updates — plugins ↔ primary legal entities");
   }
 
-  // 1. Environment — -n, or prompt. First, because discovering providers is
-  //    itself a query against the chosen namespace.
+  // 1. Verify or link? Asked first — it decides everything downstream. Any flag
+  //    that only makes sense in one mode already answers this.
+  const modeImplied = opts.verify || opts.modeGiven || opts.printOnly || opts.json;
+  if (!modeImplied) {
+    opts.verify = (await askMode()) === "verify";
+  }
+
+  // 2. Environment — -n, or prompt. Before the reads, because discovering
+  //    providers is itself a query against the chosen namespace.
   if (!opts.namespaceGiven && !opts.json) {
     opts.namespace = await askNamespace();
   }
   const env = psqlEnv(opts.namespace);
 
-  // 2. Approve the data access itself, before any query goes out ------------
+  // 3. Approve the data access itself, before any query goes out ------------
   if (!(await confirmDataAccess(opts, env))) {
     console.log("Aborted. Nothing was read.");
     return;
   }
 
-  // 3. Provider IDs — argument, --file, --all, or prompt --------------------
+  // 4. Provider IDs — argument, --file, --all, or prompt --------------------
   let raw = opts.providerIds;
   if (opts.file) {
     const fromFile = fs.readFileSync(opts.file, "utf8");
@@ -898,15 +1039,28 @@ async function main() {
     console.log(`Providers requested: ${providerIds.length} — ${providerIds.join(", ")}`);
   }
 
-  // 4. Resolve primary legal entities (shedul) -----------------------------
+  // 5. Resolve primary legal entities (shedul) -----------------------------
   if (!opts.json) console.log(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`);
   const primaryByProvider = fetchPrimaryLegalEntities(env, providerIds);
 
-  // 5. Resolve plugins (accounting_documents) ------------------------------
+  // 6. Resolve plugins (accounting_documents) ------------------------------
   if (!opts.json) console.log(`Reading plugins from ${AD_DB} (read-only)…`);
   const pluginsByProvider = fetchPlugins(env, providerIds);
 
-  // 6. Pair them up --------------------------------------------------------
+  // --verify stops here: audit what's already linked and report. No task, no
+  // command, no writes — just "is this namespace correct right now?"
+  if (opts.verify) {
+    const audit = auditProviders(providerIds, primaryByProvider, pluginsByProvider);
+    const drift = printAudit(opts, audit);
+    printCrossCheck(opts, audit.filter((a) => a.plugin).map((a) => ({
+      plugin_id: a.plugin.id,
+      _providerId: a.providerId,
+    })));
+    if (drift) process.exitCode = 1;
+    return;
+  }
+
+  // 7. Pair them up --------------------------------------------------------
   const { updates, skipped } = resolve(providerIds, primaryByProvider, pluginsByProvider);
 
   if (opts.json) {
@@ -950,14 +1104,14 @@ async function main() {
     return;
   }
 
-  // 7. Dry run or apply — --apply/--dry-run, or prompt ---------------------
+  // 8. Dry run or apply — --apply/--dry-run, or prompt ---------------------
   // Asked here, after the report, so the decision is made with the actual
   // plugin list on screen.
   if (!opts.modeGiven && !opts.printOnly) {
     opts.apply = await askApply(opts.namespace);
   }
 
-  // 8. Print the command ---------------------------------------------------
+  // 9. Print the command ---------------------------------------------------
   console.log(
     `\n── Command ─────────────────────────────────────────────` +
       (opts.apply ? "" : "\n(DRY_RUN=true — logs only, writes nothing)")
@@ -969,7 +1123,7 @@ async function main() {
     return;
   }
 
-  // 9. Confirm + run -------------------------------------------------------
+  // 10. Confirm + run -------------------------------------------------------
   // --no-tui -w are appended so the task's logs stream into this terminal;
   // runInherit echoes the full argv before it spawns.
   if (!(await confirmRun(opts))) {
@@ -979,7 +1133,7 @@ async function main() {
 
   runInherit("houston", [...taskArgs(opts, updates), "--no-tui", "-w"]);
 
-  // 10. Verify — read the rows back and prove what actually landed -----------
+  // 11. Verify — read the rows back and prove what actually landed -----------
   // The task exits 0 even when it skips every single row, so a green exit is
   // not evidence. Only the read-back is.
   console.log(`\nVerifying against ${AD_DB} (read-only)…`);

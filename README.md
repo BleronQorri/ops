@@ -90,11 +90,13 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```sh
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
-#   1. environment      — staging (eng-orion), production, or any namespace
-#   2. APPROVE READS    — target shown and confirmed BEFORE any query runs
-#   3. providers        — all of them (from account_configurations), or a list you type
-#   4. dry run or apply — asked after the resolution report is on screen
-#   5. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
+#   1. VERIFY OR LINK?  — verify (audit only) is the default; or link plugins
+#   2. environment      — staging (eng-orion), production, or any namespace
+#   3. APPROVE READS    — target shown and confirmed BEFORE any query runs
+#   4. providers        — all of them (from account_configurations), or a list you type
+#   -- verify stops here with an audit table (exit 1 on drift); link continues --
+#   5. dry run or apply — asked after the resolution report is on screen
+#   6. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
 # REQUIRES A TERMINAL: if stdin isn't a TTY it refuses outright (exit 1) — a piped
 # "yes" is not explicit approval, so cron/CI can't drive it. There is no --force.
 # Then it prints the exact `houston task run … link_plugins_to_legal_entities_from_env`
@@ -108,6 +110,7 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 # Flags just pre-answer a prompt — all optional:
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
+#       --verify           audit only — report link state, run nothing, exit 1 on drift
 #   -f, --file PATH        read provider IDs from a file (# starts a comment)
 #       --apply            DRY_RUN="false" — actually write
 #       --dry-run          DRY_RUN="true" — logs only (the default)
