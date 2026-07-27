@@ -95,7 +95,12 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #   3. dry run or apply — asked after the resolution report is on screen
 #   4. confirm          — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
 # Then it prints the exact `houston task run … link_plugins_to_legal_entities_from_env`
-# command and runs it. Dry run is the default everywhere.
+# command, runs it, and VERIFIES by reading the rows back — a per-plugin table of
+# plugin_id / provider_id / legal entity applied / how it was verified, plus the psql
+# commands to cross-check it yourself. Exits 1 if any row didn't land: the task exits 0
+# even when it skips everything, so its exit code alone proves nothing.
+# Providers it can't resolve are listed in an "Exempt providers" table with reasons.
+# Dry run is the default everywhere.
 #
 # Flags just pre-answer a prompt — all optional:
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace

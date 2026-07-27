@@ -26,6 +26,9 @@
 //   * Writes only via `--apply` (DRY_RUN="false"); the default run is log-only.
 //   * The underlying action never overwrites a non-NULL legal_entity_id, so a
 //     re-run is idempotent.
+//   * Verifies by reading the rows back afterwards — the task exits 0 even when
+//     it skips every row, so its exit code proves nothing on its own. Any row
+//     that didn't land makes this script exit 1.
 //
 // ## Where the data comes from
 //
@@ -167,6 +170,9 @@ The guided flow:
   6. confirm          — non-prod: one "yes". PRODUCTION: type the namespace
                         back, THEN "yes".
   7. runs the task    — the exact command is printed before it runs
+  8. verifies         — reads the rows back and prints a per-plugin table plus
+                        the psql commands to cross-check it yourself. Exits 1
+                        if anything didn't land.
 
 Providers are skipped (and reported) when they have no active primary legal
 entity, no account configuration, no plugin with a NULL legal_entity_id, or more
@@ -388,6 +394,24 @@ function fetchAllProviderIds(env) {
     .filter((id) => /^\d+$/.test(id));
 }
 
+// Read `legal_entity_id` straight back out of the DB for the plugins we just
+// touched. This is the verification pass: the task's exit code only says the job
+// ran, not that any particular row changed — the action logs and skips
+// individually. Returns pluginId -> legalEntityId, with absent keys meaning the
+// plugin row itself is gone.
+function fetchAppliedLegalEntities(env, pluginIds) {
+  const sql =
+    "SELECT p.id, coalesce(p.legal_entity_id::text, '') " +
+    "FROM account_configuration_plugins p " +
+    `WHERE p.id IN (${pluginIds.join(",")}) ORDER BY p.id;`;
+
+  const map = new Map();
+  for (const [id, legalEntityId] of parseRows(psqlRead(env, AD_DB, sql), 2)) {
+    map.set(id, legalEntityId || null);
+  }
+  return map;
+}
+
 // provider_id -> [{ id, pluginType, integrator, pluginStatus, legalEntityId }]
 function fetchPlugins(env, providerIds) {
   const sql =
@@ -426,12 +450,12 @@ function resolve(providerIds, primaryByProvider, pluginsByProvider) {
     const legalEntityId = primaryByProvider.get(providerId);
     const plugins = pluginsByProvider.get(providerId) || [];
 
+    // Reasons are kept short — they're rendered as a table column. The full
+    // explanation of each lives in this directory's AGENTS.md.
     if (!legalEntityId) {
       skipped.push({
         providerId,
-        reason:
-          "no active primary legal entity (no row in provider_purchases_primary_legal_entities " +
-          "with valid_to IS NULL) — the RPC would answer NOT_FOUND",
+        reason: "no active primary legal entity (RPC would answer NOT_FOUND)",
         plugins,
       });
       continue;
@@ -440,7 +464,7 @@ function resolve(providerIds, primaryByProvider, pluginsByProvider) {
     if (!plugins.length) {
       skipped.push({
         providerId,
-        reason: "no account_configuration_plugins (provider has no e-invoicing config yet)",
+        reason: "no plugins — provider has no e-invoicing config yet",
         plugins,
       });
       continue;
@@ -454,8 +478,8 @@ function resolve(providerIds, primaryByProvider, pluginsByProvider) {
       skipped.push({
         providerId,
         reason: matching
-          ? "already linked — a plugin already holds this legal_entity_id"
-          : "every plugin already has a legal_entity_id (never overwritten)",
+          ? "already linked to this legal entity"
+          : "all plugins already have a legal_entity_id (never overwritten)",
         plugins,
       });
       continue;
@@ -464,9 +488,7 @@ function resolve(providerIds, primaryByProvider, pluginsByProvider) {
     if (candidates.length > 1) {
       skipped.push({
         providerId,
-        reason:
-          `${candidates.length} plugins have a NULL legal_entity_id — only one plugin can ` +
-          "hold a legal entity (unique index), so pick one by hand",
+        reason: `${candidates.length} unlinked plugins — ambiguous, pick one by hand`,
         plugins,
       });
       continue;
@@ -537,6 +559,139 @@ function buildCommand(opts, updates) {
     `    -p UPDATES='${updatesJson(updates)}' \\\n` +
     `    -p DRY_RUN="${opts.apply ? "false" : "true"}"`
   );
+}
+
+// --- verification -----------------------------------------------------------
+
+// Compare what we intended against what the DB actually holds now. `applied` is
+// the read-back map. Under a dry run the expectation is inverted: the row must
+// still be NULL, and anything else means the task wrote when it shouldn't have.
+function verdictFor(update, applied, dryRun) {
+  const pluginId = String(update.plugin_id);
+  const intended = update.legal_entity_id;
+
+  if (!applied.has(pluginId)) {
+    return { ok: false, note: "plugin row not found on read-back" };
+  }
+
+  const actual = applied.get(pluginId);
+
+  if (dryRun) {
+    return actual === null
+      ? { ok: true, note: "unchanged, still NULL — correct for a dry run" }
+      : { ok: false, note: `dry run but row is set to ${actual}` };
+  }
+
+  if (actual === intended) return { ok: true, note: "matches intended legal_entity_id" };
+  if (actual === null) {
+    return { ok: false, note: "still NULL — task skipped it (likely a unique-index collision)" };
+  }
+  return { ok: false, note: `holds a different legal entity: ${actual}` };
+}
+
+// Fixed-width table. Kept deliberately plain so it survives copy-paste into a
+// ticket or a Slack snippet.
+function renderTable(headers, rows) {
+  const widths = headers.map((h, i) =>
+    Math.max(h.length, ...rows.map((r) => String(r[i]).length))
+  );
+  const line = (cells) => cells.map((c, i) => String(c).padEnd(widths[i])).join("  ");
+  return [line(headers), widths.map((w) => "─".repeat(w)).join("  "), ...rows.map(line)].join(
+    "\n"
+  );
+}
+
+// The post-run report: one row per plugin we tried to link, what it now holds,
+// and how that was established.
+function printVerification(opts, updates, applied) {
+  const dryRun = !opts.apply;
+
+  const rows = updates.map((u) => {
+    const v = verdictFor(u, applied, dryRun);
+    return [
+      u.plugin_id,
+      u._providerId,
+      u.legal_entity_id,
+      `${v.ok ? "✓" : "✗"} read-back`,
+      v.note,
+    ];
+  });
+
+  const failures = rows.filter((r) => r[3].startsWith("✗")).length;
+
+  console.log("\n── Verification ────────────────────────────────────────");
+  console.log(
+    renderTable(
+      ["PLUGIN", "PROVIDER", "LEGAL ENTITY APPLIED", "VERIFIED BY", "RESULT"],
+      rows
+    )
+  );
+
+  console.log(
+    `\n  Method: re-read account_configuration_plugins.legal_entity_id from ` +
+      `${AD_DB} (${opts.namespace}) after the task, and compared each row to the\n` +
+      `  value this script intended. The task's exit code alone proves nothing — ` +
+      `the action skips rows individually and still exits 0.`
+  );
+
+  console.log(
+    failures
+      ? `\n  ⚠  ${failures} of ${rows.length} did NOT verify. See RESULT above.`
+      : `\n  ✓ All ${rows.length} verified.`
+  );
+
+  printCrossCheck(opts, updates);
+  return failures;
+}
+
+// The user-runnable equivalent, so the table above can be independently
+// confirmed without trusting this script at all.
+function printCrossCheck(opts, updates) {
+  const pluginIds = updates.map((u) => u.plugin_id).join(",");
+  const providerIds = [...new Set(updates.map((u) => u._providerId))].join(",");
+
+  console.log("\n  Cross-check it yourself:");
+  console.log(
+    `\n    # what the plugins now hold\n` +
+      `    houston psql ${psqlEnv(opts.namespace)} ${AD_DB} -- -c "\n` +
+      `      SELECT ac.provider_id, p.id AS plugin_id, p.legal_entity_id, p.updated_at\n` +
+      `      FROM account_configuration_plugins p\n` +
+      `      JOIN account_configurations ac ON ac.id = p.account_configuration_id\n` +
+      `      WHERE p.id IN (${pluginIds}) ORDER BY ac.provider_id"\n`
+  );
+  console.log(
+    `    # what they SHOULD hold, straight from the source of truth\n` +
+      `    houston psql ${psqlEnv(opts.namespace)} ${SHEDUL_DB} -- -c "\n` +
+      `      SELECT provider_id, legal_entity_id\n` +
+      `      FROM provider_purchases_primary_legal_entities\n` +
+      `      WHERE provider_id IN (${providerIds}) AND valid_to IS NULL ORDER BY provider_id"\n`
+  );
+  console.log(
+    `    The two provider_id → legal_entity_id sets must be identical.\n` +
+      `    Re-running this script is the other check: everything should come back\n` +
+      `    as "already linked", with 0 updates.`
+  );
+}
+
+// Providers we deliberately did not touch, and why. Printed as a roster so the
+// exempt set is explicit rather than something you infer from what's missing.
+function printExemptProviders(skipped) {
+  if (!skipped.length) {
+    console.log("\n── Exempt providers ────────────────────────────────────");
+    console.log("  None — every requested provider resolved.");
+    return;
+  }
+
+  const rows = skipped.map((s) => [
+    s.providerId,
+    s.plugins.length,
+    s.plugins.map((p) => p.id).join(",") || "—",
+    s.reason,
+  ]);
+
+  console.log("\n── Exempt providers (not touched) ──────────────────────");
+  console.log(renderTable(["PROVIDER", "PLUGINS", "PLUGIN IDS", "WHY EXEMPT"], rows));
+  console.log(`\n  ${skipped.length} provider(s) exempt. Nothing was written for these.`);
 }
 
 // --- interactive steps ------------------------------------------------------
@@ -719,13 +874,7 @@ async function main() {
     }
   }
 
-  if (skipped.length) {
-    console.log("\n── Skipped ─────────────────────────────────────────────");
-    for (const s of skipped) {
-      console.log(`  provider=${s.providerId}: ${s.reason}`);
-      for (const p of s.plugins) console.log(`      ${fmtPlugin(p)}`);
-    }
-  }
+  printExemptProviders(skipped);
 
   const collisions = findLegalEntityCollisions(updates);
   if (collisions.length) {
@@ -775,9 +924,27 @@ async function main() {
 
   runInherit("houston", [...taskArgs(opts, updates), "--no-tui", "-w"]);
 
+  // 9. Verify — read the rows back and prove what actually landed -----------
+  // The task exits 0 even when it skips every single row, so a green exit is
+  // not evidence. Only the read-back is.
+  console.log(`\nVerifying against ${AD_DB} (read-only)…`);
+  const applied = fetchAppliedLegalEntities(env, updates.map((u) => u.plugin_id));
+  const failures = printVerification(opts, updates, applied);
+
+  const scope = `${updates.length} plugin(s) on ${opts.namespace}`;
+  if (failures) {
+    // A partial result is not a success, however green the task's exit code was.
+    console.log(
+      `\n✗ ${TASK}: ${updates.length - failures}/${updates.length} verified, ` +
+        `${failures} did not. Nothing to undo — the rest simply weren't written.`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   console.log(
-    `\n✓ Ran ${TASK} on ${opts.namespace} for ${updates.length} plugin(s)` +
-      (opts.apply ? "." : " (DRY_RUN=true — nothing written).")
+    `\n✓ Ran ${TASK} for ${scope}` +
+      (opts.apply ? " — all verified." : " (DRY_RUN=true — nothing written, verified unchanged).")
   );
 }
 

@@ -20,7 +20,7 @@ It walks you through the whole thing:
 | 3 | *(reads both DBs, prints the resolution report)* | — |
 | 4 | **Dry run or apply?** — asked with the report on screen | dry run |
 | 5 | **Confirm** — non-prod one `yes`; **production** makes you type the namespace back, *then* `yes` | — |
-| 6 | *(prints the exact command, then runs it)* | — |
+| 6 | *(prints the exact command, runs it, then verifies)* | — |
 
 Menus take the number, a name (`prod`, `staging`, `all`, `list`, `apply`), or
 blank for the default. Every flag below is only a shortcut for pre-answering one
@@ -92,19 +92,60 @@ legal entity can back **at most one** plugin. The script therefore only proposes
 plugins whose `legal_entity_id IS NULL`, and never guesses when there is more
 than one.
 
-A provider is **skipped** (with the reason printed, plus every plugin it has) when:
+## Exempt providers
 
-| Reason | Meaning |
+Anything not resolvable is listed in an **Exempt providers** table — provider,
+how many plugins it has, their IDs, and why it was passed over. The roster is
+always printed, so the exempt set is explicit rather than something you infer
+from what's missing. The short reasons in that column mean:
+
+| Reason (as printed) | Meaning |
 |--------|---------|
-| no active primary legal entity | no `valid_to IS NULL` row — the RPC would answer `NOT_FOUND` |
-| no `account_configuration_plugins` | provider has no e-invoicing config yet |
-| already linked | a plugin already holds this exact `legal_entity_id` |
-| every plugin already has a `legal_entity_id` | never overwritten by the task |
-| N plugins have a NULL `legal_entity_id` | ambiguous — pick one by hand |
+| `no active primary legal entity (RPC would answer NOT_FOUND)` | no `valid_to IS NULL` row in `provider_purchases_primary_legal_entities` |
+| `no plugins — provider has no e-invoicing config yet` | nothing in `account_configuration_plugins` for it |
+| `already linked to this legal entity` | a plugin already holds this exact `legal_entity_id` |
+| `all plugins already have a legal_entity_id (never overwritten)` | set, but to something else — the task never overwrites |
+| `N unlinked plugins — ambiguous, pick one by hand` | more than one candidate; the unique index allows only one |
 
 If two providers in one batch resolve to the **same** legal entity, that's a
 unique-index collision: it's flagged with a `⚠`, and the task will apply one and
-skip the rest.
+skip the rest. The verification pass below is what catches which one lost.
+
+## Verification
+
+After the task runs, the script **reads the rows back** and prints a table:
+
+```
+PLUGIN  PROVIDER  LEGAL ENTITY APPLIED                  VERIFIED BY  RESULT
+──────  ────────  ────────────────────────────────────  ───────────  ─────────────────────────────
+9001    101       11111111-1111-4111-8111-111111111111  ✓ read-back  matches intended legal_entity_id
+9009    108       aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa  ✗ read-back  still NULL — task skipped it …
+```
+
+**Why this exists:** the Houston task exits `0` even when it skips every single
+row. `BackfillAccountConfigurationPluginLegalEntityIdAction` logs `[skipped]` per
+entry and carries on — a green exit is not evidence that anything was written.
+Only re-reading `account_configuration_plugins.legal_entity_id` proves it.
+
+Verdicts:
+
+| Result | Meaning |
+|--------|---------|
+| `matches intended legal_entity_id` | written and correct |
+| `unchanged, still NULL — correct for a dry run` | dry run behaved (this is the *expected* pass under `DRY_RUN=true`) |
+| `still NULL — task skipped it` | apply didn't land, usually a unique-index collision |
+| `holds a different legal entity: <uuid>` | pre-existing value, not overwritten |
+| `dry run but row is set to <uuid>` | a dry run wrote something — should be impossible; investigate |
+| `plugin row not found on read-back` | the plugin disappeared between resolve and verify |
+
+Any failure makes the script exit **1** and print `✗` instead of `✓`, so it won't
+report success on a partial result.
+
+It also prints a **cross-check** block: the two `houston psql` commands to run
+yourself — what the plugins now hold, and what they *should* hold straight from
+`provider_purchases_primary_legal_entities`. The two provider→LE sets must be
+identical. Re-running the script is the other check: everything should come back
+as `already linked`, 0 updates.
 
 ## The task it drives
 
@@ -156,6 +197,8 @@ IDs may be comma- or whitespace-separated, and are deduped.
 - The underlying action never overwrites a non-NULL `legal_entity_id`, so a
   re-run is idempotent.
 - End-of-input aborts rather than accepting a default.
+- **Post-run read-back** — success is never claimed on the task's exit code
+  alone; a row that didn't land makes the script exit 1.
 
 ## Implementation note: prompting
 
