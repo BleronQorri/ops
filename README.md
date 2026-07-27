@@ -16,7 +16,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 **write**
 - **process_missing_sales** — backfills invoices/credit notes for sales that never produced one (export → S3 → Houston task). Step-gated.
 - **retry_invoices** — re-drives stuck KSA e-invoices: flips tracker statuses retry-eligible, then force-retries sending.
-- **plugin_legal_entity_updates** — links plugins to their primary legal entity. Fully interactive: prompts for environment, providers (all of them or a list), and dry-run-vs-apply, then runs `link_plugins_to_legal_entities_from_env`. Dry run by default; production takes two confirmations.
+- **plugin_legal_entity_updates** — three modes, picked at the first prompt: **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), and **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
 
 ### `staging/` — non-prod
 
@@ -90,33 +90,39 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```sh
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
-#   1. VERIFY OR LINK?  — verify (audit only) is the default; or link plugins
+#   1. WHICH MODE?      — pre-flight (default) / post-flight / link
 #   2. environment      — staging (eng-orion), production, or any namespace
 #   3. APPROVE READS    — target shown and confirmed BEFORE any query runs
 #   4. providers        — all of them (from account_configurations), or a list you type
-#   -- verify stops here; link continues --
-# Verify reports two things: the LINK state (is each plugin pointing at its
-# provider's primary legal entity? exit 1 on drift) and a FIELD COMPARISON of
-# provider_billing_informations (shedul) against the legal entity's jsonb fields
-# (legal_entities) — name, tax/VAT, registration no., address, country. Field
-# differences are reported but do not affect the exit code: the two sides are
-# maintained independently. Every SQL statement is echoed (cyan) before it runs.
+#   -- pre-flight and post-flight stop here with a PASS/FAIL verdict; link continues --
 #   5. dry run or apply — asked after the resolution report is on screen
 #   6. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
+#
+# THREE MODES:
+#   pre-flight   READ-ONLY. Cross-checks provider_billing_informations (shedul)
+#                against the legal entity's jsonb fields (legal_entities) — legal
+#                name, person name, tax/VAT, registration no., activity code,
+#                address, country. PASS/FAIL, exit 1 on any difference. Doesn't
+#                read plugins at all. Run this BEFORE linking.
+#   post-flight  READ-ONLY. Is each plugin pointing at its provider's primary
+#                legal entity? PASS/FAIL, exit 1 on drift. (--verify is an alias.)
+#   link         Prints the exact `houston task run … link_plugins_to_legal_entities_from_env`
+#                command, runs it, then VERIFIES by reading the rows back — a table
+#                of plugin_id / provider_id / legal entity applied / how it was
+#                verified, plus psql commands to cross-check yourself. Exits 1 if a
+#                row didn't land: the task exits 0 even when it skips everything, so
+#                its exit code alone proves nothing. Dry run is the default.
+#
+# Providers it can't resolve are listed in an "Exempt providers" table with reasons.
+# Every SQL statement is echoed (cyan) before it runs; NO_COLOR is honoured.
 # REQUIRES A TERMINAL: if stdin isn't a TTY it refuses outright (exit 1) — a piped
 # "yes" is not explicit approval, so cron/CI can't drive it. There is no --force.
-# Then it prints the exact `houston task run … link_plugins_to_legal_entities_from_env`
-# command, runs it, and VERIFIES by reading the rows back — a per-plugin table of
-# plugin_id / provider_id / legal entity applied / how it was verified, plus the psql
-# commands to cross-check it yourself. Exits 1 if any row didn't land: the task exits 0
-# even when it skips everything, so its exit code alone proves nothing.
-# Providers it can't resolve are listed in an "Exempt providers" table with reasons.
-# Dry run is the default everywhere.
 #
 # Flags just pre-answer a prompt — all optional:
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
-#       --verify           audit only — report link state, run nothing, exit 1 on drift
+#       --preflight        read-only: billing info vs legal entity, PASS/FAIL
+#       --postflight       read-only: link state, PASS/FAIL (--verify is an alias)
 #   -f, --file PATH        read provider IDs from a file (# starts a comment)
 #       --apply            DRY_RUN="false" — actually write
 #       --dry-run          DRY_RUN="true" — logs only (the default)
@@ -124,9 +130,10 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #       --print-only       print the command and stop; run nothing
 #       --json             print only the UPDATES JSON array (prompt goes to stderr)
 #
-# Reads provider_purchases_primary_legal_entities (shedul, valid_to IS NULL — the
-# same SQL as the get_primary_legal_entity_id_for_provider RPC) and
-# account_configuration_plugins (accounting_documents). Only proposes plugins with
+# Reads three DBs: provider_purchases_primary_legal_entities + provider_billing_informations
+# (shedul, valid_to IS NULL — the primary-LE query is the same SQL as the
+# get_primary_legal_entity_id_for_provider RPC), account_configuration_plugins
+# (accounting_documents), and legal_entities. Only proposes plugins with
 # legal_entity_id IS NULL, and skips — with a reason — any provider with no primary
 # LE, no plugins, or more than one unlinked plugin: a legal entity can back at most
 # one plugin (unique index).

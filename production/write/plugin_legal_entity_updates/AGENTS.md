@@ -11,18 +11,33 @@ the `link_plugins_to_legal_entities_from_env` Houston task.
 ./plugin_legal_entity_updates.js
 ```
 
-It walks you through the whole thing:
+## Three modes
+
+| Mode | Question it answers | Writes? | Exit 1 when |
+|---|---|---|---|
+| **pre-flight** *(default)* | Is the data consistent? `provider_billing_informations` vs the legal entity, field by field | never | any field differs |
+| **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | never | any link drift |
+| **link** | *do* the linking | only via apply | a row didn't land |
+
+Pre-flight and post-flight are strictly `SELECT`s. Neither reaches the Houston
+task; neither can write under any flag combination. Pre-flight doesn't even read
+the plugins table — it has nothing to do with link state.
+
+`--preflight`, `--postflight` and `--verify` (an alias for post-flight) skip the
+mode prompt.
+
+## The guided flow
 
 | Step | Prompt | Default |
 |------|--------|---------|
-| 1 | **What do you want to do?** verify (audit only) / link plugins | **verify** |
+| 1 | **What do you want to do?** pre-flight / post-flight / link | **pre-flight** |
 | 2 | **Which environment?** staging (`eng-orion`) / production / other namespace | staging |
 | 3 | **Read from these databases?** — target shown, approved *before any query runs* | — |
 | 4 | **Which providers?** every provider with an account configuration / a list you type | all |
-| 5 | *(reads both DBs)* | — |
+| 5 | *(reads — every statement echoed before it runs)* | — |
 
-**If you chose verify, it stops there** with the audit table and exits 1 on drift.
-If you chose link, it continues:
+**Pre-flight and post-flight stop here** with a `PASS`/`FAIL` verdict.
+Link continues:
 
 | Step | Prompt | Default |
 |------|--------|---------|
@@ -31,7 +46,7 @@ If you chose link, it continues:
 | 8 | **Approve the run** — non-prod one `yes`; **production** makes you type the namespace back, *then* `yes` | — |
 | 9 | *(prints the exact command, runs it, then verifies)* | — |
 
-The first prompt defaults to **verify** — the mode that cannot change anything.
+The first prompt defaults to **pre-flight** — a mode that cannot change anything.
 
 Menus take the number, a name (`prod`, `staging`, `all`, `list`, `apply`), or
 blank for the default. Every flag below is only a shortcut for pre-answering one
@@ -66,7 +81,8 @@ discovery, before anything — the target is spelled out and confirmed:
 ── About to read real data ─────────────────────────────
   namespace : production   ⚠  PRODUCTION
   psql env  : production
-  databases : shedul, accounting_documents
+  mode      : preflight   (read-only — cannot write)
+  databases : shedul, accounting_documents, legal_entities
   access    : read-only SELECTs — no writes at this stage
 Read from these databases? (type "yes"):
 ```
@@ -110,8 +126,12 @@ on **stderr** so its stdout stays pure JSON.
    ORDER BY ac.provider_id, p.id;
    ```
 
-All three are plain `SELECT`s. The only write is the Houston task, behind the
-confirmation gate.
+4. **Billing info + legal entity fields** (pre-flight only) — `provider_billing_informations`
+   from shedul, and the legal entity's jsonb `fields` from `legal_entities`. See
+   [Pre-flight](#pre-flight--is-the-data-consistent) for the shape.
+
+All are plain `SELECT`s. The only write in the whole script is the Houston task,
+behind the confirmation gate — and only in link mode.
 
 ## Where the data lives
 
@@ -163,18 +183,19 @@ skip the rest. The verification pass below is what catches which one lost.
 
 ## Verification
 
+The post-flight and link modes.
+
 Two forms: a standalone audit you can run any time, and an automatic read-back
 after an apply.
 
-### Verify mode — audit on demand
+### Post-flight — is everything linked?
 
-**Pick it at the first prompt** (it's the default), or skip the prompt with
-`--verify`. Answers "is this namespace correctly linked *right now?*" Runs no
-task, prints no command, writes nothing:
+Pick it at the first prompt, or `--postflight` (`--verify` still works). Answers
+"is this namespace correctly linked *right now?*" Runs no task, prints no
+command, writes nothing:
 
 ```sh
-./plugin_legal_entity_updates.js            # then just press Enter twice
-./plugin_legal_entity_updates.js --verify --all
+./plugin_legal_entity_updates.js --postflight --all
 ```
 
 ```
@@ -193,10 +214,9 @@ task, prints no command, writes nothing:
 | `–` | exempt | nothing to check — no primary LE, or no plugins |
 | `✗` | drift | not linked, ambiguous, or linked to the *wrong* legal entity |
 
-Exits **1** if anything is in drift, so it works as a check in a runbook.
-
-Verify then goes on to compare the *data* on each side — see
-[Field comparison](#field-comparison) below.
+Ends with a `POST-FLIGHT: PASS` / `FAIL` banner and exits **1** on drift, so it
+works as a runbook gate. For data consistency rather than link state, run
+pre-flight.
 
 It costs no extra queries — the plugin read already returns `legal_entity_id`, so
 this is pure comparison over what the script fetches anyway.
@@ -206,11 +226,17 @@ never overwrites, so a plugin pointing at the wrong legal entity needs a human
 decision. Plain `not linked` rows are just pending work: re-run without `--verify`
 and choose apply.
 
-### Field comparison
+### Pre-flight — is the data consistent?
 
-Being *linked* to a legal entity says nothing about whether the two sides hold
-the same data. So verify also diffs `provider_billing_informations` (shedul)
-against the legal entity's fields (`legal_entities`):
+The default mode, and the one to run *before* linking anything. Being linked to a
+legal entity says nothing about whether the two sides hold the same data, so
+pre-flight diffs `provider_billing_informations` (shedul) against the legal
+entity's fields (`legal_entities`), for every provider that has an account
+configuration:
+
+```sh
+./plugin_legal_entity_updates.js --preflight --all
+```
 
 ```
   ✓ provider=18  7/7 comparable fields match
@@ -256,9 +282,19 @@ first non-empty one wins.
 
 A field where *both* sides are empty isn't comparable and is skipped entirely.
 
-**Differences do not affect the exit code.** The two sides are maintained
-independently, so disagreeing is not by itself an error — this is a report, not a
-verdict. Only *link* drift fails the run. The script never edits either side.
+**The verdict.** A field difference is a **FAIL** — the whole point of a
+pre-flight is to say whether the data is fit to proceed on, and two systems
+disagreeing about a legal name or a tax number is exactly what you want to know
+before linking. Providers with no billing row or no primary legal entity are
+**warnings, not failures**: they have nothing to be inconsistent about.
+
+```
+══ PRE-FLIGHT: FAIL ════════════════════════════════════
+  ✗ 2 provider(s) where billing info and the legal entity disagree.
+  ⚠ 3 skipped: 3 with no billing row, 0 with no primary legal entity.
+```
+
+The script never edits either side — reconciling a difference is a human call.
 
 ### Automatic read-back after an apply
 

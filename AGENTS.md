@@ -29,7 +29,7 @@ the script's own `AGENTS.md`.
 |--------|-----|--------------|
 | [process_missing_sales](production/write/process_missing_sales/) | `./process_missing_sales.exs <provider_id> <sale_ids>` | Export sales to CSV → upload to S3 → run `process_missing_sales_events` task to backfill invoices/credit notes. Step-gated. Skips sales that already have a document. |
 | [retry_invoices](production/write/retry_invoices/) | `./retry_invoices.js <tracker_ids>` | Re-drive stuck KSA e-invoices: flip tracker statuses to retry-eligible, then force-retry sending via Houston tasks. |
-| [plugin_legal_entity_updates](production/write/plugin_legal_entity_updates/) | `./plugin_legal_entity_updates.js` (fully interactive) | Plugins ↔ **primary** legal entities. First prompt picks **verify** (audit only, the default — reports link state, exits 1 on drift, plus a field-by-field comparison of `provider_billing_informations` against the legal entity's jsonb fields) or **link** (runs `link_plugins_to_legal_entities_from_env`). Then prompts for env, providers (all, or a list), and dry-run-vs-apply. Reads `provider_purchases_primary_legal_entities` (shedul, `valid_to IS NULL` — same SQL as the `get_primary_legal_entity_id_for_provider` RPC) + `account_configuration_plugins`. Verifies by reading the rows back afterwards (per-plugin table + cross-check commands; exits 1 if a row didn't land) and prints an exempt-providers roster. Dry run by default. **Requires a TTY** — refuses piped/CI input outright, and gates the DB reads too, so nothing touches real data unapproved; prod apply takes three confirmations. |
+| [plugin_legal_entity_updates](production/write/plugin_legal_entity_updates/) | `./plugin_legal_entity_updates.js` (fully interactive) | Plugins ↔ **primary** legal entities. First prompt picks one of three modes: **pre-flight** (default; read-only, cross-checks `provider_billing_informations` against the legal entity's jsonb fields, PASS/FAIL), **post-flight** (read-only; link state, PASS/FAIL) or **link** (runs `link_plugins_to_legal_entities_from_env`). Then prompts for env, providers (all, or a list), and dry-run-vs-apply. Reads `provider_purchases_primary_legal_entities` (shedul, `valid_to IS NULL` — same SQL as the `get_primary_legal_entity_id_for_provider` RPC) + `account_configuration_plugins`. Verifies by reading the rows back afterwards (per-plugin table + cross-check commands; exits 1 if a row didn't land) and prints an exempt-providers roster. Dry run by default. **Requires a TTY** — refuses piped/CI input outright, and gates the DB reads too, so nothing touches real data unapproved; prod apply takes three confirmations. |
 
 ## staging/write/
 
@@ -41,9 +41,12 @@ the script's own `AGENTS.md`.
 
 ## Danger tiers
 
-- **Read-only:** `invopop_supplier_check`, `onboard_location_scripts` (plus any `--dry-run` path).
+- **Read-only:** `invopop_supplier_check`, `onboard_location_scripts`,
+  `plugin_legal_entity_updates` in **pre-flight** or **post-flight** mode
+  (SELECTs only — cannot write under any flag), plus any `--dry-run` path.
 - **Prod writes (gated, reversible-ish):** `process_missing_sales`, `retry_invoices`,
-  `plugin_legal_entity_updates` (dry run by default; two confirmations on prod).
+  `plugin_legal_entity_updates` in **link** mode (dry run by default; requires a
+  TTY; three confirmations on a prod apply).
 - **Sandbox / external:** `deregister_suppliers` (Invopop sandbox), `confirm_sent_uat` (Comarch UAT).
 - **Staging destructive wipe (gated):** `clear_provider_einvoicing` (deletes a provider's e-invoicing rows; refuses prod).
 

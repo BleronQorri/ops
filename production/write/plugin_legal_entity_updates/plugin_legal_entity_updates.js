@@ -63,11 +63,16 @@
 // legal_entity_id are left alone (the task would skip them anyway —
 // BackfillAccountConfigurationPluginLegalEntityIdAction never overwrites).
 //
+// THREE MODES, picked at the first prompt:
+//   pre-flight   is the data consistent? (billing info vs legal entity)  READ-ONLY
+//   post-flight  is everything linked?   (plugin vs primary legal entity) READ-ONLY
+//   link         resolve and run the task — the only mode that can write
+//
 // Usage:
 //   ./plugin_legal_entity_updates.js                        # guided — just run it
-//   ./plugin_legal_entity_updates.js --verify --all         # audit only: is it linked?
+//   ./plugin_legal_entity_updates.js --preflight --all      # data consistency, pass/fail
+//   ./plugin_legal_entity_updates.js --postflight --all     # link state, pass/fail
 //   ./plugin_legal_entity_updates.js 12345,67890            # skip the provider prompt
-//   ./plugin_legal_entity_updates.js --all                  # every provider with a config
 //   ./plugin_legal_entity_updates.js -n production --apply 12345
 //   ./plugin_legal_entity_updates.js --print-only 12345     # don't run it
 
@@ -248,7 +253,8 @@ function parseArgs(argv) {
     json: false,
     printOnly: false,
     all: false,
-    verify: false,
+    // "preflight" | "postflight" | "link" — null until chosen (flag or prompt).
+    mode: null,
     file: null,
     providerIds: null,
     help: false,
@@ -267,14 +273,23 @@ function parseArgs(argv) {
     else if (a === "--apply") {
       opts.apply = true;
       opts.modeGiven = true;
+      opts.mode = "link";
     } else if (a === "--dry-run") {
       opts.apply = false;
       opts.modeGiven = true;
+      opts.mode = "link";
     } else if (a === "--all") opts.all = true;
-    else if (a === "--verify") opts.verify = true;
-    else if (a === "--print-only") opts.printOnly = true;
-    else if (a === "--json") opts.json = true;
-    else if (a === "--help" || a === "-h") opts.help = true;
+    else if (a === "--preflight" || a === "--pre-flight") opts.mode = "preflight";
+    // --verify was the old name for the link audit; kept as an alias.
+    else if (a === "--postflight" || a === "--post-flight" || a === "--verify") {
+      opts.mode = "postflight";
+    } else if (a === "--print-only") {
+      opts.printOnly = true;
+      opts.mode = opts.mode || "link";
+    } else if (a === "--json") {
+      opts.json = true;
+      opts.mode = opts.mode || "link";
+    } else if (a === "--help" || a === "-h") opts.help = true;
     else rest.push(a);
   }
   if (rest.length) opts.providerIds = rest.join(",");
@@ -301,9 +316,10 @@ Flags (each one just pre-answers a prompt):
       --all              Every provider in account_configurations
   -f, --file PATH        Read provider IDs from a file (one per line, or any
                          comma/whitespace-separated mix; # starts a comment)
-      --verify           AUDIT ONLY. Compare what each plugin holds against its
-                         provider's primary legal entity and report. Runs no
-                         task, writes nothing. Exits 1 if anything is off.
+      --preflight        READ-ONLY. Cross-check provider_billing_informations
+                         against the legal entity, field by field. PASS/FAIL.
+      --postflight       READ-ONLY. Is every plugin pointing at its provider's
+                         primary legal entity? PASS/FAIL. (--verify is an alias.)
       --apply            DRY_RUN="false" — actually write
       --dry-run          DRY_RUN="true" — logs only (the default)
   -s, --service NAME     Houston service (default: ${DEFAULT_SERVICE})
@@ -316,27 +332,36 @@ Flags (each one just pre-answers a prompt):
 REQUIRES A TERMINAL. If stdin is not a TTY the script refuses to run — a piped
 "yes" is not explicit approval, so cron/CI cannot drive it. No --force escape.
 
+Three modes, asked as the first prompt:
+
+  PRE-FLIGHT   Is the data consistent? Cross-checks provider_billing_informations
+   (default)   (${SHEDUL_DB}) against the legal entity's fields (${LE_DB})
+               — name, tax/VAT, registration no., address, country. PASS/FAIL,
+               exit 1 on any difference. Never reads plugins. READ-ONLY.
+
+  POST-FLIGHT  Is everything linked? Compares each plugin's legal_entity_id
+               against its provider's primary. PASS/FAIL, exit 1 on drift.
+               READ-ONLY.
+
+  LINK         Resolve, then run ${TASK}.
+               The only mode that can write, and only via apply.
+
 The guided flow:
-  1. VERIFY OR LINK?  — verify (audit only, the default) or link plugins
+  1. WHICH MODE?      — pre-flight (default), post-flight, or link
   2. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
   3. APPROVE READS    — the target is shown and confirmed before ANY query runs
   4. providers        — all of them, or a list you type
-  5. reads (read-only) houston psql <env> ${SHEDUL_DB}
-                       → provider_purchases_primary_legal_entities
-                       houston psql <env> ${AD_DB}
-                       → account_configurations + account_configuration_plugins
+  5. reads (read-only) — every statement is echoed before it runs
 
-  If you chose VERIFY it stops here with the audit table (exit 1 on drift).
-  If you chose LINK it continues:
+  PRE-FLIGHT and POST-FLIGHT stop here with a PASS/FAIL verdict.
+  LINK continues:
 
   6. report           — what resolved, and which providers are exempt
   7. dry run or apply — asked with the report on screen
   8. APPROVE THE RUN  — non-prod: one "yes". PRODUCTION: type the namespace
                         back, THEN "yes".
   9. runs the task    — the exact command is printed before it runs
- 10. verifies         — reads the rows back and prints a per-plugin table plus
-                        the psql commands to cross-check it yourself. Exits 1
-                        if anything didn't land.
+ 10. reads back       — proves what actually landed. Exits 1 if anything didn't.
 
 Providers are skipped (and listed in an "Exempt providers" table) when they have
 no active primary legal entity, no account configuration, no plugin with a NULL
@@ -899,17 +924,49 @@ function printFieldComparison(comparisons) {
       `${withDiffs.length ? c.bad(`✗ ${withDiffs.length} differ`) : `✗ 0 differ`}`
   );
 
-  if (withDiffs.length) {
+  return { clean: clean.length, noBilling: noBilling.length, differ: withDiffs.length };
+}
+
+// The pre-flight verdict. A field difference is a FAIL: the whole point of a
+// pre-flight is to say whether the data is fit to proceed on, and two systems
+// disagreeing about a legal name or a tax number is precisely what you want to
+// know before linking anything.
+//
+// Missing rows are warnings, not failures — a provider with no billing info or
+// no primary legal entity has nothing to be inconsistent about. Those are gaps
+// to notice, not contradictions.
+function printPreflightVerdict(tally, missingLegalEntity) {
+  const failed = tally.differ > 0;
+  const warnings = tally.noBilling + missingLegalEntity;
+
+  console.log(
+    failed
+      ? c.bad("\n══ PRE-FLIGHT: FAIL ════════════════════════════════════")
+      : c.ok("\n══ PRE-FLIGHT: PASS ════════════════════════════════════")
+  );
+
+  if (failed) {
     console.log(
-      c.faint(
-        "\n  A difference is not necessarily wrong — billing info and the legal entity\n" +
-          "  are maintained separately. This is a report, not a verdict; nothing here\n" +
-          "  changes the link state above, and this script never edits either side."
-      )
+      `  ${c.bad("✗")} ${tally.differ} provider(s) where billing info and the legal entity disagree.`
+    );
+    console.log(c.faint("    Reconcile those before linking — see the tables above."));
+  } else {
+    console.log(
+      `  ${c.ok("✓")} ${tally.clean} provider(s) checked, every comparable field agrees.`
     );
   }
 
-  return withDiffs.length;
+  if (warnings) {
+    console.log(
+      `  ${c.warn("⚠")} ${warnings} skipped: ` +
+        `${tally.noBilling} with no billing row, ` +
+        `${missingLegalEntity} with no primary legal entity.` +
+        c.faint("  (Nothing to compare — not counted as a failure.)")
+    );
+  }
+
+  console.log(c.faint("\n  Read-only: this mode issues SELECTs and nothing else."));
+  return failed;
 }
 
 // --- audit (--verify) --------------------------------------------------------
@@ -1177,13 +1234,18 @@ function printExemptProviders(skipped) {
 async function askMode() {
   return askChoice("What do you want to do?", [
     {
-      label: "Verify — check what's linked, change nothing",
-      aliases: ["verify", "check", "audit", "read"],
-      value: "verify",
+      label: "Pre-flight  — is the data consistent? (read-only, pass/fail)",
+      aliases: ["pre", "preflight", "pre-flight", "check", "data"],
+      value: "preflight",
       default: true,
     },
     {
-      label: "Link plugins to their primary legal entity",
+      label: "Post-flight — is everything linked? (read-only, pass/fail)",
+      aliases: ["post", "postflight", "post-flight", "verify", "audit"],
+      value: "postflight",
+    },
+    {
+      label: "Link        — link plugins to their primary legal entity",
       aliases: ["link", "apply", "run", "fix"],
       value: "link",
     },
@@ -1292,7 +1354,8 @@ async function confirmDataAccess(opts, env) {
   say(c.head("\n── About to read real data ─────────────────────────────"));
   say(`  namespace : ${opts.namespace}${prod ? "   ⚠  PRODUCTION" : ""}`);
   say(`  psql env  : ${env}`);
-  say(`  databases : ${SHEDUL_DB}, ${AD_DB}`);
+  say(`  mode      : ${opts.mode}${opts.mode === "link" ? "" : "   (read-only — cannot write)"}`);
+  say(`  databases : ${[SHEDUL_DB, AD_DB, LE_DB].join(", ")}`);
   say("  access    : read-only SELECTs — no writes at this stage");
 
   const ans = (await ask('Read from these databases? (type "yes"): ')).trim().toLowerCase();
@@ -1344,12 +1407,9 @@ async function main() {
     console.log("plugin_legal_entity_updates — plugins ↔ primary legal entities");
   }
 
-  // 1. Verify or link? Asked first — it decides everything downstream. Any flag
-  //    that only makes sense in one mode already answers this.
-  const modeImplied = opts.verify || opts.modeGiven || opts.printOnly || opts.json;
-  if (!modeImplied) {
-    opts.verify = (await askMode()) === "verify";
-  }
+  // 1. Which mode? Asked first — it decides everything downstream. Any flag that
+  //    only makes sense in one mode has already answered this.
+  if (!opts.mode) opts.mode = await askMode();
 
   // 2. Environment — -n, or prompt. Before the reads, because discovering
   //    providers is itself a query against the chosen namespace.
@@ -1393,49 +1453,69 @@ async function main() {
   if (!opts.json) console.log(c.faint(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`));
   const primaryByProvider = fetchPrimaryLegalEntities(env, providerIds);
 
+  // PRE-FLIGHT stops here. It never touches plugins — it asks only whether the
+  // data on the two sides agrees, which is what you want to know *before*
+  // linking anything. Strictly SELECTs.
+  if (opts.mode === "preflight") {
+    const withLegalEntity = providerIds.filter((id) => primaryByProvider.has(id));
+    const missingLegalEntity = providerIds.length - withLegalEntity.length;
+
+    if (!withLegalEntity.length) {
+      console.log(
+        c.warn("\nNone of these providers has an active primary legal entity — nothing to compare.")
+      );
+      return;
+    }
+
+    console.log(c.faint(`Reading provider_billing_informations from ${SHEDUL_DB} (read-only)…`));
+    const billing = fetchBillingInformations(env, withLegalEntity);
+
+    console.log(c.faint(`Reading legal entity fields from ${LE_DB} (read-only)…`));
+    const leFields = fetchLegalEntityFields(env, [
+      ...new Set(withLegalEntity.map((id) => primaryByProvider.get(id))),
+    ]);
+
+    const tally = printFieldComparison(
+      withLegalEntity.map((id) =>
+        compareFields(id, billing.get(id), leFields.get(primaryByProvider.get(id)))
+      )
+    );
+
+    if (printPreflightVerdict(tally, missingLegalEntity)) process.exitCode = 1;
+    return;
+  }
+
   // 6. Resolve plugins (accounting_documents) ------------------------------
   if (!opts.json) console.log(c.faint(`Reading plugins from ${AD_DB} (read-only)…`));
   const pluginsByProvider = fetchPlugins(env, providerIds);
 
-  // --verify stops here: audit what's already linked and report. No task, no
-  // command, no writes — just "is this namespace correct right now?"
-  if (opts.verify) {
+  // POST-FLIGHT stops here: is every plugin pointing at its provider's primary
+  // legal entity? No task, no command, no writes.
+  if (opts.mode === "postflight") {
     const audit = auditProviders(providerIds, primaryByProvider, pluginsByProvider);
     const drift = printAudit(opts, audit);
-
-    // Second half of the audit: does the data on each side actually agree?
-    // Only providers with a primary legal entity have anything to compare.
-    const comparable = audit.filter((a) => a.expected);
-    let fieldDiffs = 0;
-
-    if (comparable.length) {
-      console.log(c.faint(`\nReading provider_billing_informations from ${SHEDUL_DB}…`));
-      const billing = fetchBillingInformations(env, comparable.map((a) => a.providerId));
-
-      console.log(c.faint(`Reading legal entity fields from ${LE_DB}…`));
-      const leFields = fetchLegalEntityFields(env, [
-        ...new Set(comparable.map((a) => a.expected)),
-      ]);
-
-      fieldDiffs = printFieldComparison(
-        comparable.map((a) =>
-          compareFields(a.providerId, billing.get(a.providerId), leFields.get(a.expected))
-        )
-      );
-    }
 
     printCrossCheck(opts, audit.filter((a) => a.plugin).map((a) => ({
       plugin_id: a.plugin.id,
       _providerId: a.providerId,
     })));
 
-    // Link drift fails the run. Field differences are reported, not enforced —
-    // the two sides are maintained independently and disagreeing is not by
-    // itself an error.
+    console.log(
+      drift
+        ? c.bad("\n══ POST-FLIGHT: FAIL ═══════════════════════════════════")
+        : c.ok("\n══ POST-FLIGHT: PASS ═══════════════════════════════════")
+    );
+    console.log(
+      drift
+        ? `  ${c.bad("✗")} ${drift} provider(s) not correctly linked. See the table above.`
+        : `  ${c.ok("✓")} every provider that can be linked is linked correctly.`
+    );
+    console.log(
+      c.faint("\n  Read-only: this mode issues SELECTs and nothing else.") +
+        c.faint("\n  For data consistency between billing info and the legal entity, run pre-flight.")
+    );
+
     if (drift) process.exitCode = 1;
-    if (fieldDiffs && !drift) {
-      console.log(c.faint("\n(Field differences do not affect the exit code.)"));
-    }
     return;
   }
 
