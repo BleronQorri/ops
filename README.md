@@ -91,9 +91,12 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
 #   1. environment      — staging (eng-orion), production, or any namespace
-#   2. providers        — all of them (from account_configurations), or a list you type
-#   3. dry run or apply — asked after the resolution report is on screen
-#   4. confirm          — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
+#   2. APPROVE READS    — target shown and confirmed BEFORE any query runs
+#   3. providers        — all of them (from account_configurations), or a list you type
+#   4. dry run or apply — asked after the resolution report is on screen
+#   5. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
+# REQUIRES A TERMINAL: if stdin isn't a TTY it refuses outright (exit 1) — a piped
+# "yes" is not explicit approval, so cron/CI can't drive it. There is no --force.
 # Then it prints the exact `houston task run … link_plugins_to_legal_entities_from_env`
 # command, runs it, and VERIFIES by reading the rows back — a per-plugin table of
 # plugin_id / provider_id / legal entity applied / how it was verified, plus the psql
@@ -110,7 +113,7 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #       --dry-run          DRY_RUN="true" — logs only (the default)
 #   -s, --service NAME     Houston service (default: accounting-documents)
 #       --print-only       print the command and stop; run nothing
-#       --json             print only the UPDATES JSON array; never prompts
+#       --json             print only the UPDATES JSON array (prompt goes to stderr)
 #
 # Reads provider_purchases_primary_legal_entities (shedul, valid_to IS NULL — the
 # same SQL as the get_primary_legal_entity_id_for_provider RPC) and

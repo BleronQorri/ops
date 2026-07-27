@@ -154,30 +154,36 @@ Flags (each one just pre-answers a prompt):
       --dry-run          DRY_RUN="true" — logs only (the default)
   -s, --service NAME     Houston service (default: ${DEFAULT_SERVICE})
       --print-only       Print the Houston command and stop; run nothing
-      --json             Print only the UPDATES JSON array; never prompts, so it
-                         needs provider IDs or --all
+      --json             Print only the UPDATES JSON array (stdout); prompts for
+                         the data-access approval on stderr. Takes provider IDs
+                         or --all; it does not prompt for those.
   -h, --help             Show this help
+
+REQUIRES A TERMINAL. If stdin is not a TTY the script refuses to run — a piped
+"yes" is not explicit approval, so cron/CI cannot drive it. No --force escape.
 
 The guided flow:
   1. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
-  2. providers        — all of them, or a list you type
-  3. reads (read-only) houston psql <env> ${SHEDUL_DB}
+  2. APPROVE READS    — the target is shown and confirmed before ANY query runs
+  3. providers        — all of them, or a list you type
+  4. reads (read-only) houston psql <env> ${SHEDUL_DB}
                        → provider_purchases_primary_legal_entities
                        houston psql <env> ${AD_DB}
                        → account_configurations + account_configuration_plugins
-  4. report           — what resolved, and why anything was skipped
-  5. dry run or apply — asked with the report on screen
-  6. confirm          — non-prod: one "yes". PRODUCTION: type the namespace
+  5. report           — what resolved, and which providers are exempt
+  6. dry run or apply — asked with the report on screen
+  7. APPROVE THE RUN  — non-prod: one "yes". PRODUCTION: type the namespace
                         back, THEN "yes".
-  7. runs the task    — the exact command is printed before it runs
-  8. verifies         — reads the rows back and prints a per-plugin table plus
+  8. runs the task    — the exact command is printed before it runs
+  9. verifies         — reads the rows back and prints a per-plugin table plus
                         the psql commands to cross-check it yourself. Exits 1
                         if anything didn't land.
 
-Providers are skipped (and reported) when they have no active primary legal
-entity, no account configuration, no plugin with a NULL legal_entity_id, or more
-than one such plugin — the unique index means only one plugin can hold a given
-legal entity, so an ambiguous provider is never auto-resolved.`);
+Providers are skipped (and listed in an "Exempt providers" table) when they have
+no active primary legal entity, no account configuration, no plugin with a NULL
+legal_entity_id, or more than one such plugin — the unique index means only one
+plugin can hold a given legal entity, so an ambiguous provider is never
+auto-resolved.`);
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -241,10 +247,14 @@ let inputClosed = false;
 const bufferedLines = []; // lines that arrived before anyone asked for them
 const waitingAskers = []; // resolvers parked until the next line shows up
 
+// Where prompts are written. --json keeps stdout pure for the payload, so its
+// gate has to talk on stderr instead. Set once, before the first ask().
+let promptStream = output;
+
 function ensureRl() {
   if (rl) return rl;
 
-  rl = readline.createInterface({ input, output });
+  rl = readline.createInterface({ input, output: promptStream });
   rl.on("line", (line) => {
     const waiter = waitingAskers.shift();
     if (waiter) waiter(line);
@@ -272,7 +282,7 @@ function endOfInput() {
 
 async function ask(question) {
   ensureRl();
-  output.write(question);
+  promptStream.write(question);
 
   if (bufferedLines.length) return bufferedLines.shift();
   if (inputClosed) endOfInput();
@@ -770,8 +780,43 @@ async function askProviderIds(env) {
   throw new Error("No valid provider IDs given.");
 }
 
-// Confirmation gate. Non-prod takes a single "yes"/"y"; production makes you type
-// the namespace back first and then requires an exact "yes".
+// Approval must come from a human at a keyboard. Piped stdin is refused outright
+// rather than allowed to answer the gates: a "yes" arriving down a pipe is an
+// automated approval, which is exactly what these gates exist to prevent. This
+// also rules out cron/CI driving the script by accident.
+//
+// There is deliberately no --force/--yes escape hatch. Tests allocate a real pty
+// (`script -q /dev/null …`) instead of piping.
+function requireInteractive() {
+  if (input.isTTY) return;
+
+  throw new Error(
+    "Refusing to touch real data without an interactive terminal.\n" +
+      "  stdin is not a TTY, so approval could only come from a pipe or a script —\n" +
+      "  and a piped \"yes\" is not explicit approval. Run this from a terminal.\n" +
+      "  Nothing was read and nothing was run."
+  );
+}
+
+// First gate, before ANY database access. Everything downstream — provider
+// discovery, the primary-LE lookup, the plugin read — hits a real namespace, so
+// the target is spelled out and approved before a single query goes out.
+async function confirmDataAccess(opts, env) {
+  const prod = isProd(opts.namespace);
+  const say = (line) => promptStream.write(`${line}\n`);
+
+  say("\n── About to read real data ─────────────────────────────");
+  say(`  namespace : ${opts.namespace}${prod ? "   ⚠  PRODUCTION" : ""}`);
+  say(`  psql env  : ${env}`);
+  say(`  databases : ${SHEDUL_DB}, ${AD_DB}`);
+  say("  access    : read-only SELECTs — no writes at this stage");
+
+  const ans = (await ask('Read from these databases? (type "yes"): ')).trim().toLowerCase();
+  return prod ? ans === "yes" : ans === "yes" || ans === "y";
+}
+
+// Confirmation gate for the write. Non-prod takes a single "yes"/"y"; production
+// makes you type the namespace back first and then requires an exact "yes".
 async function confirmRun(opts) {
   const prod = isProd(opts.namespace);
 
@@ -799,11 +844,15 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) return usage();
 
-  // --json is the pipeable mode: it must not prompt, so everything it needs has
-  // to arrive as flags/args.
+  // Nothing below this line may touch a database without a human present.
+  requireInteractive();
+  if (opts.json) promptStream = process.stderr;
+
+  // --json still resolves its inputs from flags rather than prompts (its stdout
+  // has to stay pure JSON), but it is not exempt from the approval gate.
   if (opts.json && !opts.providerIds && !opts.file && !opts.all) {
     throw new Error(
-      "--json needs provider IDs (argument or --file), or --all (it never prompts)."
+      "--json needs provider IDs (argument or --file), or --all (it does not prompt for them)."
     );
   }
 
@@ -818,7 +867,13 @@ async function main() {
   }
   const env = psqlEnv(opts.namespace);
 
-  // 2. Provider IDs — argument, --file, --all, or prompt --------------------
+  // 2. Approve the data access itself, before any query goes out ------------
+  if (!(await confirmDataAccess(opts, env))) {
+    console.log("Aborted. Nothing was read.");
+    return;
+  }
+
+  // 3. Provider IDs — argument, --file, --all, or prompt --------------------
   let raw = opts.providerIds;
   if (opts.file) {
     const fromFile = fs.readFileSync(opts.file, "utf8");
@@ -843,15 +898,15 @@ async function main() {
     console.log(`Providers requested: ${providerIds.length} — ${providerIds.join(", ")}`);
   }
 
-  // 3. Resolve primary legal entities (shedul) -----------------------------
+  // 4. Resolve primary legal entities (shedul) -----------------------------
   if (!opts.json) console.log(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`);
   const primaryByProvider = fetchPrimaryLegalEntities(env, providerIds);
 
-  // 4. Resolve plugins (accounting_documents) ------------------------------
+  // 5. Resolve plugins (accounting_documents) ------------------------------
   if (!opts.json) console.log(`Reading plugins from ${AD_DB} (read-only)…`);
   const pluginsByProvider = fetchPlugins(env, providerIds);
 
-  // 5. Pair them up --------------------------------------------------------
+  // 6. Pair them up --------------------------------------------------------
   const { updates, skipped } = resolve(providerIds, primaryByProvider, pluginsByProvider);
 
   if (opts.json) {
@@ -895,14 +950,14 @@ async function main() {
     return;
   }
 
-  // 6. Dry run or apply — --apply/--dry-run, or prompt ---------------------
+  // 7. Dry run or apply — --apply/--dry-run, or prompt ---------------------
   // Asked here, after the report, so the decision is made with the actual
   // plugin list on screen.
   if (!opts.modeGiven && !opts.printOnly) {
     opts.apply = await askApply(opts.namespace);
   }
 
-  // 7. Print the command ---------------------------------------------------
+  // 8. Print the command ---------------------------------------------------
   console.log(
     `\n── Command ─────────────────────────────────────────────` +
       (opts.apply ? "" : "\n(DRY_RUN=true — logs only, writes nothing)")
@@ -914,7 +969,7 @@ async function main() {
     return;
   }
 
-  // 8. Confirm + run -------------------------------------------------------
+  // 9. Confirm + run -------------------------------------------------------
   // --no-tui -w are appended so the task's logs stream into this terminal;
   // runInherit echoes the full argv before it spawns.
   if (!(await confirmRun(opts))) {
@@ -924,7 +979,7 @@ async function main() {
 
   runInherit("houston", [...taskArgs(opts, updates), "--no-tui", "-w"]);
 
-  // 9. Verify — read the rows back and prove what actually landed -----------
+  // 10. Verify — read the rows back and prove what actually landed -----------
   // The task exits 0 even when it skips every single row, so a green exit is
   // not evidence. Only the read-back is.
   console.log(`\nVerifying against ${AD_DB} (read-only)…`);

@@ -16,11 +16,12 @@ It walks you through the whole thing:
 | Step | Prompt | Default |
 |------|--------|---------|
 | 1 | **Which environment?** staging (`eng-orion`) / production / other namespace | staging |
-| 2 | **Which providers?** every provider with an account configuration / a list you type | all |
-| 3 | *(reads both DBs, prints the resolution report)* | — |
-| 4 | **Dry run or apply?** — asked with the report on screen | dry run |
-| 5 | **Confirm** — non-prod one `yes`; **production** makes you type the namespace back, *then* `yes` | — |
-| 6 | *(prints the exact command, runs it, then verifies)* | — |
+| 2 | **Read from these databases?** — target shown, approved *before any query runs* | — |
+| 3 | **Which providers?** every provider with an account configuration / a list you type | all |
+| 4 | *(reads both DBs, prints the resolution report + exempt roster)* | — |
+| 5 | **Dry run or apply?** — asked with the report on screen | dry run |
+| 6 | **Approve the run** — non-prod one `yes`; **production** makes you type the namespace back, *then* `yes` | — |
+| 7 | *(prints the exact command, runs it, then verifies)* | — |
 
 Menus take the number, a name (`prod`, `staging`, `all`, `list`, `apply`), or
 blank for the default. Every flag below is only a shortcut for pre-answering one
@@ -28,6 +29,45 @@ of these prompts — skip a flag and you simply get asked instead.
 
 Running out of input (Ctrl-D, or a piped script one line short) **aborts**; it
 never falls through to a default. Nothing is run.
+
+## Nothing touches real data without your approval
+
+Two properties, together, are what make that true:
+
+**1. It requires a terminal.** If `stdin` is not a TTY the script refuses before
+any query — exit 1, nothing read, nothing run:
+
+```
+Error: Refusing to touch real data without an interactive terminal.
+  stdin is not a TTY, so approval could only come from a pipe or a script —
+  and a piped "yes" is not explicit approval. Run this from a terminal.
+```
+
+A `yes` arriving down a pipe is an *automated* approval, which is exactly what
+these gates exist to prevent. This also means cron, CI, or another script cannot
+drive it. **There is deliberately no `--force`/`--yes` escape hatch.** Tests
+allocate a real pty, or preload a harness module that fakes `isTTY` — that trick
+lives in the test rig, never in the script.
+
+**2. Reads are gated too, up front.** Before the first `psql` — before provider
+discovery, before anything — the target is spelled out and confirmed:
+
+```
+── About to read real data ─────────────────────────────
+  namespace : production   ⚠  PRODUCTION
+  psql env  : production
+  databases : shedul, accounting_documents
+  access    : read-only SELECTs — no writes at this stage
+Read from these databases? (type "yes"):
+```
+
+Production requires an exact `yes`; other namespaces also accept `y`. Declining
+prints `Aborted. Nothing was read.` and exits without a single query.
+
+So there are **two** approvals on a dry run and **three** on a production apply
+(read gate → namespace echo → `yes`). `--print-only` and `--json` still pass the
+read gate — they query real databases, so they are not exempt. `--json` prompts
+on **stderr** so its stdout stays pure JSON.
 
 ## What it reads
 
@@ -188,6 +228,10 @@ IDs may be comma- or whitespace-separated, and are deduped.
 
 ## Safety
 
+- **Requires a terminal** — no TTY, no run. A piped `yes` is not approval, and
+  there is no `--force`.
+- **Reads are approved before any query**, with the namespace and databases
+  shown.
 - **Dry run is the default** at every level: the prompt defaults to it, and
   omitting `--apply` emits `DRY_RUN="true"`.
 - The exact command is printed **before** the confirmation, and echoed again
