@@ -94,7 +94,13 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #   2. environment      — staging (eng-orion), production, or any namespace
 #   3. APPROVE READS    — target shown and confirmed BEFORE any query runs
 #   4. providers        — all of them (from account_configurations), or a list you type
-#   -- verify stops here with an audit table (exit 1 on drift); link continues --
+#   -- verify stops here; link continues --
+# Verify reports two things: the LINK state (is each plugin pointing at its
+# provider's primary legal entity? exit 1 on drift) and a FIELD COMPARISON of
+# provider_billing_informations (shedul) against the legal entity's jsonb fields
+# (legal_entities) — name, tax/VAT, registration no., address, country. Field
+# differences are reported but do not affect the exit code: the two sides are
+# maintained independently. Every SQL statement is echoed (cyan) before it runs.
 #   5. dry run or apply — asked after the resolution report is on screen
 #   6. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
 # REQUIRES A TERMINAL: if stdin isn't a TTY it refuses outright (exit 1) — a piped

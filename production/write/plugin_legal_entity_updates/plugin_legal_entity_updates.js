@@ -78,10 +78,122 @@ const fs = require("fs");
 
 // --- constants -------------------------------------------------------------
 
-// The primary-legal-entity pointer is owned by shedul; plugins live in
-// accounting_documents. Two databases, two reads.
+// The primary-legal-entity pointer and provider_billing_informations are owned
+// by shedul; plugins live in accounting_documents; the legal entities themselves
+// live in their own service.
 const SHEDUL_DB = "shedul";
 const AD_DB = "accounting_documents";
+const LE_DB = "legal_entities";
+
+// What provider_billing_informations (shedul) says vs what the legal entity
+// (legal_entities) says. `le` lists candidate field keys in priority order —
+// legal_entities stores its data as a jsonb array of {key, value}, and which key
+// carries a value varies by entity type and country. tax_number, for instance,
+// lands in organization.vatNumber for IT but taxInformation.number elsewhere, so
+// both are checked and the first non-empty one wins.
+// `only` restricts a field to one kind of legal entity. Without it we'd report
+// every organization as "first name missing": provider_billing_informations
+// carries a contact person's name regardless of account type, while an
+// organization legal entity has no individual.* fields at all. That's a shape
+// difference, not a data discrepancy, and flagging it would bury the real ones.
+const FIELD_COMPARISON = [
+  {
+    label: "legal name",
+    pbi: "company_name",
+    le: ["organization.legalName", "trust.name"],
+    only: "organization",
+  },
+  {
+    label: "first name",
+    pbi: "first_name",
+    le: ["individual.name.firstName"],
+    only: "individual",
+  },
+  {
+    label: "last name",
+    pbi: "last_name",
+    le: ["individual.name.lastName"],
+    only: "individual",
+  },
+  {
+    label: "tax / VAT no.",
+    pbi: "tax_number",
+    le: [
+      "organization.vatNumber",
+      "organization.taxInformation.number",
+      "trust.taxInformation.number",
+    ],
+  },
+  {
+    label: "registration no.",
+    pbi: "company_registration_number",
+    le: ["organization.registrationNumber", "trust.registrationNumber"],
+    only: "organization",
+  },
+  {
+    label: "activity code",
+    pbi: "activity_code",
+    le: ["organization.activityCode"],
+    only: "organization",
+  },
+  {
+    label: "street",
+    pbi: "address",
+    le: [
+      "organization.registeredAddress.street",
+      "individual.residentialAddress.street",
+    ],
+  },
+  {
+    label: "city",
+    pbi: "city",
+    le: ["organization.registeredAddress.city", "individual.residentialAddress.city"],
+  },
+  {
+    label: "postal code",
+    pbi: "postal_code",
+    le: [
+      "organization.registeredAddress.postalCode",
+      "individual.residentialAddress.postalCode",
+    ],
+  },
+  {
+    label: "state/province",
+    pbi: "state_province",
+    le: [
+      "organization.registeredAddress.stateOrProvince",
+      "individual.residentialAddress.stateOrProvince",
+    ],
+  },
+  {
+    label: "country",
+    pbi: "country_code",
+    // Falls back to the legal_entities.country_code column, surfaced as a
+    // pseudo-key by the query below.
+    le: [
+      "organization.registeredAddress.country",
+      "individual.residentialAddress.country",
+      "_column.country_code",
+    ],
+  },
+];
+
+// The provider_billing_informations columns the comparison needs, in the order
+// the query selects them.
+const PBI_COLUMNS = [
+  "provider_id",
+  "company_name",
+  "first_name",
+  "last_name",
+  "country_code",
+  "state_province",
+  "city",
+  "postal_code",
+  "address",
+  "tax_number",
+  "company_registration_number",
+  "activity_code",
+];
 
 const DEFAULT_NAMESPACE = "eng-orion";
 const DEFAULT_SERVICE = "accounting-documents";
@@ -89,6 +201,42 @@ const TASK = "link_plugins_to_legal_entities_from_env";
 
 // Namespaces that get the second confirmation gate.
 const PROD_NAMESPACES = new Set(["production", "prod"]);
+
+// --- colour ------------------------------------------------------------------
+//
+// Same convention as onboard_location_scripts.exs: cyan for SQL, yellow for a
+// command you could run yourself, bright white for section headers, faint for
+// progress chatter. Off when stdout isn't a terminal, or when NO_COLOR is set
+// (https://no-color.org) — so piping to a file or a pager stays clean.
+
+const COLOR = output.isTTY && !process.env.NO_COLOR;
+const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+
+const c = {
+  sql: sgr("36"), // cyan   — a query about to run
+  cmd: sgr("33"), // yellow — a command you could run yourself
+  head: sgr("1;37"), // bright white — section headers
+  faint: sgr("2"), // faint  — progress
+  ok: sgr("32"), // green
+  bad: sgr("1;31"), // bright red
+  warn: sgr("1;33"), // bright yellow
+};
+
+// A long IN(...) list would drown the terminal — --all on production is
+// thousands of ids. Show enough to recognise the query, then say what was cut.
+const SQL_ECHO_LIMIT = 500;
+
+// Echo a statement before it runs, indented and cyan. Goes to the human channel
+// (stderr under --json) so it never contaminates a payload.
+function echoSql(label, sql) {
+  const shown =
+    sql.length > SQL_ECHO_LIMIT
+      ? `${sql.slice(0, SQL_ECHO_LIMIT)}\n… (${sql.length - SQL_ECHO_LIMIT} more chars)`
+      : sql;
+
+  promptStream.write(`  ${c.faint(label)}\n`);
+  for (const line of shown.split("\n")) promptStream.write(`    ${c.sql(line)}\n`);
+}
 
 // --- arg parsing -----------------------------------------------------------
 
@@ -353,8 +501,11 @@ function isProd(namespace) {
 }
 
 // Read-only psql. -t -A -F| gives bare pipe-delimited rows; a NULL column comes
-// back as an empty field.
+// back as an empty field. Every statement is echoed before it runs — this script
+// reads production, so what it asks for should never be a mystery.
 function psqlRead(env, db, sql) {
+  echoSql(`houston psql ${env} ${db}`, sql);
+
   return runCapture("houston", [
     "psql",
     env,
@@ -390,9 +541,10 @@ function parseRows(out, fieldCount) {
 // integers before they get here, so interpolation is safe.
 function fetchPrimaryLegalEntities(env, providerIds) {
   const sql =
-    "SELECT provider_id, legal_entity_id " +
-    "FROM provider_purchases_primary_legal_entities " +
-    `WHERE provider_id IN (${providerIds.join(",")}) AND valid_to IS NULL;`;
+    "SELECT provider_id, legal_entity_id\n" +
+    "FROM provider_purchases_primary_legal_entities\n" +
+    `WHERE provider_id IN (${providerIds.join(",")})\n` +
+    "  AND valid_to IS NULL;";
 
   const map = new Map();
   for (const [providerId, legalEntityId] of parseRows(psqlRead(env, SHEDUL_DB, sql), 2)) {
@@ -407,8 +559,10 @@ function fetchPrimaryLegalEntities(env, providerIds) {
 // only link through invoice_entity_id) can't be resolved here, so they're excluded.
 function fetchAllProviderIds(env) {
   const sql =
-    "SELECT DISTINCT provider_id FROM account_configurations " +
-    "WHERE provider_id IS NOT NULL ORDER BY provider_id;";
+    "SELECT DISTINCT provider_id\n" +
+    "FROM account_configurations\n" +
+    "WHERE provider_id IS NOT NULL\n" +
+    "ORDER BY provider_id;";
 
   return parseRows(psqlRead(env, AD_DB, sql), 1)
     .map(([providerId]) => providerId)
@@ -422,9 +576,10 @@ function fetchAllProviderIds(env) {
 // plugin row itself is gone.
 function fetchAppliedLegalEntities(env, pluginIds) {
   const sql =
-    "SELECT p.id, coalesce(p.legal_entity_id::text, '') " +
-    "FROM account_configuration_plugins p " +
-    `WHERE p.id IN (${pluginIds.join(",")}) ORDER BY p.id;`;
+    "SELECT p.id, coalesce(p.legal_entity_id::text, '')\n" +
+    "FROM account_configuration_plugins p\n" +
+    `WHERE p.id IN (${pluginIds.join(",")})\n` +
+    "ORDER BY p.id;";
 
   const map = new Map();
   for (const [id, legalEntityId] of parseRows(psqlRead(env, AD_DB, sql), 2)) {
@@ -436,11 +591,11 @@ function fetchAppliedLegalEntities(env, pluginIds) {
 // provider_id -> [{ id, pluginType, integrator, pluginStatus, legalEntityId }]
 function fetchPlugins(env, providerIds) {
   const sql =
-    "SELECT ac.provider_id, p.id, p.plugin_type, p.integrator, p.plugin_status, " +
-    "coalesce(p.legal_entity_id::text, '') " +
-    "FROM account_configuration_plugins p " +
-    "JOIN account_configurations ac ON ac.id = p.account_configuration_id " +
-    `WHERE ac.provider_id IN (${providerIds.join(",")}) ` +
+    "SELECT ac.provider_id, p.id, p.plugin_type, p.integrator, p.plugin_status,\n" +
+    "       coalesce(p.legal_entity_id::text, '')\n" +
+    "FROM account_configuration_plugins p\n" +
+    "JOIN account_configurations ac ON ac.id = p.account_configuration_id\n" +
+    `WHERE ac.provider_id IN (${providerIds.join(",")})\n` +
     "ORDER BY ac.provider_id, p.id;";
 
   const map = new Map();
@@ -582,6 +737,181 @@ function buildCommand(opts, updates) {
   );
 }
 
+// --- field comparison (PBI ↔ legal entity) -----------------------------------
+
+// Like parseRows, but tolerant of the delimiter appearing inside the LAST field
+// — a street or a legal name can legitimately contain a "|". Everything past the
+// (n-1)th delimiter is rejoined into the final column.
+function parseRowsLoose(out, fieldCount) {
+  return out
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.split("|");
+      if (parts.length < fieldCount) return null;
+      if (parts.length === fieldCount) return parts;
+      return [...parts.slice(0, fieldCount - 1), parts.slice(fieldCount - 1).join("|")];
+    })
+    .filter(Boolean);
+}
+
+// The ACTIVE billing information row per provider. Same valid_to convention as
+// provider_purchases_primary_legal_entities: NULL means current, non-NULL is a
+// superseded history row.
+function fetchBillingInformations(env, providerIds) {
+  const sql =
+    `SELECT ${PBI_COLUMNS.map((col) => `coalesce(${col}::text, '')`).join(", ")}\n` +
+    "FROM provider_billing_informations\n" +
+    `WHERE provider_id IN (${providerIds.join(",")})\n` +
+    "  AND valid_to IS NULL\n" +
+    "ORDER BY provider_id;";
+
+  const map = new Map();
+  for (const fields of parseRowsLoose(psqlRead(env, SHEDUL_DB, sql), PBI_COLUMNS.length)) {
+    const row = Object.fromEntries(PBI_COLUMNS.map((col, i) => [col, fields[i]]));
+    map.set(row.provider_id, row);
+  }
+  return map;
+}
+
+// legalEntityId -> Map(fieldKey -> value). `fields` is a jsonb array of
+// {key, value}, so it's unnested into one row per field; the country_code column
+// is unioned in as a pseudo-key so the comparison can fall back to it.
+function fetchLegalEntityFields(env, legalEntityIds) {
+  if (!legalEntityIds.length) return new Map();
+  const quoted = legalEntityIds.map((id) => `'${id}'`).join(",");
+
+  const sql =
+    "SELECT le.id::text, f->>'key', coalesce(f->>'value', '')\n" +
+    "FROM legal_entities le, jsonb_array_elements(le.fields) f\n" +
+    `WHERE le.id IN (${quoted})\n` +
+    "UNION ALL\n" +
+    "SELECT le.id::text, '_column.country_code', coalesce(le.country_code, '')\n" +
+    "FROM legal_entities le\n" +
+    `WHERE le.id IN (${quoted})\n` +
+    "UNION ALL\n" +
+    "SELECT le.id::text, '_column.type', coalesce(le.type::text, '')\n" +
+    "FROM legal_entities le\n" +
+    `WHERE le.id IN (${quoted});`;
+
+  const map = new Map();
+  for (const [id, key, value] of parseRowsLoose(psqlRead(env, LE_DB, sql), 3)) {
+    if (!map.has(id)) map.set(id, new Map());
+    map.get(id).set(key, value);
+  }
+  return map;
+}
+
+// Compare on meaning, not bytes: trim, collapse runs of whitespace, casefold.
+// Otherwise "Via Giovanni Giolitti 40" vs "via giovanni giolitti  40" reads as a
+// difference when it plainly isn't one.
+function normalizeValue(v) {
+  return String(v || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+// First non-empty value among the candidate keys.
+function leValue(fields, keys) {
+  if (!fields) return "";
+  for (const key of keys) {
+    const v = fields.get(key);
+    if (v) return v;
+  }
+  return "";
+}
+
+// Per provider: which comparable fields agree, and which don't. A field where
+// both sides are empty isn't comparable and is skipped entirely.
+function compareFields(providerId, billing, fields) {
+  const rows = [];
+  // "individual" vs everything else (organization, trust, sole_proprietorship,
+  // unincorporated_partnership) — see `only` on FIELD_COMPARISON.
+  const entityType = (fields && fields.get("_column.type")) || "";
+  const kind = entityType === "individual" ? "individual" : "organization";
+
+  for (const spec of FIELD_COMPARISON) {
+    if (spec.only && spec.only !== kind) continue;
+
+    const pbiValue = billing ? billing[spec.pbi] || "" : "";
+    const leVal = leValue(fields, spec.le);
+    if (!pbiValue && !leVal) continue;
+
+    const same = normalizeValue(pbiValue) === normalizeValue(leVal);
+    rows.push({
+      label: spec.label,
+      pbi: pbiValue,
+      le: leVal,
+      same,
+      note: same ? "" : !pbiValue ? "missing in billing info" : !leVal ? "missing in legal entity" : "differs",
+    });
+  }
+
+  return { providerId, billing, rows, diffs: rows.filter((r) => !r.same) };
+}
+
+function printFieldComparison(comparisons) {
+  console.log(
+    c.head("\n── Field comparison (provider_billing_informations ↔ legal entity) ──")
+  );
+
+  const noBilling = comparisons.filter((cmp) => !cmp.billing);
+  const withDiffs = comparisons.filter((cmp) => cmp.billing && cmp.diffs.length);
+  const clean = comparisons.filter((cmp) => cmp.billing && !cmp.diffs.length);
+
+  for (const cmp of clean) {
+    console.log(
+      `  ${c.ok("✓")} provider=${cmp.providerId}  ` +
+        c.faint(`${cmp.rows.length}/${cmp.rows.length} comparable fields match`)
+    );
+  }
+
+  for (const cmp of noBilling) {
+    console.log(
+      `  ${c.faint("–")} provider=${cmp.providerId}  ` +
+        c.faint("no active provider_billing_informations row — nothing to compare")
+    );
+  }
+
+  // Only the providers that actually differ get a table; the rest would be noise.
+  for (const cmp of withDiffs) {
+    const matched = cmp.rows.length - cmp.diffs.length;
+    console.log(
+      `\n  ${c.bad("✗")} provider=${cmp.providerId}  ` +
+        `${matched}/${cmp.rows.length} match — ${cmp.diffs.length} differ:`
+    );
+    console.log(
+      renderTable(
+        ["FIELD", "PROVIDER BILLING INFO", "LEGAL ENTITY", "NOTE"],
+        cmp.diffs.map((d) => [d.label, d.pbi || "∅", d.le || "∅", c.warn(d.note)])
+      )
+        .split("\n")
+        .map((l) => `      ${l}`)
+        .join("\n")
+    );
+  }
+
+  console.log(
+    `\n  ${c.ok(`✓ ${clean.length} consistent`)}   ` +
+      `${c.faint(`– ${noBilling.length} no billing row`)}   ` +
+      `${withDiffs.length ? c.bad(`✗ ${withDiffs.length} differ`) : `✗ 0 differ`}`
+  );
+
+  if (withDiffs.length) {
+    console.log(
+      c.faint(
+        "\n  A difference is not necessarily wrong — billing info and the legal entity\n" +
+          "  are maintained separately. This is a report, not a verdict; nothing here\n" +
+          "  changes the link state above, and this script never edits either side."
+      )
+    );
+  }
+
+  return withDiffs.length;
+}
+
 // --- audit (--verify) --------------------------------------------------------
 //
 // Standalone verification: for every requested provider, compare what its plugin
@@ -631,12 +961,12 @@ function auditProviders(providerIds, primaryByProvider, pluginsByProvider) {
   });
 }
 
-const AUDIT_SYMBOL = { ok: "✓", exempt: "–", drift: "✗" };
+const AUDIT_SYMBOL = { ok: c.ok("✓"), exempt: c.faint("–"), drift: c.bad("✗") };
 
 function printAudit(opts, audit) {
   const short = (uuid) => uuid || "∅";
 
-  console.log("\n── Verification ────────────────────────────────────────");
+  console.log(c.head("\n── Verification ────────────────────────────────────────"));
   console.log(
     renderTable(
       ["", "PROVIDER", "PLUGIN", "EXPECTED (primary LE)", "ACTUAL (plugin LE)", "STATUS"],
@@ -670,9 +1000,11 @@ function printAudit(opts, audit) {
     const mismatches = drift.filter((a) => a.status.startsWith("MISMATCH"));
     if (mismatches.length) {
       console.log(
-        `\n  ⚠  ${mismatches.length} MISMATCH(es) — a plugin holds a legal entity that is not\n` +
-          `     its provider's primary. This script will NOT fix those: the task only\n` +
-          `     fills NULLs and never overwrites. Investigate before changing anything.`
+        c.warn(
+          `\n  ⚠  ${mismatches.length} MISMATCH(es) — a plugin holds a legal entity that is not\n` +
+            `     its provider's primary. This script will NOT fix those: the task only\n` +
+            `     fills NULLs and never overwrites. Investigate before changing anything.`
+        )
       );
     }
     const fixable = drift.filter((a) => a.status === "not linked");
@@ -718,10 +1050,15 @@ function verdictFor(update, applied, dryRun) {
 // Fixed-width table. Kept deliberately plain so it survives copy-paste into a
 // ticket or a Slack snippet.
 function renderTable(headers, rows) {
-  const widths = headers.map((h, i) =>
-    Math.max(h.length, ...rows.map((r) => String(r[i]).length))
-  );
-  const line = (cells) => cells.map((c, i) => String(c).padEnd(widths[i])).join("  ");
+  // Measure what the eye sees, not what the string holds: a coloured cell
+  // carries escape bytes that padEnd would otherwise count as width.
+  const visible = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
+  const width = (s) => visible(s).length;
+  const pad = (s, w) => String(s) + " ".repeat(Math.max(0, w - width(s)));
+
+  const widths = headers.map((h, i) => Math.max(width(h), ...rows.map((r) => width(r[i]))));
+  const line = (cells) => cells.map((cell, i) => pad(cell, widths[i])).join("  ").trimEnd();
+
   return [line(headers), widths.map((w) => "─".repeat(w)).join("  "), ...rows.map(line)].join(
     "\n"
   );
@@ -745,7 +1082,7 @@ function printVerification(opts, updates, applied) {
 
   const failures = rows.filter((r) => r[3].startsWith("✗")).length;
 
-  console.log("\n── Verification ────────────────────────────────────────");
+  console.log(c.head("\n── Verification ────────────────────────────────────────"));
   console.log(
     renderTable(
       ["PLUGIN", "PROVIDER", "LEGAL ENTITY APPLIED", "VERIFIED BY", "RESULT"],
@@ -762,8 +1099,8 @@ function printVerification(opts, updates, applied) {
 
   console.log(
     failures
-      ? `\n  ⚠  ${failures} of ${rows.length} did NOT verify. See RESULT above.`
-      : `\n  ✓ All ${rows.length} verified.`
+      ? c.bad(`\n  ⚠  ${failures} of ${rows.length} did NOT verify. See RESULT above.`)
+      : c.ok(`\n  ✓ All ${rows.length} verified.`)
   );
 
   printCrossCheck(opts, updates);
@@ -776,26 +1113,39 @@ function printCrossCheck(opts, updates) {
   const pluginIds = updates.map((u) => u.plugin_id).join(",");
   const providerIds = [...new Set(updates.map((u) => u._providerId))].join(",");
 
-  console.log("\n  Cross-check it yourself:");
+  const env = psqlEnv(opts.namespace);
+
+  // Same colour split as everywhere else: yellow for the command you'd type,
+  // cyan for the SQL inside it.
+  const block = (comment, db, lines) =>
+    `    ${c.faint(comment)}\n` +
+    `    ${c.cmd(`houston psql ${env} ${db} -- -c "`)}\n` +
+    lines.map((l) => `      ${c.sql(l)}`).join("\n") +
+    `${c.cmd('"')}\n`;
+
+  console.log(c.head("\n  Cross-check it yourself:"));
   console.log(
-    `\n    # what the plugins now hold\n` +
-      `    houston psql ${psqlEnv(opts.namespace)} ${AD_DB} -- -c "\n` +
-      `      SELECT ac.provider_id, p.id AS plugin_id, p.legal_entity_id, p.updated_at\n` +
-      `      FROM account_configuration_plugins p\n` +
-      `      JOIN account_configurations ac ON ac.id = p.account_configuration_id\n` +
-      `      WHERE p.id IN (${pluginIds}) ORDER BY ac.provider_id"\n`
+    "\n" +
+      block("# what the plugins now hold", AD_DB, [
+        "SELECT ac.provider_id, p.id AS plugin_id, p.legal_entity_id, p.updated_at",
+        "FROM account_configuration_plugins p",
+        "JOIN account_configurations ac ON ac.id = p.account_configuration_id",
+        `WHERE p.id IN (${pluginIds})`,
+        "ORDER BY ac.provider_id",
+      ])
   );
   console.log(
-    `    # what they SHOULD hold, straight from the source of truth\n` +
-      `    houston psql ${psqlEnv(opts.namespace)} ${SHEDUL_DB} -- -c "\n` +
-      `      SELECT provider_id, legal_entity_id\n` +
-      `      FROM provider_purchases_primary_legal_entities\n` +
-      `      WHERE provider_id IN (${providerIds}) AND valid_to IS NULL ORDER BY provider_id"\n`
+    block("# what they SHOULD hold, straight from the source of truth", SHEDUL_DB, [
+      "SELECT provider_id, legal_entity_id",
+      "FROM provider_purchases_primary_legal_entities",
+      `WHERE provider_id IN (${providerIds})`,
+      "  AND valid_to IS NULL",
+      "ORDER BY provider_id",
+    ])
   );
   console.log(
     `    The two provider_id → legal_entity_id sets must be identical.\n` +
-      `    Re-running this script is the other check: everything should come back\n` +
-      `    as "already linked", with 0 updates.`
+      `    Re-running this script in verify mode is the other check.`
   );
 }
 
@@ -803,7 +1153,7 @@ function printCrossCheck(opts, updates) {
 // exempt set is explicit rather than something you infer from what's missing.
 function printExemptProviders(skipped) {
   if (!skipped.length) {
-    console.log("\n── Exempt providers ────────────────────────────────────");
+    console.log(c.head("\n── Exempt providers ────────────────────────────────────"));
     console.log("  None — every requested provider resolved.");
     return;
   }
@@ -815,7 +1165,7 @@ function printExemptProviders(skipped) {
     s.reason,
   ]);
 
-  console.log("\n── Exempt providers (not touched) ──────────────────────");
+  console.log(c.head("\n── Exempt providers (not touched) ──────────────────────"));
   console.log(renderTable(["PROVIDER", "PLUGINS", "PLUGIN IDS", "WHY EXEMPT"], rows));
   console.log(`\n  ${skipped.length} provider(s) exempt. Nothing was written for these.`);
 }
@@ -896,7 +1246,7 @@ async function askProviderIds(env) {
   ]);
 
   if (all) {
-    console.log(`\nFinding providers in ${AD_DB}.account_configurations (read-only)…`);
+    console.log(c.faint(`\nFinding providers in ${AD_DB}.account_configurations (read-only)…`));
     const ids = fetchAllProviderIds(env);
     if (!ids.length) throw new Error("No providers found in account_configurations.");
     console.log(`Found ${ids.length} provider(s) with an account configuration.`);
@@ -939,7 +1289,7 @@ async function confirmDataAccess(opts, env) {
   const prod = isProd(opts.namespace);
   const say = (line) => promptStream.write(`${line}\n`);
 
-  say("\n── About to read real data ─────────────────────────────");
+  say(c.head("\n── About to read real data ─────────────────────────────"));
   say(`  namespace : ${opts.namespace}${prod ? "   ⚠  PRODUCTION" : ""}`);
   say(`  psql env  : ${env}`);
   say(`  databases : ${SHEDUL_DB}, ${AD_DB}`);
@@ -1025,7 +1375,7 @@ async function main() {
   if (raw) {
     providerIds = parseProviderIds(raw);
   } else if (opts.all) {
-    if (!opts.json) console.log(`\nFinding providers in ${AD_DB}.account_configurations…`);
+    if (!opts.json) console.log(c.faint(`\nFinding providers in ${AD_DB}.account_configurations…`));
     providerIds = fetchAllProviderIds(env);
     if (!providerIds.length) throw new Error("No providers found in account_configurations.");
   } else {
@@ -1040,11 +1390,11 @@ async function main() {
   }
 
   // 5. Resolve primary legal entities (shedul) -----------------------------
-  if (!opts.json) console.log(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`);
+  if (!opts.json) console.log(c.faint(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`));
   const primaryByProvider = fetchPrimaryLegalEntities(env, providerIds);
 
   // 6. Resolve plugins (accounting_documents) ------------------------------
-  if (!opts.json) console.log(`Reading plugins from ${AD_DB} (read-only)…`);
+  if (!opts.json) console.log(c.faint(`Reading plugins from ${AD_DB} (read-only)…`));
   const pluginsByProvider = fetchPlugins(env, providerIds);
 
   // --verify stops here: audit what's already linked and report. No task, no
@@ -1052,11 +1402,40 @@ async function main() {
   if (opts.verify) {
     const audit = auditProviders(providerIds, primaryByProvider, pluginsByProvider);
     const drift = printAudit(opts, audit);
+
+    // Second half of the audit: does the data on each side actually agree?
+    // Only providers with a primary legal entity have anything to compare.
+    const comparable = audit.filter((a) => a.expected);
+    let fieldDiffs = 0;
+
+    if (comparable.length) {
+      console.log(c.faint(`\nReading provider_billing_informations from ${SHEDUL_DB}…`));
+      const billing = fetchBillingInformations(env, comparable.map((a) => a.providerId));
+
+      console.log(c.faint(`Reading legal entity fields from ${LE_DB}…`));
+      const leFields = fetchLegalEntityFields(env, [
+        ...new Set(comparable.map((a) => a.expected)),
+      ]);
+
+      fieldDiffs = printFieldComparison(
+        comparable.map((a) =>
+          compareFields(a.providerId, billing.get(a.providerId), leFields.get(a.expected))
+        )
+      );
+    }
+
     printCrossCheck(opts, audit.filter((a) => a.plugin).map((a) => ({
       plugin_id: a.plugin.id,
       _providerId: a.providerId,
     })));
+
+    // Link drift fails the run. Field differences are reported, not enforced —
+    // the two sides are maintained independently and disagreeing is not by
+    // itself an error.
     if (drift) process.exitCode = 1;
+    if (fieldDiffs && !drift) {
+      console.log(c.faint("\n(Field differences do not affect the exit code.)"));
+    }
     return;
   }
 
@@ -1074,7 +1453,7 @@ async function main() {
   }
 
   if (updates.length) {
-    console.log("\n── Resolved ────────────────────────────────────────────");
+    console.log(c.head("\n── Resolved ────────────────────────────────────────────"));
     for (const u of updates) {
       console.log(
         `  provider=${u._providerId}  ${fmtPlugin(u._plugin)}\n` +
@@ -1087,7 +1466,7 @@ async function main() {
 
   const collisions = findLegalEntityCollisions(updates);
   if (collisions.length) {
-    console.log("\n⚠  legal_entity_id collisions — the task will apply one and skip the rest:");
+    console.log(c.warn("\n⚠  legal_entity_id collisions — the task will apply one and skip the rest:"));
     for (const [legalEntityId, us] of collisions) {
       const where = us.map((u) => `provider=${u._providerId} plugin=${u.plugin_id}`).join(", ");
       console.log(`      ${legalEntityId} → ${where}`);
@@ -1113,10 +1492,10 @@ async function main() {
 
   // 9. Print the command ---------------------------------------------------
   console.log(
-    `\n── Command ─────────────────────────────────────────────` +
-      (opts.apply ? "" : "\n(DRY_RUN=true — logs only, writes nothing)")
+    c.head("\n── Command ─────────────────────────────────────────────") +
+      (opts.apply ? "" : c.faint("\n(DRY_RUN=true — logs only, writes nothing)"))
   );
-  console.log(`\n${buildCommand(opts, updates)}\n`);
+  console.log(`\n${c.cmd(buildCommand(opts, updates))}\n`);
 
   if (opts.printOnly) {
     console.log("[print-only] Nothing was run.");
@@ -1136,7 +1515,7 @@ async function main() {
   // 11. Verify — read the rows back and prove what actually landed -----------
   // The task exits 0 even when it skips every single row, so a green exit is
   // not evidence. Only the read-back is.
-  console.log(`\nVerifying against ${AD_DB} (read-only)…`);
+  console.log(c.faint(`\nVerifying against ${AD_DB} (read-only)…`));
   const applied = fetchAppliedLegalEntities(env, updates.map((u) => u.plugin_id));
   const failures = printVerification(opts, updates, applied);
 

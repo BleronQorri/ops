@@ -195,6 +195,9 @@ task, prints no command, writes nothing:
 
 Exits **1** if anything is in drift, so it works as a check in a runbook.
 
+Verify then goes on to compare the *data* on each side — see
+[Field comparison](#field-comparison) below.
+
 It costs no extra queries — the plugin read already returns `legal_entity_id`, so
 this is pure comparison over what the script fetches anyway.
 
@@ -202,6 +205,60 @@ this is pure comparison over what the script fetches anyway.
 never overwrites, so a plugin pointing at the wrong legal entity needs a human
 decision. Plain `not linked` rows are just pending work: re-run without `--verify`
 and choose apply.
+
+### Field comparison
+
+Being *linked* to a legal entity says nothing about whether the two sides hold
+the same data. So verify also diffs `provider_billing_informations` (shedul)
+against the legal entity's fields (`legal_entities`):
+
+```
+  ✓ provider=18  7/7 comparable fields match
+  – provider=52  no active provider_billing_informations row — nothing to compare
+
+  ✗ provider=35  3/8 match — 5 differ:
+      FIELD           PROVIDER BILLING INFO         LEGAL ENTITY  NOTE
+      tax / VAT no.   B63272603                     ∅             missing in legal entity
+      street          Carrer d'Entença 332 6º - 6º  ∅             missing in legal entity
+      city            Barcelona                     ∅             missing in legal entity
+```
+
+Only providers that actually differ get a table — the rest are one line each.
+
+**Where the values come from.** `legal_entities` doesn't store this in columns:
+it keeps a jsonb array of `{key, value}` (see `LegalEntities.Schemas.Field`), so
+the query unnests `fields` and the script looks up dotted keys.
+
+| Field | provider_billing_informations | legal entity key |
+|---|---|---|
+| legal name | `company_name` | `organization.legalName`, `trust.name` |
+| first / last name | `first_name`, `last_name` | `individual.name.firstName` / `.lastName` |
+| tax / VAT no. | `tax_number` | `organization.vatNumber`, `organization.taxInformation.number` |
+| registration no. | `company_registration_number` | `organization.registrationNumber` |
+| activity code | `activity_code` | `organization.activityCode` |
+| street / city / postal / state | `address`, `city`, `postal_code`, `state_province` | `…registeredAddress.*` or `…residentialAddress.*` |
+| country | `country_code` | `…registeredAddress.country`, else the `country_code` column |
+
+Several keys can carry the same fact and which one is populated varies by country
+and entity type — `tax_number` lands in `organization.vatNumber` for IT but
+`taxInformation.number` elsewhere — so candidates are tried in order and the
+first non-empty one wins.
+
+**Two things stop this producing noise:**
+
+1. **Type awareness.** `provider_billing_informations` always carries a contact
+   person's first/last name, while an *organization* legal entity has no
+   `individual.*` fields at all. Comparing them would report every organization
+   as "first name missing". So person-name fields are only compared for
+   `individual` entities, and company fields only for the rest.
+2. **Normalised comparison.** Values are trimmed, internal whitespace collapsed,
+   and casefolded before comparing — displayed raw, matched on meaning.
+
+A field where *both* sides are empty isn't comparable and is skipped entirely.
+
+**Differences do not affect the exit code.** The two sides are maintained
+independently, so disagreeing is not by itself an error — this is a report, not a
+verdict. Only *link* drift fails the run. The script never edits either side.
 
 ### Automatic read-back after an apply
 
@@ -317,5 +374,17 @@ runs before spawning Houston (which needs stdin for its own prompts) and in a
 
 - VPN up; `houston` authenticated (prod reads use `fresha-production-developer`).
 - Node on PATH. Dependency-free.
-- Needs psql access to **both** `shedul` and `accounting_documents` in the target
-  namespace, plus permission to run Houston tasks there.
+- Needs psql access to **three** databases in the target namespace — `shedul`,
+  `accounting_documents` and `legal_entities` — plus permission to run Houston
+  tasks there. (In staging all three are hosted on the same RDS instance,
+  `<namespace>-shedul`; the alias still selects the database.)
+
+## Output
+
+Colour follows the convention in `onboard_location_scripts.exs`: **cyan** for a
+query about to run, **yellow** for a command you could run yourself, **bright
+white** for section headers, **faint** for progress. Every statement is echoed
+before it runs — this script reads production, so what it asks for should never
+be a mystery. Long `IN (…)` lists are truncated in the echo.
+
+Colour is suppressed when stdout isn't a terminal, or when `NO_COLOR` is set.
