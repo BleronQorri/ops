@@ -16,6 +16,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 **write**
 - **process_missing_sales** — backfills invoices/credit notes for sales that never produced one (export → S3 → Houston task). Step-gated.
 - **retry_invoices** — re-drives stuck KSA e-invoices: flips tracker statuses retry-eligible, then force-retries sending.
+- **plugin_legal_entity_updates** — links plugins to their primary legal entity. Fully interactive: prompts for environment, providers (all of them or a list), and dry-run-vs-apply, then runs `link_plugins_to_legal_entities_from_env`. Dry run by default; production takes two confirmations.
 
 ### `staging/` — non-prod
 
@@ -83,6 +84,35 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #   --dry-run              plan only, no writes
 #   --skip-update          skip the tracker-status update step
 #   --skip-retry           skip the force-retry step
+```
+
+**plugin_legal_entity_updates** — link plugins to their primary legal entity.
+```sh
+./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
+# Fully interactive — just run it, no flags to remember. It asks, in order:
+#   1. environment      — staging (eng-orion), production, or any namespace
+#   2. providers        — all of them (from account_configurations), or a list you type
+#   3. dry run or apply — asked after the resolution report is on screen
+#   4. confirm          — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
+# Then it prints the exact `houston task run … link_plugins_to_legal_entities_from_env`
+# command and runs it. Dry run is the default everywhere.
+#
+# Flags just pre-answer a prompt — all optional:
+#   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
+#       --all              every provider in account_configurations
+#   -f, --file PATH        read provider IDs from a file (# starts a comment)
+#       --apply            DRY_RUN="false" — actually write
+#       --dry-run          DRY_RUN="true" — logs only (the default)
+#   -s, --service NAME     Houston service (default: accounting-documents)
+#       --print-only       print the command and stop; run nothing
+#       --json             print only the UPDATES JSON array; never prompts
+#
+# Reads provider_purchases_primary_legal_entities (shedul, valid_to IS NULL — the
+# same SQL as the get_primary_legal_entity_id_for_provider RPC) and
+# account_configuration_plugins (accounting_documents). Only proposes plugins with
+# legal_entity_id IS NULL, and skips — with a reason — any provider with no primary
+# LE, no plugins, or more than one unlinked plugin: a legal entity can back at most
+# one plugin (unique index).
 ```
 
 ### staging/write
