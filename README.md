@@ -114,7 +114,7 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #   reset        STAGING ONLY, destructive. Undoes the migration for a provider.
 #   migrate      Runs `legal_entities_migration:migrate` on the partners-app service
 #                to CREATE each provider's legal entity and set it primary. Explicit
-#                provider list only (no --all). This task has NO dry run, so a
+#                provider list only (never "all"). This task has NO dry run, so a
 #                read-only preview of each provider's current migration state is
 #                shown first; it is resumable, so a re-run resumes rather than
 #                duplicating. MIGRATE_PAYMENT_METHODS defaults to true and also
@@ -128,7 +128,7 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #                address, country. PASS/FAIL, exit 1 on any difference. Doesn't
 #                read plugins at all. Run this BEFORE linking.
 #   post-flight  READ-ONLY. Is each plugin pointing at its provider's primary
-#                legal entity? PASS/FAIL, exit 1 on drift. (--verify is an alias.)
+#                legal entity? PASS/FAIL, exit 1 on drift.
 #   link         Prints the exact `houston task run … link_plugins_to_legal_entities_from_env`
 #                command, runs it, then VERIFIES by reading the rows back — a table
 #                of plugin_id / provider_id / legal entity applied / how it was
@@ -141,32 +141,10 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 # REQUIRES A TERMINAL: if stdin isn't a TTY it refuses outright (exit 1) — a piped
 # "yes" is not explicit approval, so cron/CI can't drive it. There is no --force.
 #
-# Flags just pre-answer a prompt — all optional:
-#   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
-#       --all              every provider in account_configurations
-#       --plugins          read-only: billing info vs each PLUGIN's own legal entity —
-#                          what the send path actually reads (pre-flight uses the primary)
-#       --guided           walk pre-flight -> link -> post-flight, each step defined.
-#                          Does NOT run migrate (precondition: no dry run, RPC side effect)
-#       --migrate          create legal entities (partners-app); explicit ids only
-#       --reset            STAGING ONLY, destructive: undo the migration for a provider
-#                          so it can be re-run. Refuses production. Per-provider confirm.
-#       --no-payment-methods / --copy-tax-number / --batch-size N   migrate params
-#       --preflight        read-only: billing info vs legal entity + per-country REQUIRED
-#                          set and KSA format rules (CRN 10 chars, TRN ^3\d{12}03$)
-#       --md [path]        export the report as Markdown: field-by-field comparison +
-#                          blocked roster + KYC gate (offered as a
-#                          prompt too); default preflight-<ns>-<date>.md
-#       --detail / --summary   force the per-provider field checklist on/off
-#                          (default: on when you name providers, off for --all)
-#       --postflight       read-only: link state, PASS/FAIL (--verify is an alias)
-#   -f, --file PATH        read provider IDs from a file (# starts a comment)
-#       --apply            DRY_RUN="false" — actually write
-#       --dry-run          DRY_RUN="true" — logs only (the default)
-#   -s, --service NAME     Houston service (default: accounting-documents)
-#       --print-only       print the command and stop; run nothing
-#       --json             print only the UPDATES JSON array (prompt goes to stderr)
-#
+# NO FLAGS. Every choice is a prompt: mode, environment, read approval, providers,
+# dry-run-vs-apply, payment methods, soft-delete, Markdown export. The only
+# arguments are -h/--help and bare provider IDs.
+
 # Reads three DBs: provider_purchases_primary_legal_entities + provider_billing_informations
 # (shedul, valid_to IS NULL — the primary-LE query is the same SQL as the
 # get_primary_legal_entity_id_for_provider RPC), account_configuration_plugins

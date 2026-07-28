@@ -422,7 +422,6 @@ function parseArgs(argv) {
     // Pre-flight Markdown export. --md sets the flag; an optional value sets the
     // path. Without the flag you're offered the export at the end anyway.
     md: false,
-    mdPath: null,
     file: null,
     providerIds: null,
     help: false,
@@ -430,160 +429,109 @@ function parseArgs(argv) {
     namespaceGiven: false,
     modeGiven: false,
   };
+  // NO FLAGS. This script is interactive: every choice is a prompt, so there is
+  // nothing to remember and nothing to get wrong on a command line. Only --help
+  // and bare provider IDs are accepted.
+  //
+  // Guided runs each step as a child process. It passes the step, namespace and
+  // provider list through the environment variables below rather than flags —
+  // internal plumbing, not a user interface. Set them by hand and you are simply
+  // pre-answering prompts; nothing validates that you meant to.
   const rest = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--namespace" || a === "-n") {
-      opts.namespace = argv[++i];
-      opts.namespaceGiven = true;
-    } else if (a === "--service" || a === "-s") opts.service = argv[++i];
-    else if (a === "--file" || a === "-f") opts.file = argv[++i];
-    else if (a === "--apply") {
-      opts.apply = true;
-      opts.modeGiven = true;
-      opts.mode = "link";
-    } else if (a === "--dry-run") {
-      opts.apply = false;
-      opts.modeGiven = true;
-      opts.mode = "link";
-    } else if (a === "--all") opts.all = true;
-    else if (a === "--detail") opts.detail = true;
-    else if (a === "--summary") opts.detail = false;
-    else if (a === "--md" || a === "--markdown") {
-      opts.md = true;
-      // Optional value: only consume the next argv if it isn't another flag.
-      if (argv[i + 1] && !argv[i + 1].startsWith("-")) opts.mdPath = argv[++i];
+  for (const a of argv) {
+    if (a === "--help" || a === "-h") {
+      opts.help = true;
+    } else if (a.startsWith("-")) {
+      throw new Error(
+        `Unknown option "${a}". This script takes no flags — it asks you everything.\n` +
+          "  Run it with no arguments, or with provider IDs: ./plugin_legal_entity_updates.js 33,41"
+      );
+    } else {
+      rest.push(a);
     }
-    else if (a === "--migrate") opts.mode = "migrate";
-    else if (a === "--guided" || a === "--guide") opts.mode = "guided";
-    else if (a === "--plugins" || a === "--by-plugin") opts.mode = "plugins";
-    else if (a === "--reset") opts.mode = "reset";
-    else if (a === "--keep-legal-entities") opts.deleteLegalEntities = false;
-    else if (a === "--no-payment-methods") opts.migratePaymentMethods = false;
-    else if (a === "--copy-tax-number") opts.copyTaxNumber = true;
-    else if (a === "--batch-size") opts.batchSize = argv[++i];
-    // Selects link mode WITHOUT pre-answering dry-run-vs-apply — unlike --apply and
-    // --dry-run, which set modeGiven and therefore skip that prompt. Guided needs
-    // this: it has to reach link mode and still let you choose.
-    else if (a === "--link") opts.mode = "link";
-    else if (a === "--preflight" || a === "--pre-flight") opts.mode = "preflight";
-    // --verify was the old name for the link audit; kept as an alias.
-    else if (a === "--postflight" || a === "--post-flight" || a === "--verify") {
-      opts.mode = "postflight";
-    } else if (a === "--print-only") {
-      // Valid in both link and migrate, so it must NOT imply a mode — otherwise
-      // it would silently answer the mode prompt for you.
-      opts.printOnly = true;
-    } else if (a === "--json") {
-      opts.json = true;
-      opts.mode = opts.mode || "link";
-    } else if (a === "--help" || a === "-h") opts.help = true;
-    else rest.push(a);
   }
   if (rest.length) opts.providerIds = rest.join(",");
+
+  // Guided → child handoff.
+  if (process.env.PLE_STEP) opts.mode = process.env.PLE_STEP;
+  if (process.env.PLE_NAMESPACE) {
+    opts.namespace = process.env.PLE_NAMESPACE;
+    opts.namespaceGiven = true;
+  }
+  if (process.env.PLE_PROVIDERS) opts.providerIds = process.env.PLE_PROVIDERS;
+
   return opts;
 }
 
 function usage() {
-  console.log(`plugin_legal_entity_updates — link plugins to their primary legal entity
+  console.log(`plugin_legal_entity_updates — providers ↔ primary legal entities
 
 Usage:
-  ./plugin_legal_entity_updates.js [flags] [PROVIDER_IDS]
+  ./plugin_legal_entity_updates.js [PROVIDER_IDS]
 
-Run it with no arguments — it walks you through every choice. Everything below
-is optional; each flag only pre-answers a prompt, so there is nothing to
-remember.
+THERE ARE NO FLAGS. The script asks you everything, in order, so there is nothing
+to remember and nothing to mistype. Just run it:
+
+  ./plugin_legal_entity_updates.js
 
 Arguments:
-  PROVIDER_IDS           Comma- and/or space-separated provider IDs (e.g. 123,456).
-                         Omit to be asked (all providers, or a list you type).
+  PROVIDER_IDS   Optional. Comma- or space-separated provider IDs (e.g. 33,41).
+                 Omit them and you'll be asked — including an "all providers"
+                 option where that makes sense.
+  -h, --help     This help.
 
-Flags (each one just pre-answers a prompt):
-  -n, --namespace NAME   Namespace / env (default: ${DEFAULT_NAMESPACE}).
-                         Drives BOTH the psql env and the task's --namespace.
-      --all              Every provider in account_configurations
-  -f, --file PATH        Read provider IDs from a file (one per line, or any
-                         comma/whitespace-separated mix; # starts a comment)
-      --migrate          Run ${MIGRATE_TASK} on
-                         ${MIGRATE_SERVICE}. Explicit provider list only.
-      --guided           Walk the migration step by step (verify -> link -> verify),
-                         with each step defined. Runs each as its own invocation.
-                         Does NOT run migrate — that is a precondition.
-      --reset            STAGING ONLY, DESTRUCTIVE. Undo the migration for a
-                         provider so it can run again. Refuses production.
-      --keep-legal-entities  reset without soft-deleting the legal entities
-      --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (default true)
-      --copy-tax-number      COPY_TAX_NUMBER=true (default false)
-      --batch-size N         BATCH_SIZE=N (task default 100)
-      --md [path]        Export the comparison as Markdown. Offered as a prompt
-                         too. Default: preflight-<namespace>-<date>.md
-      --detail           Per-provider field checklist (default when you name ids)
-      --summary          One line per provider instead (default with --all)
-      --plugins          READ-ONLY. Billing info vs each PLUGIN's own legal entity
-                         (what the send path reads). One section per plugin.
-      --preflight        READ-ONLY. Cross-check provider_billing_informations
-                         against the legal entity, field by field. PASS/FAIL.
-      --postflight       READ-ONLY. Is every plugin pointing at its provider's
-                         primary legal entity? PASS/FAIL. (--verify is an alias.)
-      --apply            DRY_RUN="false" — actually write
-      --dry-run          DRY_RUN="true" — logs only (the default)
-  -s, --service NAME     Houston service (default: ${DEFAULT_SERVICE})
-      --print-only       Print the Houston command and stop; run nothing
-      --json             Print only the UPDATES JSON array (stdout); prompts for
-                         the data-access approval on stderr. Takes provider IDs
-                         or --all; it does not prompt for those.
-  -h, --help             Show this help
+REQUIRES A TERMINAL. If stdin is not a TTY the script refuses before touching
+anything — a piped "yes" is not explicit approval, so cron/CI cannot drive it.
+There is deliberately no --force.
 
-REQUIRES A TERMINAL. If stdin is not a TTY the script refuses to run — a piped
-"yes" is not explicit approval, so cron/CI cannot drive it. No --force escape.
+WHAT IT ASKS, IN ORDER
+  1. Which mode          grouped into MIGRATION / REPORTING / STAGING ONLY, each
+                         option tagged with its stage and what it does.
+  2. Which environment   staging (${DEFAULT_NAMESPACE}), production, or any namespace.
+  3. Approve the reads   the namespace and every database are shown and confirmed
+                         BEFORE a single query runs.
+  4. Which providers     all of them, or a list you type.
+  5. Mode-specific       dry run vs apply (link), payment methods (migrate),
+                         soft-delete entities (reset), export as Markdown.
+  6. Approve the run     non-prod one "yes"; PRODUCTION makes you type the
+                         namespace back first.
 
-Four modes, asked as the first prompt:
+THE MODES
+  Guided       The whole procedure, step by step, each step explained before you
+               run it: pre-flight → link → post-flight. Runs each as its own
+               invocation. Does NOT run migrate or reset — both are described.
 
-  MIGRATE      Create the legal entities in the first place — runs
-               ${MIGRATE_TASK} on ${MIGRATE_SERVICE}.
-               Takes an explicit provider list only. No dry run exists for this
-               task, so a read-only preview of each provider's current migration
-               state is shown before the gate. Run this BEFORE link.
+  Migrate      Creates the legal entities: ${MIGRATE_TASK}
+               on ${MIGRATE_SERVICE}. Run first; nothing else works without an
+               entity. NO dry run — it writes on the first call — so a read-only
+               preview of each provider's migration state is shown first.
 
+  Pre-flight   READ-ONLY. provider_billing_informations (${SHEDUL_DB}) vs the
+               provider's PRIMARY legal entity (${LE_DB}), field by field, plus
+               the per-country required set and the KSA format rules, plus the
+               KYC / payments gate. PASS/FAIL.
 
-  PRE-FLIGHT   Is the data consistent? Cross-checks provider_billing_informations
-   (default)   (${SHEDUL_DB}) against the legal entity's fields (${LE_DB})
-               — name, tax/VAT, registration no., address, country. PASS/FAIL,
-               exit 1 on any difference. Never reads plugins. READ-ONLY.
+  Link         Runs ${TASK}.
+               Asks dry run or apply, then reads the rows back to prove what
+               landed — the task exits 0 even when it skips everything.
 
-  POST-FLIGHT  Is everything linked? Compares each plugin's legal_entity_id
-               against its provider's primary. PASS/FAIL, exit 1 on drift.
-               READ-ONLY.
+  Post-flight  READ-ONLY. Each plugin's legal_entity_id vs its provider's
+               primary. PASS/FAIL.
 
-  LINK         Resolve, then run ${TASK}.
-               The only mode that can write, and only via apply.
+  Plugin audit READ-ONLY. Billing info vs the legal entity each PLUGIN points at
+               — what the send path actually reads. One section per plugin.
 
-Workflow order: MIGRATE → PRE-FLIGHT → LINK → POST-FLIGHT.
+  Reset        STAGING ONLY, DESTRUCTIVE, no undo. Clears the migration state,
+               primary pointer and plugin link so migrate can genuinely re-run.
+               Refuses production outright.
 
-The guided flow:
-  1. WHICH MODE?      — guided (DEFAULT, start here), migrate, pre-flight, link,
-                        post-flight, plugin-audit, or
-                        reset (staging only, destructive)
-  2. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
-  3. APPROVE READS    — the target is shown and confirmed before ANY query runs
-  4. providers        — all of them, or a list you type
-  5. reads (read-only) — every statement is echoed before it runs
+Every read-only mode can write its report to a Markdown file — you're offered the
+export at the end.
 
-  PRE-FLIGHT and POST-FLIGHT stop here with a PASS/FAIL verdict.
-  LINK continues:
-
-  6. report           — what resolved, and which providers are exempt
-  7. dry run or apply — asked with the report on screen
-  8. APPROVE THE RUN  — non-prod: one "yes". PRODUCTION: type the namespace
-                        back, THEN "yes".
-  9. runs the task    — the exact command is printed before it runs
- 10. reads back       — proves what actually landed. Exits 1 if anything didn't.
-
-Providers are skipped (and listed in an "Exempt providers" table) when they have
-no active primary legal entity, no account configuration, no plugin with a NULL
-legal_entity_id, or more than one such plugin — the unique index means only one
-plugin can hold a given legal entity, so an ambiguous provider is never
-auto-resolved.`);
+Providers are skipped (and listed with a reason) when they have no active primary
+legal entity, no account configuration, no plugin with a NULL legal_entity_id, or
+more than one such plugin — one legal entity can back at most one plugin, so an
+ambiguous provider is never auto-resolved.`);
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -2394,7 +2342,6 @@ function buildPreflightMarkdown(
 // Resolve the export path: --md with a value uses it, --md alone defaults to a
 // dated name in the working directory.
 function preflightMarkdownPath(opts) {
-  if (opts.mdPath) return path.resolve(opts.mdPath);
   const day = new Date().toISOString().slice(0, 10);
   return path.resolve(`preflight-${opts.namespace}-${day}.md`);
 }
@@ -2751,6 +2698,47 @@ async function askGuidedProviderIds() {
   throw new Error("No valid provider IDs given.");
 }
 
+// MIGRATE_PAYMENT_METHODS has an external side effect — it migrates cards on file
+// through an RPC — so it is asked rather than assumed, even though true is the
+// usual answer.
+async function askMigratePaymentMethods() {
+  return askChoice("Migrate payment methods too?", [
+    {
+      label: 'yes — MIGRATE_PAYMENT_METHODS="true"',
+      detail: "also migrates cards on file via an RPC. This is how the task is normally run.",
+      aliases: ["yes", "y", "true"],
+      value: true,
+      default: true,
+    },
+    {
+      label: 'no — MIGRATE_PAYMENT_METHODS="false"',
+      detail: "creates the legal entity only; leaves cards on file alone.",
+      aliases: ["no", "n", "false"],
+      value: false,
+    },
+  ]);
+}
+
+// Whether to soft-delete the entities a reset orphans. Leaving them live is what
+// produced provider 33's duplicates, so yes is the default.
+async function askDeleteLegalEntities() {
+  return askChoice("Soft-delete the orphaned legal entities?", [
+    {
+      label: "yes — set deleted_at on them",
+      detail: "leaving them live is what leaves duplicate entities behind.",
+      aliases: ["yes", "y"],
+      value: true,
+      default: true,
+    },
+    {
+      label: "no — leave the entities alone",
+      detail: "clears the migration state only; the entities stay live but unreferenced.",
+      aliases: ["no", "n", "keep"],
+      value: false,
+    },
+  ]);
+}
+
 // Reset takes an explicit list too — and, being destructive, no "all" option.
 async function askResetProviderIds() {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -2824,7 +2812,7 @@ async function askApply(namespace) {
 // Which providers to work on: everything with an account configuration, or a
 // list you type. Returns validated ID strings.
 async function askProviderIds(env) {
-  const all = await askChoice("Which providers?", [
+  const chooseAll = await askChoice("Which providers?", [
     {
       label: `every provider with an account configuration (${AD_DB})`,
       aliases: ["all", "every"],
@@ -2834,18 +2822,22 @@ async function askProviderIds(env) {
     { label: "a list I'll type", aliases: ["list", "some", "specific"], value: false },
   ]);
 
-  if (all) {
+  if (chooseAll) {
     console.log(c.faint(`\nFinding providers in ${AD_DB}.account_configurations (read-only)…`));
     const ids = fetchAllProviderIds(env);
     if (!ids.length) throw new Error("No providers found in account_configurations.");
     console.log(`Found ${ids.length} provider(s) with an account configuration.`);
-    return ids;
+    // Reporting the choice back drives the detail-vs-summary default: a bulk
+    // sweep gets one line per provider, a named set gets the full field tables.
+    return { ids, all: true };
   }
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const raw = await ask("  provider IDs (comma- or space-separated): ");
     try {
-      return parseProviderIds(raw);
+      // Same {ids, all} shape as the "all" branch above — the caller needs to know
+      // which was chosen so detail-vs-summary defaults correctly.
+      return { ids: parseProviderIds(raw), all: false };
     } catch (err) {
       console.error(`  ${err.message}`);
     }
@@ -2933,7 +2925,6 @@ async function confirmRun(opts) {
 const WORKFLOW_STEPS = [
   {
     key: "preflight",
-    flag: "--preflight",
     title: "PRE-FLIGHT — is the data fit to proceed on?",
     writes: false,
     what:
@@ -2945,10 +2936,6 @@ const WORKFLOW_STEPS = [
   },
   {
     key: "link",
-    // --link, NOT --dry-run: the latter would pre-answer the apply prompt and make
-    // guided incapable of ever writing. This step must be able to complete the
-    // migration, so it asks you like the direct path does.
-    flag: "--link",
     title: "LINK — point the plugins at the legal entity",
     writes: true,
     what:
@@ -2960,7 +2947,6 @@ const WORKFLOW_STEPS = [
   },
   {
     key: "postflight",
-    flag: "--postflight",
     title: "POST-FLIGHT — did it actually land?",
     writes: false,
     what:
@@ -3062,18 +3048,21 @@ function printGuidedPlan(opts, providerIds) {
 // Spawn one step. Inherits the terminal so the step's own prompts and Houston's
 // output work exactly as they do when run directly.
 function runGuidedStep(step, opts, providerIds) {
-  const args = [
-    process.argv[1],
-    step.flag,
-    "-n",
-    opts.namespace,
-    ...(step.key === "link" && opts.detail !== null ? [opts.detail ? "--detail" : "--summary"] : []),
-    providerIds.join(","),
-  ];
+  const args = [process.argv[1]];
+  const env = {
+    ...process.env,
+    PLE_STEP: step.key,
+    PLE_NAMESPACE: opts.namespace,
+    PLE_PROVIDERS: providerIds.join(","),
+  };
 
   closeRl();
-  console.log(`\n$ ${process.argv[0]} ${args.join(" ")}\n`);
-  const res = spawnSync(process.argv[0], args, { stdio: "inherit" });
+  console.log(
+    `\n${c.faint(`PLE_STEP=${step.key} PLE_NAMESPACE=${opts.namespace} ` +
+      `PLE_PROVIDERS=${providerIds.join(",")}`)}\n` +
+      `$ ${process.argv[0]} ${args.join(" ")}\n`
+  );
+  const res = spawnSync(process.argv[0], args, { stdio: "inherit", env });
   if (res.error) throw res.error;
   return res.status === 0;
 }
@@ -3152,19 +3141,8 @@ async function main() {
 
   // Nothing below this line may touch a database without a human present.
   requireInteractive();
-  if (opts.json) promptStream = process.stderr;
 
-  // --json still resolves its inputs from flags rather than prompts (its stdout
-  // has to stay pure JSON), but it is not exempt from the approval gate.
-  if (opts.json && !opts.providerIds && !opts.file && !opts.all) {
-    throw new Error(
-      "--json needs provider IDs (argument or --file), or --all (it does not prompt for them)."
-    );
-  }
-
-  if (!opts.json) {
-    console.log("plugin_legal_entity_updates — plugins ↔ primary legal entities");
-  }
+  console.log("plugin_legal_entity_updates — plugins ↔ primary legal entities");
 
   // 1. Which mode? Asked first — it decides everything downstream. Any flag that
   //    only makes sense in one mode has already answered this.
@@ -3181,25 +3159,9 @@ async function main() {
     );
   }
 
-  // Fail loudly on flags that mean nothing in migrate mode rather than ignoring
-  // them — silently dropping --all on a migration would be a nasty surprise.
-  if (opts.mode === "migrate" || opts.mode === "reset" || opts.mode === "guided") {
-    const bad = [
-      opts.all && "--all",
-      opts.file && "--file",
-      opts.json && "--json",
-    ].filter(Boolean);
-    if (bad.length) {
-      throw new Error(
-        `${bad.join(", ")} cannot be used with ${opts.mode} — it takes an explicit ` +
-          "provider list only. Pass the IDs as arguments, or let it prompt you."
-      );
-    }
-  }
-
   // 2. Environment — -n, or prompt. Before the reads, because discovering
   //    providers is itself a query against the chosen namespace.
-  if (!opts.namespaceGiven && !opts.json) {
+  if (!opts.namespaceGiven) {
     opts.namespace = await askNamespace();
   }
   const env = psqlEnv(opts.namespace);
@@ -3233,6 +3195,8 @@ async function main() {
     );
     console.log(`Providers to reset: ${providerIds.length} — ${providerIds.join(", ")}`);
 
+    opts.deleteLegalEntities = await askDeleteLegalEntities();
+
     let failures = 0;
 
     // One provider at a time: each gets its own preview and its own confirmation.
@@ -3242,14 +3206,12 @@ async function main() {
       const preview = fetchResetPreview(env, providerId);
       const total = printResetPreview(providerId, preview, opts);
 
-      if (opts.printOnly) {
-        console.log(c.head("\n── SQL (print-only) ────────────────────────────────────"));
-        console.log(c.sql(buildResetPluginSql(providerId)));
-        console.log(c.sql(buildResetShedulSql(providerId)));
-        if (opts.deleteLegalEntities && preview.legalEntityIds.length) {
-          console.log(c.sql(buildResetLegalEntitySql(preview.legalEntityIds)));
-        }
-        continue;
+      // The SQL is the plan — always shown, so you approve what will actually run.
+      console.log(c.head("\n── SQL that will run ───────────────────────────────────"));
+      console.log(c.sql(buildResetPluginSql(providerId)));
+      console.log(c.sql(buildResetShedulSql(providerId)));
+      if (opts.deleteLegalEntities && preview.legalEntityIds.length) {
+        console.log(c.sql(buildResetLegalEntitySql(preview.legalEntityIds)));
       }
 
       if (!total && !preview.legalEntityIds.length) {
@@ -3307,11 +3269,6 @@ async function main() {
       }
     }
 
-    if (opts.printOnly) {
-      console.log("\n[print-only] Nothing was written.");
-      return;
-    }
-
     console.log(
       failures
         ? c.bad("\n══ RESET: FAIL ═════════════════════════════════════════")
@@ -3331,13 +3288,8 @@ async function main() {
   // compares billing info against each PLUGIN's own legal entity. Read-only.
   if (opts.mode === "plugins") {
     let providerIds;
-    if (opts.providerIds || opts.file) {
-      let raw = opts.providerIds || "";
-      if (opts.file) {
-        const fromFile = fs.readFileSync(opts.file, "utf8");
-        raw = raw ? `${raw},${fromFile}` : fromFile;
-      }
-      providerIds = parseProviderIds(raw);
+    if (opts.providerIds) {
+      providerIds = parseProviderIds(opts.providerIds);
     } else {
       console.log(c.faint(`\nFinding providers with plugins in ${AD_DB}…`));
       providerIds = fetchProviderIdsWithPlugins(env);
@@ -3432,6 +3384,8 @@ async function main() {
     );
     console.log(`Providers to migrate: ${providerIds.length} — ${providerIds.join(", ")}`);
 
+    opts.migratePaymentMethods = await askMigratePaymentMethods();
+
     // Preview stands in for the dry run this task doesn't have.
     console.log(c.faint(`\nReading migration state from ${SHEDUL_DB} (read-only)…`));
     const before = fetchMigrationStatuses(env, providerIds);
@@ -3439,11 +3393,6 @@ async function main() {
 
     console.log(c.head("\n── Command ─────────────────────────────────────────────"));
     console.log(`\n${c.cmd(buildMigrateCommand(opts, providerIds))}\n`);
-
-    if (opts.printOnly) {
-      console.log("[print-only] Nothing was run.");
-      return;
-    }
 
     printMigrateWarning(opts);
 
@@ -3460,33 +3409,25 @@ async function main() {
     return;
   }
 
-  // 4. Provider IDs — argument, --file, --all, or prompt --------------------
-  let raw = opts.providerIds;
-  if (opts.file) {
-    const fromFile = fs.readFileSync(opts.file, "utf8");
-    raw = raw ? `${raw},${fromFile}` : fromFile;
-  }
-
+  // 4. Provider IDs — given as arguments, or asked for --------------------
   let providerIds;
-  if (raw) {
-    providerIds = parseProviderIds(raw);
+  if (opts.providerIds) {
+    providerIds = parseProviderIds(opts.providerIds);
   } else if (opts.all) {
-    if (!opts.json) console.log(c.faint(`\nFinding providers in ${AD_DB}.account_configurations…`));
+    console.log(c.faint(`\nFinding providers in ${AD_DB}.account_configurations…`));
     providerIds = fetchAllProviderIds(env);
     if (!providerIds.length) throw new Error("No providers found in account_configurations.");
   } else {
-    providerIds = await askProviderIds(env);
+    const chosen = await askProviderIds(env);
+    providerIds = chosen.ids;
+    opts.all = chosen.all;
   }
 
-  if (!opts.json) {
-    console.log(
-      `\nTarget: namespace=${opts.namespace} psql_env=${env} service=${opts.service}`
-    );
-    console.log(`Providers requested: ${providerIds.length} — ${providerIds.join(", ")}`);
-  }
+  console.log(`\nTarget: namespace=${opts.namespace} psql_env=${env} service=${opts.service}`);
+  console.log(`Providers requested: ${providerIds.length} — ${providerIds.join(", ")}`);
 
   // 5. Resolve primary legal entities (shedul) -----------------------------
-  if (!opts.json) console.log(c.faint(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`));
+  console.log(c.faint(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`));
   const primaryByProvider = fetchPrimaryLegalEntities(env, providerIds);
 
   // PRE-FLIGHT stops here. It never touches plugins — it asks only whether the
@@ -3573,7 +3514,7 @@ async function main() {
     // Export. --md writes without asking; otherwise it's offered, because a flag
     // nobody remembers is a flag that doesn't exist.
     let wantMd = opts.md;
-    if (!wantMd && !opts.json) {
+    if (!wantMd) {
       const answer = (await ask("\n  Export this comparison as Markdown? (y/N): "))
         .trim()
         .toLowerCase();
@@ -3594,7 +3535,7 @@ async function main() {
   }
 
   // 6. Resolve plugins (accounting_documents) ------------------------------
-  if (!opts.json) console.log(c.faint(`Reading plugins from ${AD_DB} (read-only)…`));
+  console.log(c.faint(`Reading plugins from ${AD_DB} (read-only)…`));
   const pluginsByProvider = fetchPlugins(env, providerIds);
 
   // POST-FLIGHT stops here: is every plugin pointing at its provider's primary
@@ -3630,15 +3571,6 @@ async function main() {
   // 7. Pair them up --------------------------------------------------------
   const { updates, skipped } = resolve(providerIds, primaryByProvider, pluginsByProvider);
 
-  if (opts.json) {
-    // Machine-readable mode: payload on stdout, diagnostics on stderr, so the
-    // JSON can be piped straight into another command.
-    if (skipped.length) {
-      console.error(`# ${skipped.length} provider(s) skipped — rerun without --json for detail`);
-    }
-    console.log(updatesJson(updates));
-    return;
-  }
 
   if (updates.length) {
     console.log(c.head("\n── Resolved ────────────────────────────────────────────"));
@@ -3674,7 +3606,7 @@ async function main() {
   // 8. Dry run or apply — --apply/--dry-run, or prompt ---------------------
   // Asked here, after the report, so the decision is made with the actual
   // plugin list on screen.
-  if (!opts.modeGiven && !opts.printOnly) {
+  if (!opts.modeGiven) {
     opts.apply = await askApply(opts.namespace);
   }
 
@@ -3684,11 +3616,6 @@ async function main() {
       (opts.apply ? "" : c.faint("\n(DRY_RUN=true — logs only, writes nothing)"))
   );
   console.log(`\n${c.cmd(buildCommand(opts, updates))}\n`);
-
-  if (opts.printOnly) {
-    console.log("[print-only] Nothing was run.");
-    return;
-  }
 
   // 10. Confirm + run -------------------------------------------------------
   // --no-tui -w are appended so the task's logs stream into this terminal;

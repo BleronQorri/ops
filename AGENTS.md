@@ -43,7 +43,7 @@ the script's own `AGENTS.md`.
 
 - **Read-only:** `invopop_supplier_check`, `onboard_location_scripts`,
   `plugin_legal_entity_updates` in **pre-flight** or **post-flight** mode
-  (SELECTs only — cannot write under any flag), plus any `--dry-run` path.
+  (SELECTs only — cannot write at all), plus any dry-run path.
 - **Prod writes (gated, reversible-ish):** `process_missing_sales`, `retry_invoices`,
   `plugin_legal_entity_updates` in **link** mode (dry run by default; requires a
   TTY; three confirmations on a prod apply).

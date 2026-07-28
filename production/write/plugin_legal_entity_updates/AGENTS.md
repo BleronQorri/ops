@@ -14,89 +14,14 @@ the `link_plugins_to_legal_entities_from_env` Houston task.
 ## Guided — the whole procedure, step by step
 
 If you don't remember the order or what each step is for, pick **Guided** (option
-1, the default, or `--guided`). It prints the procedure — every step, what it does, why it
-exists, and what to watch for — then walks you through **pre-flight → link →
-post-flight**, letting you run, skip, or stop at each:
+1, the default, or **There are no flags.** Every choice is a prompt — there is nothing to remember
+and nothing to mistype. The only accepted arguments are `-h`/`--help` and bare
+provider IDs. Passing anything starting with `-` is a hard error.
 
-```sh
-./plugin_legal_entity_updates.js --guided 33
-```
-
-Each step runs as **its own invocation** of this script. That keeps guided
-completely decoupled from the other modes — it adds no shared state — and means
-every step keeps its own gates and re-approves its own data access, which is
-right, because each reads something different.
-
-**Pre-flight failing stops the walkthrough** by default. That's the whole point of
-its position in the order: linking a provider whose legal entity is incomplete
-just defers the failure to the send path. You can override and continue.
-
-The summary at the end marks each step `pass` / `fail` / `skipped` / `not
-reached`, and the walkthrough exits 1 if any step failed.
-
-### What guided does NOT run
-
-Both are described in the plan so the procedure is written down, then listed under
-*Not run by this walkthrough*:
-
-| | Why it's excluded |
-|---|---|
-| **migrate** | It's a **precondition**, not a step. It's the only thing here that writes on the first call with **no dry run**, and `MIGRATE_PAYMENT_METHODS=true` migrates cards on file through an RPC. One keystroke from a default "Run it" is the wrong place for that — run it with `--migrate`, on purpose. If it hasn't run, pre-flight says so: *no active primary legal entity*. |
-| **reset** | Remedial and destructive, staging only. |
-
-## KYC / payments gate
-
-Pre-flight also reports the other thing that can block onboarding, mirroring
-`AccountingDocuments.EInvoicing.Common.PaymentsKycGate`:
-
-| Situation | Gate |
-|---|---|
-| payments not enabled | **allow** — KYC irrelevant |
-| payments enabled + KYC approved | allow |
-| payments enabled + not approved **or not synced** | `{:error, :kyc_not_approved}` |
-
-The gate resolves that over three RPCs. Two of the three outcomes are reproducible
-from the database **exactly**; the third is not, and the report says so rather than
-guessing:
-
-| Signal | Source | Exact? |
-|---|---|---|
-| payments enabled | `shedul.providers.fresha_pay` — enum `not_set`/`enabled`/`disabled` | **yes** |
-| synced to a KYC provider | `legal_entities.adyen_platform_legal_entity_id` | **yes** |
-| verification status | `adyen_platform.legal_entity_verifications.state` | **no** — the authoritative value is behind the adyen-platform RPC |
-
-So:
-
-- `✓ allowed` — payments not enabled. Definitive.
-- `✗ not approved` — payments enabled but not synced. Definitive: the gate treats
-  not-synced as not-approved.
-- `? unknown` — payments enabled **and** synced, but no verification row.
-  `legal_entity_verifications` is empty in staging, so **this script will not claim
-  `PASSED` from the database.** Use the RPC if you need certainty.
-
-This adds a fourth database, `adyen_platform`.
-
-## Guided plus six single-purpose modes
-
-Workflow order: **migrate → pre-flight → link → post-flight**.
-
-| Mode | Question it answers | Service | Writes? | Exit 1 when |
-|---|---|---|---|---|
-| **migrate** | Create the legal entities in the first place | `partners-app` | yes, no dry run | a provider didn't migrate |
-| **pre-flight** | Is the data consistent, and does the legal entity carry everything the country requires? | — | never | any field differs, or a required field is missing (⛔ blocks e-invoicing) |
-| **link** | *do* the linking | `accounting-documents` | only via apply | a row didn't land |
-| **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | — | never | any link drift |
-| **plugin audit** | Does billing info match the legal entity each **plugin** points at? | — | never | a plugin's legal entity is unusable or disagrees |
-| **reset** ⚠️ | Undo the migration so it can run again — **STAGING ONLY** | — | yes, destructive, no undo | rows survive the reset |
-
-Pre-flight and post-flight are strictly `SELECT`s. Neither reaches a Houston
-task; neither can write under any flag combination. Pre-flight doesn't even read
-the plugins table — it has nothing to do with link state.
-
-`--guided`, `--migrate`, `--preflight`, `--postflight`, `--plugins`, `--reset` and
-`--verify` (an alias for
-post-flight) skip the mode prompt. `--print-only` deliberately does *not* imply a
-mode — it's valid in both migrate and link.
+Guided runs each step as a child process and hands it the step, namespace and
+provider list through `PLE_STEP` / `PLE_NAMESPACE` / `PLE_PROVIDERS` environment
+variables. That is internal plumbing, not an interface: set them by hand and you
+are simply pre-answering prompts, with nothing checking that you meant to.
 
 ## The guided flow
 
@@ -167,9 +92,8 @@ Production requires an exact `yes`; other namespaces also accept `y`. Declining
 prints `Aborted. Nothing was read.` and exits without a single query.
 
 So there are **two** approvals on a dry run and **three** on a production apply
-(read gate → namespace echo → `yes`). `--print-only` and `--json` still pass the
-read gate — they query real databases, so they are not exempt. `--json` prompts
-on **stderr** so its stdout stays pure JSON.
+(read gate → namespace echo → `yes`). Every mode passes the read gate, including
+the read-only ones — they query real databases, so they are not exempt.
 
 ## What it reads
 
@@ -264,8 +188,7 @@ starts from scratch. **Refuses production outright** — same stance as
 `clear_provider_einvoicing`. There is no undo.
 
 ```sh
-./plugin_legal_entity_updates.js --reset 33
-./plugin_legal_entity_updates.js --reset --print-only 33   # show the SQL, write nothing
+./plugin_legal_entity_updates.js 33     # pick Reset
 ```
 
 ### What it clears, and why in that order
@@ -290,12 +213,12 @@ are real financial records. The preview prints that list every run.
 Legal entities are **soft**-deleted, not deleted: `legal_entity_associations`,
 `_events`, `_capabilities` and `_field_versions` hang off those rows, and
 `deleted_at` is the service's own convention (its schemas filter on
-`where: [deleted_at: nil]`). `--keep-legal-entities` skips step 6.
+`where: [deleted_at: nil]`). You are asked whether to soft-delete them.
 
 ### Gates
 
 - **Production refused** before anything runs.
-- Explicit provider list only — no `--all`, no `--file`, no `--json`.
+- Explicit provider list only — reset never offers an "all providers" option.
 - **Per provider**, not in bulk: each gets its own row-count preview, then you
   type its `provider_id` back, then `yes`. A mismatch skips that provider.
 - One transaction per database (`BEGIN`/`COMMIT` + `ON_ERROR_STOP`), so a failure
@@ -314,8 +237,8 @@ pre-flight after re-migrating to confirm you actually gained something.
 ## Plugin audit — billing info vs each plugin's legal entity
 
 ```sh
-./plugin_legal_entity_updates.js --plugins            # every provider with a plugin
-./plugin_legal_entity_updates.js --plugins 33         # or a named set
+./plugin_legal_entity_updates.js        # pick Plugin audit, then all providers
+./plugin_legal_entity_updates.js 33     # or name a set up front
 ```
 
 **Why this isn't pre-flight.** Pre-flight compares billing info against the
@@ -345,9 +268,8 @@ against yet. Plugins pointing somewhere other than their provider's primary get 
 `⚠ not the primary` marker and a dedicated section showing both UUIDs — not wrong
 by itself, but it means pre-flight and this mode are looking at different entities.
 
-Reuses the same required-field sets, KSA format rules and `--md` export as
-pre-flight, and the same `--detail` / `--summary` switch (detail defaults on for
-five providers or fewer).
+Reuses the same required-field sets, KSA format rules and Markdown export as
+pre-flight. Detail is automatic: five providers or fewer gets the full tables.
 
 **On the counts:** a field empty on *both* sides is technically "equal" but still
 blocking, so it does not count toward `n/m agree` — agreement on nothing is not
@@ -360,7 +282,7 @@ The first step of the workflow, and the one everything else depends on: without 
 legal entity and a primary pointer there is nothing to compare or link.
 
 ```sh
-./plugin_legal_entity_updates.js --migrate 12345,67890
+./plugin_legal_entity_updates.js 12345,67890     # pick Migrate
 ./plugin_legal_entity_updates.js            # then pick 4
 ```
 
@@ -378,11 +300,10 @@ houston task run partners-app --namespace eng-orion \
 classifies and dispatches to `billing_only`, `adyen_fresha_pay` or
 `checkout_fresha_pay`, creating the legal entity and setting it primary.
 
-**Explicit provider list only.** No `--all`, no `COUNTRY_CODES`, no
-`PROVIDER_IDS_CSV_URL` — the task supports the latter two, but "every provider
-with an account configuration" is the wrong set for a migration and a stray Enter
-must not migrate everything. `--all`, `--file` and `--json` are rejected with an
-error rather than silently ignored.
+**Explicit provider list only.** Migrate never offers an "all providers" option,
+and `COUNTRY_CODES` / `PROVIDER_IDS_CSV_URL` are deliberately not exposed even
+though the task supports them — "every provider with an account configuration" is
+the wrong set for a migration, and a stray Enter must not migrate everything.
 
 ### Three things about this task that shaped the design
 
@@ -416,7 +337,7 @@ error rather than silently ignored.
 3. **`MIGRATE_PAYMENT_METHODS=true` has an external side effect** — card-on-file
    migration through an RPC (`PaymentMethodMigration`). It defaults to true here,
    matching how the task is invoked in practice, and the gate says so explicitly.
-   `--no-payment-methods` turns it off.
+   You are asked whether to migrate payment methods.
 
 Only the provider IDs are prompted for. `COPY_TAX_NUMBER` and `BATCH_SIZE` stay
 at the task's own defaults (`false`, `100`), overridable by flag but never asked.
@@ -446,12 +367,12 @@ after an apply.
 
 ### Post-flight — is everything linked?
 
-Pick it at the first prompt, or `--postflight` (`--verify` still works). Answers
+Pick it at the first prompt. Answers
 "is this namespace correctly linked *right now?*" Runs no task, prints no
 command, writes nothing:
 
 ```sh
-./plugin_legal_entity_updates.js --postflight --all
+./plugin_legal_entity_updates.js        # pick Post-flight, then all providers
 ```
 
 ```
@@ -479,7 +400,7 @@ this is pure comparison over what the script fetches anyway.
 
 **A `MISMATCH` is not something this script fixes.** The task only fills NULLs and
 never overwrites, so a plugin pointing at the wrong legal entity needs a human
-decision. Plain `not linked` rows are just pending work: re-run without `--verify`
+decision. Plain `not linked` rows are just pending work: re-run in link mode
 and choose apply.
 
 ### Pre-flight — is the data consistent?
@@ -491,7 +412,7 @@ entity's fields (`legal_entities`), for every provider that has an account
 configuration:
 
 ```sh
-./plugin_legal_entity_updates.js --preflight --all
+./plugin_legal_entity_updates.js        # pick Pre-flight, then all providers
 ```
 
 ```
@@ -536,8 +457,9 @@ district          1234                       —                                
 | `provider only` (plain) | a billing-info column with **no** legal-entity counterpart — see below |
 
 **Defaults by intent**, so neither use is noisy: naming providers means you're
-inspecting them, so you get the checklists; `--all` is a bulk sweep, so you get
-one line each. `--detail` and `--summary` force either way.
+inspecting them, so you get the checklists; choosing "all providers" is a bulk
+sweep, so you get one line each. There is no override — the choice you made at the
+providers prompt decides it.
 
 ### Required fields per e-invoicing country
 
@@ -588,12 +510,12 @@ harmless), so there's nothing extra to model there.
 
 ### Export it as Markdown
 
-`--md [path]` writes the comparison to a file — and if you don't pass the flag,
+the export prompt writes the comparison to a file — and if you don't pass the flag,
 pre-flight offers the export at the end anyway (default No):
 
 ```sh
-./plugin_legal_entity_updates.js --preflight --all --md
-./plugin_legal_entity_updates.js --preflight 33 --md /tmp/provider-33.md
+./plugin_legal_entity_updates.js        # pick Pre-flight, then all providers
+./plugin_legal_entity_updates.js 33     # pick Pre-flight, then say yes to the export
 ```
 
 Without a path it writes `preflight-<namespace>-<YYYY-MM-DD>.md` in the working
@@ -603,7 +525,7 @@ their source modules — so it stands on its own pasted into a ticket.
 
 Built from the comparison data, never from the terminal output: that carries ANSI
 escapes when stdout is a TTY, and its padding is meaningless in Markdown. Values
-containing `|` are escaped. `--summary` drops the per-provider tables and keeps the
+containing `|` are escaped. the summary view drops the per-provider tables and keeps the
 roster.
 
 Note the KSA `tax_number` is a *different identifier kind* — present-and-equal
@@ -733,29 +655,17 @@ houston task run accounting-documents --namespace eng-orion \
 When the script runs it itself, it appends `--no-tui -w` so the task's logs
 stream into your terminal; the full argv is echoed before the spawn.
 
-## Flags (all optional — each just skips a prompt)
+## Arguments
 
 ```sh
 ./plugin_legal_entity_updates.js [provider_ids]
-#   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
-#       --all              every provider in account_configurations
-#       --migrate          run legal_entities_migration:migrate on partners-app
-#       --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (default true)
-#       --copy-tax-number      COPY_TAX_NUMBER=true (default false)
-#       --batch-size N         BATCH_SIZE=N (task default 100)
-#       --verify           audit only — report link state, run nothing, exit 1 on drift
-#   -f, --file PATH        read provider IDs from a file (# starts a comment)
-#       --apply            DRY_RUN="false" — actually write
-#       --dry-run          DRY_RUN="true" — logs only (the default)
-#   -s, --service NAME     Houston service (default: accounting-documents)
-#       --print-only       print the command and stop; run nothing
-#       --json             print only the UPDATES JSON array; never prompts, so it
-#                          needs provider IDs or --all
-#   -h, --help             help
+#   -h, --help   this help
+# Nothing else. Every other choice is a prompt.
 ```
 
 IDs may be comma- or whitespace-separated, and are deduped.
-`--json` makes it pipeable — payload on stdout, skip count on stderr.
+
+IDs may be comma- or whitespace-separated, and are deduped.
 
 ## Safety
 
@@ -764,7 +674,7 @@ IDs may be comma- or whitespace-separated, and are deduped.
 - **Reads are approved before any query**, with the namespace and databases
   shown.
 - **Dry run is the default** at every level: the prompt defaults to it, and
-  omitting `--apply` emits `DRY_RUN="true"`.
+  the answer you give at the dry-run-vs-apply prompt is what sets `DRY_RUN`.
 - The exact command is printed **before** the confirmation, and echoed again
   before the spawn.
 - **Production takes two gates:** type the namespace back, then an exact `yes`
