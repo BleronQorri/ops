@@ -16,7 +16,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 **write**
 - **process_missing_sales** — backfills invoices/credit notes for sales that never produced one (export → S3 → Houston task). Step-gated.
 - **retry_invoices** — re-drives stuck KSA e-invoices: flips tracker statuses retry-eligible, then force-retries sending.
-- **plugin_legal_entity_updates** — three modes, picked at the first prompt: **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), and **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
+- **plugin_legal_entity_updates** — four modes, picked at the first prompt: **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), and **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
 
 ### `staging/` — non-prod
 
@@ -90,15 +90,23 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```sh
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
-#   1. WHICH MODE?      — pre-flight (default) / post-flight / link
+#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate
 #   2. environment      — staging (eng-orion), production, or any namespace
 #   3. APPROVE READS    — target shown and confirmed BEFORE any query runs
 #   4. providers        — all of them (from account_configurations), or a list you type
+#                         (migrate: an explicit list only, never "all")
 #   -- pre-flight and post-flight stop here with a PASS/FAIL verdict; link continues --
 #   5. dry run or apply — asked after the resolution report is on screen
 #   6. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
 #
-# THREE MODES:
+# FOUR MODES — workflow order is migrate → pre-flight → link → post-flight:
+#   migrate      Runs `legal_entities_migration:migrate` on the partners-app service
+#                to CREATE each provider's legal entity and set it primary. Explicit
+#                provider list only (no --all). This task has NO dry run, so a
+#                read-only preview of each provider's current migration state is
+#                shown first; it is resumable, so a re-run resumes rather than
+#                duplicating. MIGRATE_PAYMENT_METHODS defaults to true and also
+#                migrates cards on file via an RPC — --no-payment-methods skips it.
 #   pre-flight   READ-ONLY. Cross-checks provider_billing_informations (shedul)
 #                against the legal entity's jsonb fields (legal_entities) — legal
 #                name, person name, tax/VAT, registration no., activity code,
@@ -121,6 +129,8 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 # Flags just pre-answer a prompt — all optional:
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
+#       --migrate          create legal entities (partners-app); explicit ids only
+#       --no-payment-methods / --copy-tax-number / --batch-size N   migrate params
 #       --preflight        read-only: billing info vs legal entity, PASS/FAIL
 #       --postflight       read-only: link state, PASS/FAIL (--verify is an alias)
 #   -f, --file PATH        read provider IDs from a file (# starts a comment)

@@ -11,26 +11,30 @@ the `link_plugins_to_legal_entities_from_env` Houston task.
 ./plugin_legal_entity_updates.js
 ```
 
-## Three modes
+## Four modes
 
-| Mode | Question it answers | Writes? | Exit 1 when |
-|---|---|---|---|
-| **pre-flight** *(default)* | Is the data consistent? `provider_billing_informations` vs the legal entity, field by field | never | any field differs |
-| **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | never | any link drift |
-| **link** | *do* the linking | only via apply | a row didn't land |
+Workflow order: **migrate → pre-flight → link → post-flight**.
 
-Pre-flight and post-flight are strictly `SELECT`s. Neither reaches the Houston
+| Mode | Question it answers | Service | Writes? | Exit 1 when |
+|---|---|---|---|---|
+| **migrate** | Create the legal entities in the first place | `partners-app` | yes, no dry run | a provider didn't migrate |
+| **pre-flight** *(default)* | Is the data consistent? `provider_billing_informations` vs the legal entity, field by field | — | never | any field differs |
+| **link** | *do* the linking | `accounting-documents` | only via apply | a row didn't land |
+| **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | — | never | any link drift |
+
+Pre-flight and post-flight are strictly `SELECT`s. Neither reaches a Houston
 task; neither can write under any flag combination. Pre-flight doesn't even read
 the plugins table — it has nothing to do with link state.
 
-`--preflight`, `--postflight` and `--verify` (an alias for post-flight) skip the
-mode prompt.
+`--migrate`, `--preflight`, `--postflight` and `--verify` (an alias for
+post-flight) skip the mode prompt. `--print-only` deliberately does *not* imply a
+mode — it's valid in both migrate and link.
 
 ## The guided flow
 
 | Step | Prompt | Default |
 |------|--------|---------|
-| 1 | **What do you want to do?** pre-flight / post-flight / link | **pre-flight** |
+| 1 | **What do you want to do?** pre-flight / post-flight / link / migrate | **pre-flight** |
 | 2 | **Which environment?** staging (`eng-orion`) / production / other namespace | staging |
 | 3 | **Read from these databases?** — target shown, approved *before any query runs* | — |
 | 4 | **Which providers?** every provider with an account configuration / a list you type | all |
@@ -180,6 +184,89 @@ from what's missing. The short reasons in that column mean:
 If two providers in one batch resolve to the **same** legal entity, that's a
 unique-index collision: it's flagged with a `⚠`, and the task will apply one and
 skip the rest. The verification pass below is what catches which one lost.
+
+## Migrate — create the legal entities
+
+The first step of the workflow, and the one everything else depends on: without a
+legal entity and a primary pointer there is nothing to compare or link.
+
+```sh
+./plugin_legal_entity_updates.js --migrate 12345,67890
+./plugin_legal_entity_updates.js            # then pick 4
+```
+
+Runs, on the **`partners-app`** service (not accounting-documents):
+
+```sh
+houston task run partners-app --namespace eng-orion \
+    legal_entities_migration:migrate \
+    -p PROVIDER_IDS=12345,67890 \
+    -p MIGRATE_PAYMENT_METHODS="true"
+```
+
+`app-shedul/src/lib/tasks/legal_entities_migration.rake` →
+`legal_entities_migration.rb` (`LegalEntitiesMigration`). Per provider it
+classifies and dispatches to `billing_only`, `adyen_fresha_pay` or
+`checkout_fresha_pay`, creating the legal entity and setting it primary.
+
+**Explicit provider list only.** No `--all`, no `COUNTRY_CODES`, no
+`PROVIDER_IDS_CSV_URL` — the task supports the latter two, but "every provider
+with an account configuration" is the wrong set for a migration and a stray Enter
+must not migrate everything. `--all`, `--file` and `--json` are rejected with an
+error rather than silently ignored.
+
+### Three things about this task that shaped the design
+
+1. **There is no `DRY_RUN`.** Unlike the link task, it writes on the first call.
+   So the stand-in is a read-only preview of where each provider stands, printed
+   before the gate:
+
+   ```
+   PROVIDER  CC  FRESHA_PAY  MIGRATION TYPE       STATUS     LEGAL ENTITY  WHAT WILL HAPPEN
+   201       IT  0           —                    —          —             new — will migrate
+   202       IT  0           billing_only         confirmed  aaaa2222…     already confirmed — re-run resumes, no duplicate
+   203       ES  1           adyen_fresha_pay     failed     ∅             previously failed — will retry
+   204       IT  0           billing_only         migrated   aaaa4444…     partially migrated — will resume
+                             checkout_fresha_pay  pending    ∅
+   999       —   —           —                    —          —             ⚠ provider not found in providers
+   ```
+
+   A provider can hold one `billing_migration_statuses` row per `migration_type`,
+   so the join legitimately fans out — every row is shown. `MIGRATION TYPE` and
+   `STATUS` are what's already *recorded*; for a provider with no row the branch
+   is decided server-side by `resolve_migration_type` (plus the `fresha_pay`
+   nil/`not_set` → `billing_only` special case), so `CC` and `FRESHA_PAY` are
+   shown as the inputs rather than a guessed outcome.
+
+2. **It is resumable.** `ensure_legal_entity_created` returns early when the
+   status is already `migrated`, `find_or_create_status` reuses an existing row,
+   and the blast-marketing update only claims rows whose `legal_entity_id IS
+   NULL`. A re-run resumes rather than duplicating — which is why "already
+   confirmed" is not treated as an error.
+
+3. **`MIGRATE_PAYMENT_METHODS=true` has an external side effect** — card-on-file
+   migration through an RPC (`PaymentMethodMigration`). It defaults to true here,
+   matching how the task is invoked in practice, and the gate says so explicitly.
+   `--no-payment-methods` turns it off.
+
+Only the provider IDs are prompted for. `COPY_TAX_NUMBER` and `BATCH_SIZE` stay
+at the task's own defaults (`false`, `100`), overridable by flag but never asked.
+
+### Read-back
+
+Same principle as link mode — the task exits 0 even when individual providers
+fail, so the exit code proves nothing. The migration state is re-read afterwards
+and shown as a before → after transition:
+
+```
+   PROVIDER  BEFORE                            AFTER      LEGAL ENTITY  RESULT
+✓  201       new — will migrate                confirmed  aaaa1111…     migrated
+✗  203       previously failed — will retry    failed     ∅             FAILED — see task logs
+✓  204       partially migrated — will resume  confirmed  aaaa4444…     migrated
+```
+
+Ends in `MIGRATE: PASS` / `FAIL`. Exits 1 if any requested provider still has no
+status row or sits at `failed`.
 
 ## Verification
 
@@ -358,6 +445,10 @@ stream into your terminal; the full argv is echoed before the spawn.
 ./plugin_legal_entity_updates.js [provider_ids]
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
+#       --migrate          run legal_entities_migration:migrate on partners-app
+#       --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (default true)
+#       --copy-tax-number      COPY_TAX_NUMBER=true (default false)
+#       --batch-size N         BATCH_SIZE=N (task default 100)
 #       --verify           audit only — report link state, run nothing, exit 1 on drift
 #   -f, --file PATH        read provider IDs from a file (# starts a comment)
 #       --apply            DRY_RUN="false" — actually write
@@ -412,7 +503,7 @@ runs before spawning Houston (which needs stdin for its own prompts) and in a
 - Node on PATH. Dependency-free.
 - Needs psql access to **three** databases in the target namespace — `shedul`,
   `accounting_documents` and `legal_entities` — plus permission to run Houston
-  tasks there. (In staging all three are hosted on the same RDS instance,
+  tasks on **both** `accounting-documents` (link) and `partners-app` (migrate). (In staging all three are hosted on the same RDS instance,
   `<namespace>-shedul`; the alias still selects the database.)
 
 ## Output

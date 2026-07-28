@@ -63,16 +63,19 @@
 // legal_entity_id are left alone (the task would skip them anyway —
 // BackfillAccountConfigurationPluginLegalEntityIdAction never overwrites).
 //
-// THREE MODES, picked at the first prompt:
+// FOUR MODES, picked at the first prompt. Workflow order:
+//   migrate      create the legal entities (legal_entities_migration:migrate on
+//                partners-app) — run FIRST; everything else depends on it
 //   pre-flight   is the data consistent? (billing info vs legal entity)  READ-ONLY
+//   link         resolve and run link_plugins_to_legal_entities_from_env
 //   post-flight  is everything linked?   (plugin vs primary legal entity) READ-ONLY
-//   link         resolve and run the task — the only mode that can write
 //
 // Usage:
 //   ./plugin_legal_entity_updates.js                        # guided — just run it
+//   ./plugin_legal_entity_updates.js --migrate 12345        # create legal entities
 //   ./plugin_legal_entity_updates.js --preflight --all      # data consistency, pass/fail
 //   ./plugin_legal_entity_updates.js --postflight --all     # link state, pass/fail
-//   ./plugin_legal_entity_updates.js 12345,67890            # skip the provider prompt
+//   ./plugin_legal_entity_updates.js 12345,67890            # link: skip the provider prompt
 //   ./plugin_legal_entity_updates.js -n production --apply 12345
 //   ./plugin_legal_entity_updates.js --print-only 12345     # don't run it
 
@@ -204,6 +207,14 @@ const DEFAULT_NAMESPACE = "eng-orion";
 const DEFAULT_SERVICE = "accounting-documents";
 const TASK = "link_plugins_to_legal_entities_from_env";
 
+// Migrate mode drives a different service entirely — the migration lives in
+// app-shedul (partners), not accounting-documents.
+const MIGRATE_SERVICE = "partners-app";
+const MIGRATE_TASK = "legal_entities_migration:migrate";
+
+// app-shedul/src/app/models/billing_migration_status.rb
+const MIGRATION_STATUSES = ["pending", "migrated", "confirmed", "failed"];
+
 // Namespaces that get the second confirmation gate.
 const PROD_NAMESPACES = new Set(["production", "prod"]);
 
@@ -253,8 +264,13 @@ function parseArgs(argv) {
     json: false,
     printOnly: false,
     all: false,
-    // "preflight" | "postflight" | "link" — null until chosen (flag or prompt).
+    // "preflight" | "postflight" | "link" | "migrate" — null until chosen.
     mode: null,
+    // Migrate-mode params. Payment methods default ON, matching how the task is
+    // invoked in practice; the rest sit at the rake task's own defaults.
+    migratePaymentMethods: true,
+    copyTaxNumber: false,
+    batchSize: null,
     file: null,
     providerIds: null,
     help: false,
@@ -279,13 +295,18 @@ function parseArgs(argv) {
       opts.modeGiven = true;
       opts.mode = "link";
     } else if (a === "--all") opts.all = true;
+    else if (a === "--migrate") opts.mode = "migrate";
+    else if (a === "--no-payment-methods") opts.migratePaymentMethods = false;
+    else if (a === "--copy-tax-number") opts.copyTaxNumber = true;
+    else if (a === "--batch-size") opts.batchSize = argv[++i];
     else if (a === "--preflight" || a === "--pre-flight") opts.mode = "preflight";
     // --verify was the old name for the link audit; kept as an alias.
     else if (a === "--postflight" || a === "--post-flight" || a === "--verify") {
       opts.mode = "postflight";
     } else if (a === "--print-only") {
+      // Valid in both link and migrate, so it must NOT imply a mode — otherwise
+      // it would silently answer the mode prompt for you.
       opts.printOnly = true;
-      opts.mode = opts.mode || "link";
     } else if (a === "--json") {
       opts.json = true;
       opts.mode = opts.mode || "link";
@@ -316,6 +337,11 @@ Flags (each one just pre-answers a prompt):
       --all              Every provider in account_configurations
   -f, --file PATH        Read provider IDs from a file (one per line, or any
                          comma/whitespace-separated mix; # starts a comment)
+      --migrate          Run ${MIGRATE_TASK} on
+                         ${MIGRATE_SERVICE}. Explicit provider list only.
+      --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (default true)
+      --copy-tax-number      COPY_TAX_NUMBER=true (default false)
+      --batch-size N         BATCH_SIZE=N (task default 100)
       --preflight        READ-ONLY. Cross-check provider_billing_informations
                          against the legal entity, field by field. PASS/FAIL.
       --postflight       READ-ONLY. Is every plugin pointing at its provider's
@@ -332,7 +358,14 @@ Flags (each one just pre-answers a prompt):
 REQUIRES A TERMINAL. If stdin is not a TTY the script refuses to run — a piped
 "yes" is not explicit approval, so cron/CI cannot drive it. No --force escape.
 
-Three modes, asked as the first prompt:
+Four modes, asked as the first prompt:
+
+  MIGRATE      Create the legal entities in the first place — runs
+               ${MIGRATE_TASK} on ${MIGRATE_SERVICE}.
+               Takes an explicit provider list only. No dry run exists for this
+               task, so a read-only preview of each provider's current migration
+               state is shown before the gate. Run this BEFORE link.
+
 
   PRE-FLIGHT   Is the data consistent? Cross-checks provider_billing_informations
    (default)   (${SHEDUL_DB}) against the legal entity's fields (${LE_DB})
@@ -346,8 +379,10 @@ Three modes, asked as the first prompt:
   LINK         Resolve, then run ${TASK}.
                The only mode that can write, and only via apply.
 
+Workflow order: MIGRATE → PRE-FLIGHT → LINK → POST-FLIGHT.
+
 The guided flow:
-  1. WHICH MODE?      — pre-flight (default), post-flight, or link
+  1. WHICH MODE?      — pre-flight (default), post-flight, link, or migrate
   2. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
   3. APPROVE READS    — the target is shown and confirmed before ANY query runs
   4. providers        — all of them, or a list you type
@@ -969,6 +1004,244 @@ function printPreflightVerdict(tally, missingLegalEntity) {
   return failed;
 }
 
+// --- migrate -----------------------------------------------------------------
+//
+// Drives `legal_entities_migration:migrate` on partners-app (app-shedul), the
+// step that CREATES each provider's legal entity and sets it primary. Everything
+// the other modes inspect depends on this having run.
+//
+// The task has no DRY_RUN — it writes on first call. So the stand-in is a
+// read-only preview of where each provider currently stands, shown before the
+// confirmation gate. It is resumable though: ensure_legal_entity_created returns
+// early when the status is already `migrated`, find_or_create_status reuses an
+// existing row, and the blast-marketing update only claims rows whose
+// legal_entity_id IS NULL — so a re-run resumes rather than duplicating.
+
+// One row per (provider, migration_type). A provider can hold several status rows
+// — one per type — so the LEFT JOIN legitimately fans out; every row is shown.
+// Providers absent from `providers` come back with no row at all and are flagged.
+function fetchMigrationStatuses(env, providerIds) {
+  const sql =
+    "SELECT p.id::text, coalesce(p.country_code, ''), coalesce(p.fresha_pay::text, ''),\n" +
+    "       coalesce(s.migration_type, ''), coalesce(s.status, ''),\n" +
+    "       coalesce(s.legal_entity_id::text, ''),\n" +
+    "       coalesce(s.payment_method_migrated::text, '')\n" +
+    "FROM providers p\n" +
+    "LEFT JOIN billing_migration_statuses s ON s.provider_id = p.id\n" +
+    `WHERE p.id IN (${providerIds.join(",")})\n` +
+    "ORDER BY p.id, s.migration_type;";
+
+  const byProvider = new Map();
+  for (const row of parseRowsLoose(psqlRead(env, SHEDUL_DB, sql), 7)) {
+    const [id, countryCode, freshaPay, migrationType, status, legalEntityId, pmMigrated] = row;
+    if (!byProvider.has(id)) {
+      byProvider.set(id, { providerId: id, countryCode, freshaPay, statuses: [] });
+    }
+    if (migrationType || status) {
+      byProvider.get(id).statuses.push({
+        migrationType,
+        status,
+        legalEntityId,
+        paymentMethodMigrated: pmMigrated === "t" || pmMigrated === "true",
+      });
+    }
+  }
+  return byProvider;
+}
+
+// What running the task would mean for a provider in this state.
+function migrateVerdict(entry) {
+  if (!entry) return { text: "⚠ provider not found in providers", bad: true };
+  if (!entry.statuses.length) return { text: "new — will migrate", bad: false };
+
+  const statuses = entry.statuses.map((s) => s.status);
+  if (statuses.includes("failed")) return { text: "previously failed — will retry", bad: true };
+  if (statuses.every((s) => s === "confirmed")) {
+    return { text: "already confirmed — re-run resumes, no duplicate", bad: false };
+  }
+  if (statuses.includes("migrated")) {
+    return { text: "partially migrated — will resume", bad: false };
+  }
+  if (statuses.includes("pending")) return { text: "pending — will retry", bad: false };
+  return { text: statuses.join(","), bad: false };
+}
+
+function printMigratePreview(providerIds, byProvider) {
+  console.log(c.head("\n── Current migration state (read-only) ─────────────────"));
+
+  const rows = [];
+  for (const id of providerIds) {
+    const entry = byProvider.get(id);
+    const verdict = migrateVerdict(entry);
+
+    if (!entry || !entry.statuses.length) {
+      rows.push([
+        id,
+        entry ? entry.countryCode : "—",
+        entry ? entry.freshaPay || "∅" : "—",
+        "—",
+        "—",
+        "—",
+        verdict.bad ? c.bad(verdict.text) : verdict.text,
+      ]);
+      continue;
+    }
+
+    entry.statuses.forEach((s, i) => {
+      rows.push([
+        i === 0 ? id : "",
+        i === 0 ? entry.countryCode : "",
+        i === 0 ? entry.freshaPay || "∅" : "",
+        s.migrationType,
+        s.status,
+        s.legalEntityId || "∅",
+        i === 0 ? (verdict.bad ? c.bad(verdict.text) : verdict.text) : "",
+      ]);
+    });
+  }
+
+  console.log(
+    renderTable(
+      ["PROVIDER", "CC", "FRESHA_PAY", "MIGRATION TYPE", "STATUS", "LEGAL ENTITY", "WHAT WILL HAPPEN"],
+      rows
+    )
+  );
+
+  const missing = providerIds.filter((id) => !byProvider.has(id));
+  if (missing.length) {
+    console.log(c.bad(`\n  ⚠ Not found in providers: ${missing.join(", ")}`));
+  }
+
+  console.log(
+    c.faint(
+      "\n  MIGRATION TYPE / STATUS are what is already recorded. For a provider with\n" +
+        "  no row yet, the branch is decided server-side by resolve_migration_type\n" +
+        "  (plus the fresha_pay nil/not_set → billing_only special case), so CC and\n" +
+        "  FRESHA_PAY are shown as the inputs rather than a guessed outcome."
+    )
+  );
+
+  return missing.length;
+}
+
+function migrateTaskArgs(opts, providerIds) {
+  const args = [
+    "task",
+    "run",
+    MIGRATE_SERVICE,
+    "--namespace",
+    opts.namespace,
+    MIGRATE_TASK,
+    "-p",
+    `PROVIDER_IDS=${providerIds.join(",")}`,
+    "-p",
+    `MIGRATE_PAYMENT_METHODS=${opts.migratePaymentMethods}`,
+  ];
+  if (opts.copyTaxNumber) args.push("-p", "COPY_TAX_NUMBER=true");
+  if (opts.batchSize) args.push("-p", `BATCH_SIZE=${opts.batchSize}`);
+  return args;
+}
+
+function buildMigrateCommand(opts, providerIds) {
+  const lines = [
+    `houston task run ${MIGRATE_SERVICE} --namespace ${opts.namespace} \\`,
+    `    ${MIGRATE_TASK} \\`,
+    `    -p PROVIDER_IDS=${providerIds.join(",")} \\`,
+    `    -p MIGRATE_PAYMENT_METHODS="${opts.migratePaymentMethods}"`,
+  ];
+  if (opts.copyTaxNumber) {
+    lines[lines.length - 1] += " \\";
+    lines.push(`    -p COPY_TAX_NUMBER="true"`);
+  }
+  if (opts.batchSize) {
+    lines[lines.length - 1] += " \\";
+    lines.push(`    -p BATCH_SIZE="${opts.batchSize}"`);
+  }
+  return lines.join("\n");
+}
+
+// Migrate has no dry run, so the gate has to carry that weight explicitly.
+function printMigrateWarning(opts) {
+  console.log(
+    c.warn(
+      "\n  ⚠ This task has NO dry run — it writes on the first call. It creates each\n" +
+        "    provider's legal entity and sets it as primary."
+    )
+  );
+  if (opts.migratePaymentMethods) {
+    console.log(
+      c.warn(
+        "    MIGRATE_PAYMENT_METHODS=true also migrates cards on file through an RPC\n" +
+          "    — an external side effect. Pass --no-payment-methods to skip that."
+      )
+    );
+  }
+  console.log(
+    c.faint(
+      "    It is resumable: an already-migrated provider is resumed, not duplicated."
+    )
+  );
+}
+
+// Before → after, per provider. The task logs per-provider outcomes and still
+// exits 0 on failures, so as with the link mode the read-back is the evidence.
+function printMigrateReadback(providerIds, before, after) {
+  console.log(c.head("\n── Verification ────────────────────────────────────────"));
+
+  const rows = [];
+  let failures = 0;
+
+  for (const id of providerIds) {
+    const was = migrateVerdict(before.get(id)).text;
+    const entry = after.get(id);
+    const statuses = entry ? entry.statuses.map((s) => s.status) : [];
+    const now = statuses.length ? statuses.join(",") : "—";
+
+    const ok = statuses.length > 0 && !statuses.includes("failed");
+    if (!ok) failures++;
+
+    rows.push([
+      ok ? c.ok("✓") : c.bad("✗"),
+      id,
+      was,
+      now,
+      entry && entry.statuses.find((s) => s.legalEntityId)
+        ? entry.statuses.find((s) => s.legalEntityId).legalEntityId
+        : "∅",
+      ok ? "migrated" : statuses.includes("failed") ? "FAILED — see task logs" : "no status row written",
+    ]);
+  }
+
+  console.log(
+    renderTable(["", "PROVIDER", "BEFORE", "AFTER", "LEGAL ENTITY", "RESULT"], rows)
+  );
+  console.log(
+    c.faint(
+      `\n  Method: re-read providers + billing_migration_statuses from ${SHEDUL_DB} after\n` +
+        "  the task. The task exits 0 even when individual providers fail, so its exit\n" +
+        "  code alone proves nothing — only the read-back does."
+    )
+  );
+
+  console.log(
+    failures
+      ? c.bad(`\n══ MIGRATE: FAIL ═══════════════════════════════════════`)
+      : c.ok(`\n══ MIGRATE: PASS ═══════════════════════════════════════`)
+  );
+  console.log(
+    failures
+      ? `  ${c.bad("✗")} ${failures} of ${providerIds.length} did not migrate. See RESULT above.`
+      : `  ${c.ok("✓")} all ${providerIds.length} provider(s) migrated.`
+  );
+  if (!failures) {
+    console.log(
+      c.faint("\n  Next: pre-flight to check the data, then link to connect the plugins.")
+    );
+  }
+
+  return failures;
+}
+
 // --- audit (--verify) --------------------------------------------------------
 //
 // Standalone verification: for every requested provider, compare what its plugin
@@ -1249,7 +1522,27 @@ async function askMode() {
       aliases: ["link", "apply", "run", "fix"],
       value: "link",
     },
+    {
+      label: "Migrate     — create legal entities for providers (run BEFORE link)",
+      aliases: ["migrate", "migration", "create"],
+      value: "migrate",
+    },
   ]);
+}
+
+// Migrate takes an explicit list and nothing else. Deliberately no "all" option:
+// "every provider with an account configuration" is the wrong set for a
+// migration, and a stray Enter must not migrate everything.
+async function askMigrateProviderIds() {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = await ask("\nProvider IDs to migrate (comma- or space-separated): ");
+    try {
+      return parseProviderIds(raw);
+    } catch (err) {
+      console.error(`  ${err.message}`);
+    }
+  }
+  throw new Error("No valid provider IDs given.");
 }
 
 // Which environment. Returns a namespace string. "Other" lets you name any
@@ -1411,6 +1704,22 @@ async function main() {
   //    only makes sense in one mode has already answered this.
   if (!opts.mode) opts.mode = await askMode();
 
+  // Fail loudly on flags that mean nothing in migrate mode rather than ignoring
+  // them — silently dropping --all on a migration would be a nasty surprise.
+  if (opts.mode === "migrate") {
+    const bad = [
+      opts.all && "--all",
+      opts.file && "--file",
+      opts.json && "--json",
+    ].filter(Boolean);
+    if (bad.length) {
+      throw new Error(
+        `${bad.join(", ")} cannot be used with migrate — it takes an explicit ` +
+          "provider list only. Pass the IDs as arguments, or let it prompt you."
+      );
+    }
+  }
+
   // 2. Environment — -n, or prompt. Before the reads, because discovering
   //    providers is itself a query against the chosen namespace.
   if (!opts.namespaceGiven && !opts.json) {
@@ -1421,6 +1730,46 @@ async function main() {
   // 3. Approve the data access itself, before any query goes out ------------
   if (!(await confirmDataAccess(opts, env))) {
     console.log("Aborted. Nothing was read.");
+    return;
+  }
+
+  // MIGRATE takes its own path from here. It shares the gates above and nothing
+  // else — no provider discovery, no plugin reads, no resolve.
+  if (opts.mode === "migrate") {
+    const providerIds = opts.providerIds
+      ? parseProviderIds(opts.providerIds)
+      : await askMigrateProviderIds();
+
+    console.log(
+      `\nTarget: namespace=${opts.namespace} psql_env=${env} service=${MIGRATE_SERVICE}`
+    );
+    console.log(`Providers to migrate: ${providerIds.length} — ${providerIds.join(", ")}`);
+
+    // Preview stands in for the dry run this task doesn't have.
+    console.log(c.faint(`\nReading migration state from ${SHEDUL_DB} (read-only)…`));
+    const before = fetchMigrationStatuses(env, providerIds);
+    printMigratePreview(providerIds, before);
+
+    console.log(c.head("\n── Command ─────────────────────────────────────────────"));
+    console.log(`\n${c.cmd(buildMigrateCommand(opts, providerIds))}\n`);
+
+    if (opts.printOnly) {
+      console.log("[print-only] Nothing was run.");
+      return;
+    }
+
+    printMigrateWarning(opts);
+
+    if (!(await confirmRun(opts))) {
+      console.log("Aborted. Nothing was run.");
+      return;
+    }
+
+    runInherit("houston", [...migrateTaskArgs(opts, providerIds), "--no-tui", "-w"]);
+
+    console.log(c.faint(`\nVerifying against ${SHEDUL_DB} (read-only)…`));
+    const after = fetchMigrationStatuses(env, providerIds);
+    if (printMigrateReadback(providerIds, before, after)) process.exitCode = 1;
     return;
   }
 
