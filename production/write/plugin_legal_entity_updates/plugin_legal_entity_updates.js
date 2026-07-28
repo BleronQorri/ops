@@ -462,6 +462,10 @@ function parseArgs(argv) {
     else if (a === "--no-payment-methods") opts.migratePaymentMethods = false;
     else if (a === "--copy-tax-number") opts.copyTaxNumber = true;
     else if (a === "--batch-size") opts.batchSize = argv[++i];
+    // Selects link mode WITHOUT pre-answering dry-run-vs-apply — unlike --apply and
+    // --dry-run, which set modeGiven and therefore skip that prompt. Guided needs
+    // this: it has to reach link mode and still let you choose.
+    else if (a === "--link") opts.mode = "link";
     else if (a === "--preflight" || a === "--pre-flight") opts.mode = "preflight";
     // --verify was the old name for the link audit; kept as an alias.
     else if (a === "--postflight" || a === "--post-flight" || a === "--verify") {
@@ -2941,7 +2945,10 @@ const WORKFLOW_STEPS = [
   },
   {
     key: "link",
-    flag: "--dry-run",
+    // --link, NOT --dry-run: the latter would pre-answer the apply prompt and make
+    // guided incapable of ever writing. This step must be able to complete the
+    // migration, so it asks you like the direct path does.
+    flag: "--link",
     title: "LINK — point the plugins at the legal entity",
     writes: true,
     what:
@@ -2949,7 +2956,7 @@ const WORKFLOW_STEPS = [
     why:
       "The plugin is what the send path reads. Until it carries the legal_entity_id, e-invoicing still uses the legacy provider billing.",
     watch:
-      "Defaults to DRY_RUN=true — this step runs the dry run. Re-run the step and choose APPLY to write. Only one plugin can hold a given legal entity.",
+      "This step ASKS: dry run (default) or apply. Choosing apply writes, so guided can complete the migration. Only one plugin can hold a given legal entity.",
   },
   {
     key: "postflight",
