@@ -154,7 +154,8 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #       --no-payment-methods / --copy-tax-number / --batch-size N   migrate params
 #       --preflight        read-only: billing info vs legal entity + per-country REQUIRED
 #                          set and KSA format rules (CRN 10 chars, TRN ^3\d{12}03$)
-#       --md [path]        export the pre-flight comparison as Markdown (offered as a
+#       --md [path]        export the report as Markdown: field-by-field comparison +
+#                          blocked roster + KYC gate (offered as a
 #                          prompt too); default preflight-<ns>-<date>.md
 #       --detail / --summary   force the per-provider field checklist on/off
 #                          (default: on when you name providers, off for --all)

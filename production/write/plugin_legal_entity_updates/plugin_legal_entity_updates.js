@@ -701,6 +701,9 @@ async function askChoice(title, choices) {
 
   console.log(`\n${title}`);
   choices.forEach((choice, i) => {
+    // A `section` on a choice starts a new group above it. Purely presentational —
+    // numbering stays continuous so "4" always means the same thing.
+    if (choice.section) console.log(`\n  ${c.head(choice.section)}`);
     console.log(
       `  ${i + 1}) ${choice.label}` +
         (choice.stage ? `   ${c.faint(`[${choice.stage}]`)}` : "") +
@@ -1802,6 +1805,172 @@ function printMigrateReadback(providerIds, before, after) {
   return failures;
 }
 
+// --- KYC status ----------------------------------------------------------------
+//
+// Mirrors AccountingDocuments.EInvoicing.Common.PaymentsKycGate, which gates
+// onboarding on the Billing Profiles path:
+//
+//   payments not enabled                        -> allow (KYC irrelevant)
+//   payments enabled + KYC approved             -> allow
+//   payments enabled + not approved/not synced  -> {:error, :kyc_not_approved}
+//
+// The gate resolves this over three RPCs: Platform get_provider
+// (`fresha_pay_enabled`), legal-entities get_legal_entity (which carries the
+// adyen-platform legal-entity id when synced), then adyen-platform
+// get_legal_entity (`verification_status`).
+//
+// From psql we can reproduce TWO of the three outcomes exactly:
+//   * payments not enabled            -> ALLOWED, definitively
+//   * payments enabled + not synced    -> NOT APPROVED, definitively (the gate
+//                                        treats "not synced" as not approved)
+// The third — payments enabled AND synced — needs the adyen-platform
+// verification_status. Its backing table (adyen_platform.legal_entity_verifications)
+// is empty in staging, so we report it as UNKNOWN rather than guessing. Never
+// claim PASSED from the database.
+const ADYEN_DB = "adyen_platform";
+
+// providers.fresha_pay is enum %i[not_set enabled disabled] — see Provider model.
+const FRESHA_PAY = { 0: "not_set", 1: "enabled", 2: "disabled" };
+
+function fetchPaymentsEnabled(env, providerIds) {
+  const sql =
+    "SELECT id::text, coalesce(fresha_pay::text, '')\n" +
+    "FROM providers\n" +
+    `WHERE id IN (${providerIds.join(",")})\n` +
+    "ORDER BY id;";
+
+  const map = new Map();
+  for (const [id, freshaPay] of parseRows(psqlRead(env, SHEDUL_DB, sql), 2)) {
+    map.set(id, FRESHA_PAY[freshaPay] || (freshaPay === "" ? "not_set" : freshaPay));
+  }
+  return map;
+}
+
+// The Fresha legal entity stores the adyen-platform legal-entity id when synced to
+// a KYC provider; that id is the primary key over in adyen_platform.legal_entities.
+function fetchKycSync(env, legalEntityIds) {
+  if (!legalEntityIds.length) return new Map();
+  const quoted = legalEntityIds.map((id) => `'${id}'`).join(",");
+
+  const sql =
+    "SELECT id::text, coalesce(adyen_platform_legal_entity_id::text, '')\n" +
+    "FROM legal_entities\n" +
+    `WHERE id IN (${quoted});`;
+
+  const map = new Map();
+  for (const [id, adyenId] of parseRows(psqlRead(env, LE_DB, sql), 2)) {
+    map.set(id, adyenId || null);
+  }
+  return map;
+}
+
+// Whatever adyen-platform knows about those entities. legal_entity_verifications is
+// the closest thing to the RPC's verification_status; where there is no row we say
+// so rather than inferring approval.
+function fetchAdyenVerifications(env, adyenLegalEntityIds) {
+  if (!adyenLegalEntityIds.length) return new Map();
+  const quoted = adyenLegalEntityIds.map((id) => `'${id}'`).join(",");
+
+  const sql =
+    "SELECT le.id::text, coalesce(le.tier::text, ''), coalesce(le.adyen_legal_entity_id, ''),\n" +
+    "       coalesce((SELECT v.state::text FROM legal_entity_verifications v\n" +
+    "                 WHERE v.legal_entity_id = le.id ORDER BY v.updated_at DESC LIMIT 1), '')\n" +
+    "FROM legal_entities le\n" +
+    `WHERE le.id IN (${quoted});`;
+
+  const map = new Map();
+  for (const row of parseRows(psqlRead(env, ADYEN_DB, sql), 4)) {
+    const [id, tier, adyenId, state] = row;
+    map.set(id, { tier, adyenId: adyenId || null, state: state || null });
+  }
+  return map;
+}
+
+// The gate's verdict, as far as the database can honestly establish it.
+function kycVerdict({ payments, adyenLegalEntityId, adyen }) {
+  if (payments !== "enabled") {
+    return {
+      state: "allowed",
+      text: `payments ${payments} — KYC not required`,
+      exact: true,
+    };
+  }
+  if (!adyenLegalEntityId) {
+    return {
+      state: "not_approved",
+      text: "payments enabled but not synced to a KYC provider — gate returns kyc_not_approved",
+      exact: true,
+    };
+  }
+  if (adyen && adyen.state === "success") {
+    return { state: "likely_approved", text: "adyen verification: success", exact: false };
+  }
+  if (adyen && adyen.state) {
+    return { state: "not_approved", text: `adyen verification: ${adyen.state}`, exact: false };
+  }
+  return {
+    state: "unknown",
+    text: "payments enabled and synced, but no verification record — needs the adyen-platform RPC",
+    exact: false,
+  };
+}
+
+function printKycStatus(rows) {
+  const mark = {
+    allowed: c.ok("✓ allowed"),
+    likely_approved: c.ok("✓ likely"),
+    not_approved: c.bad("✗ not approved"),
+    unknown: c.warn("? unknown"),
+  };
+
+  console.log(c.head("\n── KYC / payments gate ─────────────────────────────────"));
+  console.log(
+    renderTable(
+      ["PROVIDER", "PAYMENTS", "KYC PROVIDER (adyen LE)", "TIER", "GATE", "BASIS"],
+      rows.map((r) => [
+        r.providerId,
+        r.payments,
+        r.adyenLegalEntityId || c.faint("∅ not synced"),
+        (r.adyen && r.adyen.tier) || "—",
+        mark[r.verdict.state] || r.verdict.state,
+        r.verdict.exact ? r.verdict.text : c.faint(r.verdict.text),
+      ])
+    )
+  );
+
+  const blocked = rows.filter((r) => r.verdict.state === "not_approved");
+  const unknown = rows.filter((r) => r.verdict.state === "unknown");
+
+  console.log(
+    c.faint(
+      "\n  Mirrors EInvoicing.Common.PaymentsKycGate. Payments come from providers.fresha_pay\n" +
+        "  (enum not_set/enabled/disabled); the KYC-provider link is\n" +
+        "  legal_entities.adyen_platform_legal_entity_id. The gate treats NOT SYNCED as not\n" +
+        "  approved, so those two verdicts are exact."
+    )
+  );
+  if (unknown.length) {
+    console.log(
+      c.warn(
+        `\n  ? ${unknown.length} provider(s) UNKNOWN: payments enabled and synced, but the\n` +
+          "    authoritative verification_status lives behind the adyen-platform RPC.\n" +
+          `    ${ADYEN_DB}.legal_entity_verifications has no row for them — this script will\n` +
+          "    not claim PASSED from the database."
+      )
+    );
+  }
+  if (blocked.length) {
+    console.log(
+      c.bad(
+        `\n  ✗ ${blocked.length} provider(s) would be blocked by the KYC gate: ` +
+          blocked.map((r) => r.providerId).join(", ")
+      )
+    );
+  }
+
+  return blocked.length;
+}
+
 // --- plugin audit -------------------------------------------------------------
 //
 // Pre-flight compares billing info against the provider's PRIMARY legal entity.
@@ -2023,7 +2192,15 @@ function mdPresence(row) {
   return `⚠ ${row.presence}`;
 }
 
-function buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail, title) {
+function buildPreflightMarkdown(
+  opts,
+  comparisons,
+  tally,
+  missingLegalEntity,
+  detail,
+  title,
+  kycRows
+) {
   const blocked = comparisons.filter((cmp) => cmp.blocking.length);
   const failed = tally.differ > 0 || tally.blocked > 0;
   const out = [];
@@ -2104,6 +2281,46 @@ function buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, de
         )
       );
     }
+  }
+
+  if (kycRows && kycRows.length) {
+    out.push("");
+    out.push("## KYC / payments gate");
+    out.push("");
+    out.push(
+      mdTable(
+        ["Provider", "Payments", "KYC provider (adyen LE)", "Tier", "Gate", "Basis"],
+        kycRows.map((r) => [
+          r.providerId,
+          r.payments,
+          r.adyenLegalEntityId || "∅ not synced",
+          (r.adyen && r.adyen.tier) || "—",
+          { allowed: "✓ allowed", likely_approved: "✓ likely", not_approved: "✗ not approved", unknown: "? unknown" }[
+            r.verdict.state
+          ] || r.verdict.state,
+          r.verdict.exact ? r.verdict.text : `*${r.verdict.text}*`,
+        ])
+      )
+    );
+    out.push("");
+    out.push(
+      "Mirrors `AccountingDocuments.EInvoicing.Common.PaymentsKycGate`: payments not " +
+        "enabled → allowed (KYC irrelevant); payments enabled + approved → allowed; " +
+        "payments enabled + not approved **or not synced** → `{:error, :kyc_not_approved}`."
+    );
+    out.push("");
+    out.push(
+      "| Signal | Source | Exact? |\n|---|---|---|\n" +
+        "| payments enabled | `shedul.providers.fresha_pay` (enum `not_set`/`enabled`/`disabled`) | yes |\n" +
+        "| synced to KYC provider | `legal_entities.adyen_platform_legal_entity_id` | yes |\n" +
+        `| verification status | \`${ADYEN_DB}.legal_entity_verifications.state\` | **no** — authoritative value is behind the adyen-platform RPC |`
+    );
+    out.push("");
+    out.push(
+      "Rows in *italics* are inferred, not definitive. **`? unknown` means payments are " +
+        "enabled and the entity is synced, but no verification record exists — this report " +
+        "will not claim PASSED from the database.**"
+    );
   }
 
   out.push("");
@@ -2447,6 +2664,7 @@ function printExemptProviders(skipped) {
 async function askMode() {
   return askChoice("What do you want to do?", [
     {
+      section: "MIGRATION — the procedure, in order",
       label: "Guided       — the whole procedure, step by step",
       stage: "start here",
       detail:
@@ -2493,6 +2711,7 @@ async function askMode() {
       value: "postflight",
     },
     {
+      section: "REPORTING — look, don't touch",
       label: "Plugin audit — billing info vs each PLUGIN's legal entity",
       stage: "any stage · read-only",
       detail:
@@ -2502,6 +2721,7 @@ async function askMode() {
       value: "plugins",
     },
     {
+      section: "STAGING ONLY — destructive",
       label: "Reset        — undo the migration for a provider",
       stage: "remedial · STAGING ONLY · destructive",
       detail:
@@ -2658,7 +2878,7 @@ async function confirmDataAccess(opts, env) {
   say(`  namespace : ${opts.namespace}${prod ? "   ⚠  PRODUCTION" : ""}`);
   say(`  psql env  : ${env}`);
   say(`  mode      : ${opts.mode}${opts.mode === "link" ? "" : "   (read-only — cannot write)"}`);
-  say(`  databases : ${[SHEDUL_DB, AD_DB, LE_DB].join(", ")}`);
+  say(`  databases : ${[SHEDUL_DB, AD_DB, LE_DB, ADYEN_DB].join(", ")}`);
   say("  access    : read-only SELECTs — no writes at this stage");
 
   const ans = (await ask('Read from these databases? (type "yes"): ')).trim().toLowerCase();
@@ -3310,6 +3530,37 @@ async function main() {
     }
 
     const tally = printFieldComparison(comparisons);
+
+    // KYC / payments gate — a separate concern from field consistency, but the
+    // other thing that decides whether a provider can onboard.
+    console.log(c.faint(`\nReading payments status from ${SHEDUL_DB} (read-only)…`));
+    const payments = fetchPaymentsEnabled(env, withLegalEntity);
+
+    console.log(c.faint(`Reading KYC-provider links from ${LE_DB} (read-only)…`));
+    const kycSync = fetchKycSync(env, [
+      ...new Set(withLegalEntity.map((id) => primaryByProvider.get(id))),
+    ]);
+
+    const adyenIds = [...new Set([...kycSync.values()].filter(Boolean))];
+    let adyenById = new Map();
+    if (adyenIds.length) {
+      console.log(c.faint(`Reading verifications from ${ADYEN_DB} (read-only)…`));
+      adyenById = fetchAdyenVerifications(env, adyenIds);
+    }
+
+    const kycRows = withLegalEntity.map((id) => {
+      const adyenLegalEntityId = kycSync.get(primaryByProvider.get(id)) || null;
+      const row = {
+        providerId: id,
+        payments: payments.get(id) || "unknown",
+        adyenLegalEntityId,
+        adyen: adyenLegalEntityId ? adyenById.get(adyenLegalEntityId) || null : null,
+      };
+      return { ...row, verdict: kycVerdict(row) };
+    });
+
+    printKycStatus(kycRows);
+
     const failed = printPreflightVerdict(tally, missingLegalEntity);
 
     // Export. --md writes without asking; otherwise it's offered, because a flag
@@ -3326,7 +3577,7 @@ async function main() {
       const target = preflightMarkdownPath(opts);
       fs.writeFileSync(
         target,
-        buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail)
+        buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail, null, kycRows)
       );
       console.log(`  ${c.ok("✓")} written: ${target}`);
     }

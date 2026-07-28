@@ -44,6 +44,38 @@ Both are described in the plan so the procedure is written down, then listed und
 | **migrate** | It's a **precondition**, not a step. It's the only thing here that writes on the first call with **no dry run**, and `MIGRATE_PAYMENT_METHODS=true` migrates cards on file through an RPC. One keystroke from a default "Run it" is the wrong place for that — run it with `--migrate`, on purpose. If it hasn't run, pre-flight says so: *no active primary legal entity*. |
 | **reset** | Remedial and destructive, staging only. |
 
+## KYC / payments gate
+
+Pre-flight also reports the other thing that can block onboarding, mirroring
+`AccountingDocuments.EInvoicing.Common.PaymentsKycGate`:
+
+| Situation | Gate |
+|---|---|
+| payments not enabled | **allow** — KYC irrelevant |
+| payments enabled + KYC approved | allow |
+| payments enabled + not approved **or not synced** | `{:error, :kyc_not_approved}` |
+
+The gate resolves that over three RPCs. Two of the three outcomes are reproducible
+from the database **exactly**; the third is not, and the report says so rather than
+guessing:
+
+| Signal | Source | Exact? |
+|---|---|---|
+| payments enabled | `shedul.providers.fresha_pay` — enum `not_set`/`enabled`/`disabled` | **yes** |
+| synced to a KYC provider | `legal_entities.adyen_platform_legal_entity_id` | **yes** |
+| verification status | `adyen_platform.legal_entity_verifications.state` | **no** — the authoritative value is behind the adyen-platform RPC |
+
+So:
+
+- `✓ allowed` — payments not enabled. Definitive.
+- `✗ not approved` — payments enabled but not synced. Definitive: the gate treats
+  not-synced as not-approved.
+- `? unknown` — payments enabled **and** synced, but no verification row.
+  `legal_entity_verifications` is empty in staging, so **this script will not claim
+  `PASSED` from the database.** Use the RPC if you need certainty.
+
+This adds a fourth database, `adyen_platform`.
+
 ## Guided plus six single-purpose modes
 
 Workflow order: **migrate → pre-flight → link → post-flight**.
@@ -126,7 +158,7 @@ discovery, before anything — the target is spelled out and confirmed:
   namespace : production   ⚠  PRODUCTION
   psql env  : production
   mode      : preflight   (read-only — cannot write)
-  databases : shedul, accounting_documents, legal_entities
+  databases : shedul, accounting_documents, legal_entities, adyen_platform
   access    : read-only SELECTs — no writes at this stage
 Read from these databases? (type "yes"):
 ```
@@ -763,8 +795,8 @@ runs before spawning Houston (which needs stdin for its own prompts) and in a
 
 - VPN up; `houston` authenticated (prod reads use `fresha-production-developer`).
 - Node on PATH. Dependency-free.
-- Needs psql access to **three** databases in the target namespace — `shedul`,
-  `accounting_documents` and `legal_entities` — plus permission to run Houston
+- Needs psql access to **four** databases in the target namespace — `shedul`,
+  `accounting_documents`, `legal_entities` and `adyen_platform` (KYC) — plus permission to run Houston
   tasks on **both** `accounting-documents` (link) and `partners-app` (migrate). (In staging all three are hosted on the same RDS instance,
   `<namespace>-shedul`; the alias still selects the database.)
 
