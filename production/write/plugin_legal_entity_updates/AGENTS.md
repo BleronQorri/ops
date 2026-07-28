@@ -338,6 +338,48 @@ configuration:
 
 Only providers that actually differ get a table — the rest are one line each.
 
+### The field-by-field checklist
+
+When you name providers explicitly, pre-flight *also* prints a full checklist per
+provider — every field, matching or not, with the legal-entity key that supplied
+the value:
+
+```
+── provider=33 (organization) ─────────────────────────
+REQUIRED FIELD    PROVIDER BILLING (shedul)  LEGAL ENTITY (fields jsonb)                        PRESENT?
+legal name        My business                organization.legalName = My business                ✅ both
+tax / VAT no.     311268874200003            organization.vatNumber = 311268874200003            ✅ both
+registration no.  7394826150                 organization.registrationNumber = 7394826150        ✅ both
+street            Al Faisaliyyah             organization.registeredAddress.street = …           ✅ both
+country           SA                         organization.registeredAddress.country = SA         ✅ both
+building number   1234                       —                                                   provider only
+district          1234                       —                                                   provider only
+
+  ✓ 8/8 comparable fields agree   (2 provider-only column(s) shown for completeness, not compared)
+```
+
+| `PRESENT?` | Meaning |
+|---|---|
+| `✅ both` | on both sides and equal |
+| `❌ differs` | on both sides, values disagree |
+| `⚠ provider only` | in billing info, absent from the legal entity |
+| `⚠ legal entity only` | in the legal entity, absent from billing info |
+| `provider only` (plain) | a billing-info column with **no** legal-entity counterpart — see below |
+
+**Defaults by intent**, so neither use is noisy: naming providers means you're
+inspecting them, so you get the checklists; `--all` is a bulk sweep, so you get
+one line each. `--detail` and `--summary` force either way.
+
+**`building_number`, `district` and `company_number`** are
+`provider_billing_informations` columns with no legal-entity equivalent at all.
+They're listed so the checklist is complete, but marked *informational*:
+"provider only" is the designed state, not a discrepancy, so they never count
+toward the verdict. Every other row does.
+
+When nothing matched, the key column still names the key this entity *would* use
+— `individual.residentialAddress.street` for an individual, not the organization
+key — so an empty value reads as missing data rather than a wrong lookup.
+
 **Where the values come from.** `legal_entities` doesn't store this in columns:
 it keeps a jsonb array of `{key, value}` (see `LegalEntities.Schemas.Field`), so
 the query unnests `fields` and the script looks up dotted keys.
@@ -350,6 +392,7 @@ the query unnests `fields` and the script looks up dotted keys.
 | registration no. | `company_registration_number` | `organization.registrationNumber` |
 | activity code | `activity_code` | `organization.activityCode` |
 | street / city / postal / state | `address`, `city`, `postal_code`, `state_province` | `…registeredAddress.*` or `…residentialAddress.*` |
+| building no. / district / company no. | `building_number`, `district`, `company_number` | *(none — provider only)* |
 | country | `country_code` | `…registeredAddress.country`, else the `country_code` column |
 
 Several keys can carry the same fact and which one is populated varies by country

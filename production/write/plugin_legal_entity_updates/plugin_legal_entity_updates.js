@@ -184,6 +184,12 @@ const FIELD_COMPARISON = [
       "_column.country_code",
     ],
   },
+  // Billing-info columns with NO legal-entity counterpart. They are listed so the
+  // per-provider checklist is complete, but marked informational: "provider only"
+  // is the designed state, not a discrepancy, so they never fail pre-flight.
+  { label: "building number", pbi: "building_number", le: [], informational: true },
+  { label: "district", pbi: "district", le: [], informational: true },
+  { label: "company number", pbi: "company_number", le: [], informational: true },
 ];
 
 // The provider_billing_informations columns the comparison needs, in the order
@@ -201,6 +207,9 @@ const PBI_COLUMNS = [
   "tax_number",
   "company_registration_number",
   "activity_code",
+  "building_number",
+  "district",
+  "company_number",
 ];
 
 const DEFAULT_NAMESPACE = "eng-orion";
@@ -271,6 +280,10 @@ function parseArgs(argv) {
     migratePaymentMethods: true,
     copyTaxNumber: false,
     batchSize: null,
+    // Pre-flight detail view. null = auto: full per-provider field tables when you
+    // named providers yourself (you're inspecting them), compact summary for a
+    // bulk --all sweep. --detail / --summary force it either way.
+    detail: null,
     file: null,
     providerIds: null,
     help: false,
@@ -295,6 +308,8 @@ function parseArgs(argv) {
       opts.modeGiven = true;
       opts.mode = "link";
     } else if (a === "--all") opts.all = true;
+    else if (a === "--detail") opts.detail = true;
+    else if (a === "--summary") opts.detail = false;
     else if (a === "--migrate") opts.mode = "migrate";
     else if (a === "--no-payment-methods") opts.migratePaymentMethods = false;
     else if (a === "--copy-tax-number") opts.copyTaxNumber = true;
@@ -342,6 +357,8 @@ Flags (each one just pre-answers a prompt):
       --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (default true)
       --copy-tax-number      COPY_TAX_NUMBER=true (default false)
       --batch-size N         BATCH_SIZE=N (task default 100)
+      --detail           Per-provider field checklist (default when you name ids)
+      --summary          One line per provider instead (default with --all)
       --preflight        READ-ONLY. Cross-check provider_billing_informations
                          against the legal entity, field by field. PASS/FAIL.
       --postflight       READ-ONLY. Is every plugin pointing at its provider's
@@ -863,6 +880,16 @@ function fetchLegalEntityFields(env, legalEntityIds) {
   return map;
 }
 
+// When nothing matched there is still a key worth naming — the one this entity
+// *would* use. Picking spec.le[0] blindly would show an organization key against
+// an individual entity, which reads as a wrong lookup rather than a missing value.
+function fallbackLeKey(keys, kind) {
+  if (!keys.length) return "";
+  const individual = (k) => k.startsWith("individual.");
+  const wanted = keys.filter((k) => (kind === "individual" ? individual(k) : !individual(k)));
+  return (wanted[0] || keys[0]);
+}
+
 // Compare on meaning, not bytes: trim, collapse runs of whitespace, casefold.
 // Otherwise "Via Giovanni Giolitti 40" vs "via giovanni giolitti  40" reads as a
 // difference when it plainly isn't one.
@@ -873,14 +900,16 @@ function normalizeValue(v) {
     .toLowerCase();
 }
 
-// First non-empty value among the candidate keys.
+// First non-empty value among the candidate keys, and which key supplied it —
+// the key matters for the per-provider checklist, where showing
+// `organization.vatNumber` vs `organization.taxInformation.number` is the point.
 function leValue(fields, keys) {
-  if (!fields) return "";
+  if (!fields) return { value: "", key: "" };
   for (const key of keys) {
     const v = fields.get(key);
-    if (v) return v;
+    if (v) return { value: v, key };
   }
-  return "";
+  return { value: "", key: "" };
 }
 
 // Per provider: which comparable fields agree, and which don't. A field where
@@ -896,20 +925,76 @@ function compareFields(providerId, billing, fields) {
     if (spec.only && spec.only !== kind) continue;
 
     const pbiValue = billing ? billing[spec.pbi] || "" : "";
-    const leVal = leValue(fields, spec.le);
+    const { value: leVal, key: leKey } = leValue(fields, spec.le);
     if (!pbiValue && !leVal) continue;
 
     const same = normalizeValue(pbiValue) === normalizeValue(leVal);
+    // "present?" in the per-provider checklist.
+    const presence = pbiValue && leVal ? "both" : pbiValue ? "provider only" : "legal entity only";
+
     rows.push({
       label: spec.label,
       pbi: pbiValue,
       le: leVal,
+      leKey: leKey || fallbackLeKey(spec.le, kind),
+      // No legal-entity counterpart exists for this column, so "provider only"
+      // is correct by design — reported, never counted against the verdict.
+      informational: Boolean(spec.informational),
       same,
+      presence,
       note: same ? "" : !pbiValue ? "missing in billing info" : !leVal ? "missing in legal entity" : "differs",
     });
   }
 
-  return { providerId, billing, rows, diffs: rows.filter((r) => !r.same) };
+  return {
+    providerId,
+    billing,
+    entityType,
+    rows,
+    diffs: rows.filter((r) => !r.same && !r.informational),
+  };
+}
+
+// The per-provider checklist: every comparable field, matching or not, with the
+// legal-entity key that supplied the value. This is the "are these good?" view —
+// printFieldComparison's tables only surface what disagrees.
+function printProviderFieldTable(cmp) {
+  const mark = (row) => {
+    if (row.informational) return `${c.faint("provider only")}`;
+    if (row.same) return `${c.ok("✅")} both`;
+    if (row.presence === "both") return `${c.bad("❌")} differs`;
+    return `${c.warn("⚠")} ${row.presence}`;
+  };
+
+  console.log(
+    c.head(
+      `\n── provider=${cmp.providerId} (${cmp.entityType || "unknown type"}) ` +
+        "─────────────────────────"
+    )
+  );
+
+  console.log(
+    renderTable(
+      ["REQUIRED FIELD", `PROVIDER BILLING (${SHEDUL_DB})`, `LEGAL ENTITY (fields jsonb)`, "PRESENT?"],
+      cmp.rows.map((r) => [
+        r.label,
+        r.pbi || "—",
+        r.le ? `${c.sql(r.leKey)} = ${r.le}` : r.leKey ? c.faint(`${r.leKey} = ∅`) : "—",
+        mark(r),
+      ])
+    )
+  );
+
+  const comparable = cmp.rows.filter((r) => !r.informational);
+  const matched = comparable.filter((r) => r.same).length;
+  console.log(
+    `\n  ${matched === comparable.length ? c.ok("✓") : c.bad("✗")} ` +
+      `${matched}/${comparable.length} comparable fields agree` +
+      c.faint(
+        `   (${cmp.rows.length - comparable.length} provider-only column(s) shown for ` +
+          "completeness, not compared)"
+      )
+  );
 }
 
 function printFieldComparison(comparisons) {
@@ -1824,11 +1909,22 @@ async function main() {
       ...new Set(withLegalEntity.map((id) => primaryByProvider.get(id))),
     ]);
 
-    const tally = printFieldComparison(
-      withLegalEntity.map((id) =>
-        compareFields(id, billing.get(id), leFields.get(primaryByProvider.get(id)))
-      )
+    const comparisons = withLegalEntity.map((id) =>
+      compareFields(id, billing.get(id), leFields.get(primaryByProvider.get(id)))
     );
+
+    // Auto: detail when you named the providers, summary for a bulk --all sweep.
+    const detail = opts.detail === null ? !opts.all : opts.detail;
+
+    if (detail) {
+      console.log(
+        c.head("\n── Field-by-field check ────────────────────────────────") +
+          c.faint("\n  (--summary for one line per provider instead)")
+      );
+      for (const cmp of comparisons) printProviderFieldTable(cmp);
+    }
+
+    const tally = printFieldComparison(comparisons);
 
     if (printPreflightVerdict(tally, missingLegalEntity)) process.exitCode = 1;
     return;

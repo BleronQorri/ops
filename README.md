@@ -132,6 +132,8 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #       --migrate          create legal entities (partners-app); explicit ids only
 #       --no-payment-methods / --copy-tax-number / --batch-size N   migrate params
 #       --preflight        read-only: billing info vs legal entity, PASS/FAIL
+#       --detail / --summary   force the per-provider field checklist on/off
+#                          (default: on when you name providers, off for --all)
 #       --postflight       read-only: link state, PASS/FAIL (--verify is an alias)
 #   -f, --file PATH        read provider IDs from a file (# starts a comment)
 #       --apply            DRY_RUN="false" — actually write
