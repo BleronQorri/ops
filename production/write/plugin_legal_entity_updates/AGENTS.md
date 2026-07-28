@@ -14,7 +14,7 @@ the `link_plugins_to_legal_entities_from_env` Houston task.
 ## Guided — the whole procedure, step by step
 
 If you don't remember the order or what each step is for, pick **Guided** (option
-6, or `--guided`). It prints the procedure — every step, what it does, why it
+1, the default, or `--guided`). It prints the procedure — every step, what it does, why it
 exists, and what to watch for — then walks you through **pre-flight → link →
 post-flight**, letting you run, skip, or stop at each:
 
@@ -44,14 +44,14 @@ Both are described in the plan so the procedure is written down, then listed und
 | **migrate** | It's a **precondition**, not a step. It's the only thing here that writes on the first call with **no dry run**, and `MIGRATE_PAYMENT_METHODS=true` migrates cards on file through an RPC. One keystroke from a default "Run it" is the wrong place for that — run it with `--migrate`, on purpose. If it hasn't run, pre-flight says so: *no active primary legal entity*. |
 | **reset** | Remedial and destructive, staging only. |
 
-## Five modes plus guided
+## Guided plus six single-purpose modes
 
 Workflow order: **migrate → pre-flight → link → post-flight**.
 
 | Mode | Question it answers | Service | Writes? | Exit 1 when |
 |---|---|---|---|---|
 | **migrate** | Create the legal entities in the first place | `partners-app` | yes, no dry run | a provider didn't migrate |
-| **pre-flight** *(default)* | Is the data consistent, and does the legal entity carry everything the country requires? | — | never | any field differs, or a required field is missing (⛔ blocks e-invoicing) |
+| **pre-flight** | Is the data consistent, and does the legal entity carry everything the country requires? | — | never | any field differs, or a required field is missing (⛔ blocks e-invoicing) |
 | **link** | *do* the linking | `accounting-documents` | only via apply | a row didn't land |
 | **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | — | never | any link drift |
 | **plugin audit** | Does billing info match the legal entity each **plugin** points at? | — | never | a plugin's legal entity is unusable or disagrees |
@@ -61,7 +61,8 @@ Pre-flight and post-flight are strictly `SELECT`s. Neither reaches a Houston
 task; neither can write under any flag combination. Pre-flight doesn't even read
 the plugins table — it has nothing to do with link state.
 
-`--migrate`, `--preflight`, `--postflight` and `--verify` (an alias for
+`--guided`, `--migrate`, `--preflight`, `--postflight`, `--plugins`, `--reset` and
+`--verify` (an alias for
 post-flight) skip the mode prompt. `--print-only` deliberately does *not* imply a
 mode — it's valid in both migrate and link.
 
@@ -69,7 +70,7 @@ mode — it's valid in both migrate and link.
 
 | Step | Prompt | Default |
 |------|--------|---------|
-| 1 | **What do you want to do?** pre-flight / post-flight / link / migrate / reset / guided | **pre-flight** |
+| 1 | **What do you want to do?** guided / migrate / pre-flight / link / post-flight / plugin audit / reset — each tagged with the stage it belongs to | **guided** |
 | 2 | **Which environment?** staging (`eng-orion`) / production / other namespace | staging |
 | 3 | **Read from these databases?** — target shown, approved *before any query runs* | — |
 | 4 | **Which providers?** every provider with an account configuration / a list you type | all |
@@ -85,7 +86,11 @@ Link continues:
 | 8 | **Approve the run** — non-prod one `yes`; **production** makes you type the namespace back, *then* `yes` | — |
 | 9 | *(prints the exact command, runs it, then verifies)* | — |
 
-The first prompt defaults to **pre-flight** — a mode that cannot change anything.
+The first prompt defaults to **guided** — the one mode that explains itself, so it is
+the right landing place if you don't already know the order. The remaining options
+are listed in workflow order (migrate → pre-flight → link → post-flight) and each
+carries its stage and a one-line description, so the menu teaches the procedure
+rather than listing verbs.
 
 Menus take the number, a name (`prod`, `staging`, `all`, `list`, `apply`), or
 blank for the default. Every flag below is only a shortcut for pre-answering one

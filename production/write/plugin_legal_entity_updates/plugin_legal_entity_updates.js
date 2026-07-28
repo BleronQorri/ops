@@ -557,8 +557,8 @@ Four modes, asked as the first prompt:
 Workflow order: MIGRATE → PRE-FLIGHT → LINK → POST-FLIGHT.
 
 The guided flow:
-  1. WHICH MODE?      — guided (the whole sequence), pre-flight (default),
-                        post-flight, link, migrate, or
+  1. WHICH MODE?      — guided (DEFAULT, start here), migrate, pre-flight, link,
+                        post-flight, plugin-audit, or
                         reset (staging only, destructive)
   2. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
   3. APPROVE READS    — the target is shown and confirmed before ANY query runs
@@ -700,8 +700,15 @@ async function askChoice(title, choices) {
   const def = choices.find((c) => c.default) || choices[0];
 
   console.log(`\n${title}`);
-  choices.forEach((c, i) => {
-    console.log(`  ${i + 1}) ${c.label}${c === def ? "   [default]" : ""}`);
+  choices.forEach((choice, i) => {
+    console.log(
+      `  ${i + 1}) ${choice.label}` +
+        (choice.stage ? `   ${c.faint(`[${choice.stage}]`)}` : "") +
+        (choice === def ? `   ${c.ok("[default]")}` : "")
+    );
+    // Optional second line: what it actually does. Keeps the label short enough
+    // to scan while still answering "which one do I want?" without --help.
+    if (choice.detail) console.log(c.faint(wrapText(choice.detail, "", 7)));
   });
 
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -2433,45 +2440,75 @@ function printExemptProviders(skipped) {
 
 // What are we here to do? Asked first, because it decides the whole flow.
 // Verify is the default: it's the one that can't change anything.
+// Guided first and default — it's the one that explains itself, so it's the right
+// landing place for anyone who doesn't already know the order. The rest follow the
+// actual workflow (migrate → pre-flight → link → post-flight), each tagged with the
+// stage it belongs to, so the menu teaches the procedure rather than listing verbs.
 async function askMode() {
   return askChoice("What do you want to do?", [
     {
-      label: "Pre-flight  — is the data consistent? (read-only, pass/fail)",
-      aliases: ["pre", "preflight", "pre-flight", "check", "data"],
-      value: "preflight",
+      label: "Guided       — the whole procedure, step by step",
+      stage: "start here",
+      detail:
+        "walks pre-flight → link → post-flight, explaining each step before you run it. " +
+        "Migrate and reset are described but not run.",
+      aliases: ["guided", "guide", "walkthrough", "steps", "all"],
+      value: "guided",
       default: true,
     },
     {
-      label: "Post-flight — is everything linked? (read-only, pass/fail)",
-      aliases: ["post", "postflight", "post-flight", "verify", "audit"],
-      value: "postflight",
-    },
-    {
-      label: "Link        — link plugins to their primary legal entity",
-      aliases: ["link", "apply", "run", "fix"],
-      value: "link",
-    },
-    {
-      label: "Migrate     — create legal entities for providers (run BEFORE link)",
+      label: "Migrate      — create the legal entities",
+      stage: "stage 1 · writes",
+      detail:
+        `runs ${MIGRATE_TASK} on ${MIGRATE_SERVICE}. Do this first — ` +
+        "nothing else works without an entity. No dry run.",
       aliases: ["migrate", "migration", "create"],
       value: "migrate",
     },
     {
-      label: "Plugin audit— billing info vs each PLUGIN's legal entity (read-only)",
+      label: "Pre-flight   — is the data fit to link?",
+      stage: "stage 2 · read-only",
+      detail:
+        "billing info vs the provider's PRIMARY legal entity, plus the per-country " +
+        "required fields and KSA formats. PASS/FAIL.",
+      aliases: ["pre", "preflight", "pre-flight", "check", "data"],
+      value: "preflight",
+    },
+    {
+      label: "Link         — point the plugins at the legal entity",
+      stage: "stage 3 · writes",
+      detail:
+        `runs ${TASK}. Dry run by default; ` +
+        "reads the rows back afterwards to prove what landed.",
+      aliases: ["link", "apply", "run", "fix"],
+      value: "link",
+    },
+    {
+      label: "Post-flight  — did the link actually land?",
+      stage: "stage 4 · read-only",
+      detail:
+        "each plugin's legal_entity_id vs its provider's primary. The task exits 0 " +
+        "even when it skips rows, so only this proves it. PASS/FAIL.",
+      aliases: ["post", "postflight", "post-flight", "verify"],
+      value: "postflight",
+    },
+    {
+      label: "Plugin audit — billing info vs each PLUGIN's legal entity",
+      stage: "any stage · read-only",
+      detail:
+        "what the send path actually reads (plugin.legal_entity_id, not the primary). " +
+        "One section per plugin.",
       aliases: ["plugins", "plugin", "audit", "by-plugin"],
       value: "plugins",
     },
     {
-      label: "Reset       — undo the migration for a provider (STAGING ONLY, destructive)",
+      label: "Reset        — undo the migration for a provider",
+      stage: "remedial · STAGING ONLY · destructive",
+      detail:
+        "clears migration state, the primary pointer and the plugin link so migrate " +
+        "can genuinely re-run. No undo.",
       aliases: ["reset", "undo", "clear", "wipe"],
       value: "reset",
-    },
-    // Appended rather than inserted first: 1–5 keep the numbers they've always
-    // had. Blank still selects pre-flight.
-    {
-      label: "Guided      — walk the WHOLE migration step by step, with definitions",
-      aliases: ["guided", "guide", "walkthrough", "steps", "all"],
-      value: "guided",
     },
   ]);
 }

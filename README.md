@@ -90,8 +90,9 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```sh
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
-#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate /
-#                         plugin-audit / reset / guided
+#   1. WHICH MODE?      — guided (default, start here) / migrate / pre-flight / link /
+#                         post-flight / plugin-audit / reset. Each option shows its
+#                         stage and a one-line description.
 #                         GUIDED walks the whole sequence with every step defined —
 #                         start there if you don't remember the order.
 #   2. environment      — staging (eng-orion), production, or any namespace
