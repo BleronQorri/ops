@@ -21,6 +21,7 @@ Workflow order: **migrate → pre-flight → link → post-flight**.
 | **pre-flight** *(default)* | Is the data consistent, and does the legal entity carry everything the country requires? | — | never | any field differs, or a required field is missing (⛔ blocks e-invoicing) |
 | **link** | *do* the linking | `accounting-documents` | only via apply | a row didn't land |
 | **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | — | never | any link drift |
+| **reset** ⚠️ | Undo the migration so it can run again — **STAGING ONLY** | — | yes, destructive, no undo | rows survive the reset |
 
 Pre-flight and post-flight are strictly `SELECT`s. Neither reaches a Houston
 task; neither can write under any flag combination. Pre-flight doesn't even read
@@ -184,6 +185,60 @@ from what's missing. The short reasons in that column mean:
 If two providers in one batch resolve to the **same** legal entity, that's a
 unique-index collision: it's flagged with a `⚠`, and the task will apply one and
 skip the rest. The verification pass below is what catches which one lost.
+
+## Reset — undo the migration (⚠️ STAGING ONLY)
+
+Clears the migration state for a provider so `legal_entities_migration:migrate`
+starts from scratch. **Refuses production outright** — same stance as
+`clear_provider_einvoicing`. There is no undo.
+
+```sh
+./plugin_legal_entity_updates.js --reset 33
+./plugin_legal_entity_updates.js --reset --print-only 33   # show the SQL, write nothing
+```
+
+### What it clears, and why in that order
+
+Derived from a real run's audit trail (`billing_migration_statuses.metadata`
+records every action the migration took), not guessed:
+
+| # | Action | Table | Why |
+|---|---|---|---|
+| 1 | `SET NULL` | `accounting_documents.account_configuration_plugins` | unlink the plugin — a plugin still pointing at a deleted entity is the most confusing leftover |
+| 2 | `DELETE` | `shedul.provider_purchases_primary_legal_entities` | the primary pointer, history rows included |
+| 3 | `DELETE` | `shedul.location_legal_entity_assignments` | written by `AssignLocationsService` |
+| 4 | `SET NULL` | `shedul.blast_marketing_transactions` | release back to the provider-wide bucket |
+| 5 | `DELETE` | `shedul.billing_migration_statuses` | **last** — this is what lets the task re-run, so it must only go once nothing references the entity |
+| 6 | `deleted_at = now()` | `legal_entities.legal_entities` | soft-delete the now-orphaned entities |
+
+**Deliberately not touched:** `provider_purchases`, `provider_fees`,
+`provider_purchase_payment_preferences`, `blast_marketing_campaigns`. They carry
+`legal_entity_id`, but this migration never writes them and `provider_purchases`
+are real financial records. The preview prints that list every run.
+
+Legal entities are **soft**-deleted, not deleted: `legal_entity_associations`,
+`_events`, `_capabilities` and `_field_versions` hang off those rows, and
+`deleted_at` is the service's own convention (its schemas filter on
+`where: [deleted_at: nil]`). `--keep-legal-entities` skips step 6.
+
+### Gates
+
+- **Production refused** before anything runs.
+- Explicit provider list only — no `--all`, no `--file`, no `--json`.
+- **Per provider**, not in bulk: each gets its own row-count preview, then you
+  type its `provider_id` back, then `yes`. A mismatch skips that provider.
+- One transaction per database (`BEGIN`/`COMMIT` + `ON_ERROR_STOP`), so a failure
+  rolls that database's changes back. The three databases are necessarily
+  separate transactions.
+- Read-back afterwards: every target count must be zero, else `RESET: FAIL` and
+  exit 1.
+
+### Resetting may not be the fix
+
+A reset only helps if re-running the migration produces something better. It
+won't if the migrator itself is dropping fields — see the note on SA organization
+entities under [Required fields](#required-fields-per-e-invoicing-country). Run
+pre-flight after re-migrating to confirm you actually gained something.
 
 ## Migrate — create the legal entities
 

@@ -52,7 +52,7 @@ the script's own `AGENTS.md`.
   (a re-run resumes, never duplicates) and gated behind a read-only state preview
   plus the usual confirmations, but there is nothing to rehearse with.
 - **Sandbox / external:** `deregister_suppliers` (Invopop sandbox), `confirm_sent_uat` (Comarch UAT).
-- **Staging destructive wipe (gated):** `clear_provider_einvoicing` (deletes a provider's e-invoicing rows; refuses prod).
+- **Staging destructive wipe (gated):** `clear_provider_einvoicing` (deletes a provider's e-invoicing rows; refuses prod), `plugin_legal_entity_updates` in **reset** mode (undoes the legal-entities migration: drops migration state, location assignments and the primary pointer, soft-deletes the legal entities; refuses prod; per-provider confirm).
 
 ## Prereqs (most scripts)
 

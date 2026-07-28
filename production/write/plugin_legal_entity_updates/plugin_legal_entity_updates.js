@@ -83,6 +83,8 @@ const readline = require("readline/promises");
 const { stdin: input, stdout: output } = require("process");
 const { spawnSync } = require("child_process");
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 // --- constants -------------------------------------------------------------
 
@@ -283,6 +285,50 @@ const MIGRATE_TASK = "legal_entities_migration:migrate";
 // app-shedul/src/app/models/billing_migration_status.rb
 const MIGRATION_STATUSES = ["pending", "migrated", "confirmed", "failed"];
 
+// Reset mode: everything the legal-entities migration writes for a provider, in
+// the order it has to be undone. Derived from a real run's audit trail
+// (billing_migration_statuses.metadata), not guessed — see AGENTS.md.
+//
+// `billing_migration_statuses` is LAST: it is what makes the task re-run, so it
+// must only disappear once every reference to the entity is gone.
+const RESET_SHEDUL_STEPS = [
+  {
+    table: "provider_purchases_primary_legal_entities",
+    action: "delete",
+    where: "provider_id = %ID%",
+    note: "the primary pointer (history rows included)",
+  },
+  {
+    table: "location_legal_entity_assignments",
+    action: "delete",
+    where: "provider_id = %ID%",
+    note: "AssignLocationsService",
+  },
+  {
+    table: "blast_marketing_transactions",
+    action: "null",
+    column: "legal_entity_id",
+    where: "provider_id = %ID% AND legal_entity_id IS NOT NULL",
+    note: "release back to the provider-wide bucket",
+  },
+  {
+    table: "billing_migration_statuses",
+    action: "delete",
+    where: "provider_id = %ID%",
+    note: "LAST — this is what lets the migration re-run",
+  },
+];
+
+// Tables that carry legal_entity_id but which this migration never writes.
+// Listed so the reset is explicit about what it leaves alone: provider_purchases
+// in particular are real financial records.
+const RESET_UNTOUCHED = [
+  "provider_purchases",
+  "provider_fees",
+  "provider_purchase_payment_preferences",
+  "blast_marketing_campaigns",
+];
+
 // Namespaces that get the second confirmation gate.
 const PROD_NAMESPACES = new Set(["production", "prod"]);
 
@@ -343,6 +389,9 @@ function parseArgs(argv) {
     // named providers yourself (you're inspecting them), compact summary for a
     // bulk --all sweep. --detail / --summary force it either way.
     detail: null,
+    // Reset mode: also soft-delete the orphaned legal entities. On by default —
+    // leaving them live is what produced provider 33's duplicate.
+    deleteLegalEntities: true,
     file: null,
     providerIds: null,
     help: false,
@@ -370,6 +419,8 @@ function parseArgs(argv) {
     else if (a === "--detail") opts.detail = true;
     else if (a === "--summary") opts.detail = false;
     else if (a === "--migrate") opts.mode = "migrate";
+    else if (a === "--reset") opts.mode = "reset";
+    else if (a === "--keep-legal-entities") opts.deleteLegalEntities = false;
     else if (a === "--no-payment-methods") opts.migratePaymentMethods = false;
     else if (a === "--copy-tax-number") opts.copyTaxNumber = true;
     else if (a === "--batch-size") opts.batchSize = argv[++i];
@@ -413,6 +464,9 @@ Flags (each one just pre-answers a prompt):
                          comma/whitespace-separated mix; # starts a comment)
       --migrate          Run ${MIGRATE_TASK} on
                          ${MIGRATE_SERVICE}. Explicit provider list only.
+      --reset            STAGING ONLY, DESTRUCTIVE. Undo the migration for a
+                         provider so it can run again. Refuses production.
+      --keep-legal-entities  reset without soft-deleting the legal entities
       --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (default true)
       --copy-tax-number      COPY_TAX_NUMBER=true (default false)
       --batch-size N         BATCH_SIZE=N (task default 100)
@@ -458,7 +512,8 @@ Four modes, asked as the first prompt:
 Workflow order: MIGRATE → PRE-FLIGHT → LINK → POST-FLIGHT.
 
 The guided flow:
-  1. WHICH MODE?      — pre-flight (default), post-flight, link, or migrate
+  1. WHICH MODE?      — pre-flight (default), post-flight, link, migrate, or
+                        reset (staging only, destructive)
   2. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
   3. APPROVE READS    — the target is shown and confirmed before ANY query runs
   4. providers        — all of them, or a list you type
@@ -1254,6 +1309,183 @@ function printPreflightVerdict(tally, missingLegalEntity) {
   return failed;
 }
 
+// --- reset (STAGING ONLY) -----------------------------------------------------
+//
+// Undoes the legal-entities migration for a provider so the task can run again
+// from scratch. STAGING ONLY — production is refused outright; this deletes rows
+// with no undo.
+//
+// It clears exactly what the migration writes (RESET_SHEDUL_STEPS, plus the
+// plugin link in accounting_documents and a soft-delete of the legal entities),
+// leaving `provider_purchases` and friends alone.
+
+// Read-only: how many rows each step would touch, and which legal entities the
+// provider currently references.
+function fetchResetPreview(env, providerId) {
+  const counts = RESET_SHEDUL_STEPS.map(
+    (step) =>
+      `SELECT '${step.table}' AS t, count(*) AS n FROM ${step.table} ` +
+      `WHERE ${step.where.replace("%ID%", providerId)}`
+  );
+  const ordered = counts
+    .map((s, i) => `SELECT ${i} AS ord, t, n FROM (${s}) s${i}`)
+    .join("\nUNION ALL\n");
+
+  const shedul = parseRows(
+    psqlRead(env, SHEDUL_DB, `SELECT t, n FROM (\n${ordered}\n) all_counts ORDER BY ord;`),
+    2
+  ).map(([table, n]) => ({ table, count: Number(n) }));
+
+  // Every legal entity this provider points at, from either side — the status
+  // rows and the primary pointer, history included.
+  const leSql =
+    "SELECT DISTINCT legal_entity_id::text FROM (\n" +
+    `  SELECT legal_entity_id FROM billing_migration_statuses WHERE provider_id = ${providerId}\n` +
+    "  UNION\n" +
+    `  SELECT legal_entity_id FROM provider_purchases_primary_legal_entities WHERE provider_id = ${providerId}\n` +
+    ") ids WHERE legal_entity_id IS NOT NULL;";
+
+  const legalEntityIds = parseRows(psqlRead(env, SHEDUL_DB, leSql), 1)
+    .map(([id]) => id)
+    .filter(Boolean);
+
+  // Plugins in the other database that were linked to those entities.
+  const pluginSql =
+    "SELECT count(*)\n" +
+    "FROM account_configuration_plugins p\n" +
+    "JOIN account_configurations ac ON ac.id = p.account_configuration_id\n" +
+    `WHERE ac.provider_id = ${providerId} AND p.legal_entity_id IS NOT NULL;`;
+
+  const linkedPlugins = Number(
+    (parseRows(psqlRead(env, AD_DB, pluginSql), 1)[0] || ["0"])[0]
+  );
+
+  return { shedul, legalEntityIds, linkedPlugins };
+}
+
+function printResetPreview(providerId, preview, opts) {
+  console.log(c.head("\n── Reset plan (read-only preview) ──────────────────────"));
+
+  const rows = RESET_SHEDUL_STEPS.map((step) => {
+    const found = preview.shedul.find((s) => s.table === step.table);
+    return [
+      step.action === "delete" ? c.bad("DELETE") : c.warn("SET NULL"),
+      `${SHEDUL_DB}.${step.table}`,
+      found ? found.count : "?",
+      c.faint(step.note),
+    ];
+  });
+
+  rows.unshift([
+    c.warn("SET NULL"),
+    `${AD_DB}.account_configuration_plugins`,
+    preview.linkedPlugins,
+    c.faint("unlink the plugin(s) from the legal entity"),
+  ]);
+
+  if (opts.deleteLegalEntities && preview.legalEntityIds.length) {
+    rows.push([
+      c.bad("SOFT DELETE"),
+      `${LE_DB}.legal_entities`,
+      preview.legalEntityIds.length,
+      c.faint("set deleted_at — orphaned entities"),
+    ]);
+  }
+
+  console.log(renderTable(["ACTION", "TABLE", "ROWS", "WHY"], rows));
+
+  if (preview.legalEntityIds.length) {
+    console.log(
+      `\n  Legal entities referenced by provider=${providerId}:` +
+        (opts.deleteLegalEntities ? "" : c.faint("  (kept — --keep-legal-entities)"))
+    );
+    for (const id of preview.legalEntityIds) console.log(`      ${c.sql(id)}`);
+  } else {
+    console.log(c.faint("\n  No legal entities referenced — nothing to soft-delete."));
+  }
+
+  console.log(
+    c.faint(
+      `\n  NOT touched: ${RESET_UNTOUCHED.join(", ")}.\n` +
+        "  Those carry legal_entity_id but this migration never writes them, and\n" +
+        "  provider_purchases are real financial records."
+    )
+  );
+
+  const total =
+    preview.shedul.reduce((n, s) => n + s.count, 0) + preview.linkedPlugins;
+  return total;
+}
+
+// One transaction for the shedul side. Order matters: billing_migration_statuses
+// is last so the migration state only vanishes once nothing references the entity.
+function buildResetShedulSql(providerId) {
+  const statements = RESET_SHEDUL_STEPS.map((step) => {
+    const where = step.where.replace("%ID%", providerId);
+    return step.action === "delete"
+      ? `DELETE FROM ${step.table} WHERE ${where};`
+      : `UPDATE ${step.table} SET ${step.column} = NULL WHERE ${where};`;
+  });
+
+  return (
+    `-- reset legal-entities migration state for provider_id=${providerId}\n` +
+    "BEGIN;\n" +
+    statements.join("\n") +
+    "\nCOMMIT;\n"
+  );
+}
+
+function buildResetPluginSql(providerId) {
+  return (
+    `-- unlink plugins for provider_id=${providerId}\n` +
+    "BEGIN;\n" +
+    "UPDATE account_configuration_plugins p\n" +
+    "SET legal_entity_id = NULL\n" +
+    "FROM account_configurations ac\n" +
+    `WHERE ac.id = p.account_configuration_id AND ac.provider_id = ${providerId};\n` +
+    "COMMIT;\n"
+  );
+}
+
+// Soft delete, not DELETE: legal_entity_associations / _events / _capabilities /
+// _field_versions all hang off these rows, and deleted_at is the service's own
+// convention (schemas filter on `where: [deleted_at: nil]`).
+function buildResetLegalEntitySql(legalEntityIds) {
+  const quoted = legalEntityIds.map((id) => `'${id}'`).join(",");
+  return (
+    `-- soft-delete orphaned legal entities\n` +
+    "BEGIN;\n" +
+    `UPDATE legal_entities SET deleted_at = now() WHERE id IN (${quoted}) AND deleted_at IS NULL;\n` +
+    "COMMIT;\n"
+  );
+}
+
+// psql with --write, one file per database. ON_ERROR_STOP + the BEGIN/COMMIT in
+// the SQL means a failure rolls that database's changes back.
+function psqlWrite(namespace, db, sql, label) {
+  const tmp = path.join(os.tmpdir(), `reset_${label}_${process.pid}.sql`);
+  fs.writeFileSync(tmp, sql);
+  try {
+    runInherit("houston", [
+      "psql",
+      namespace,
+      db,
+      "--write",
+      "--",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-f",
+      tmp,
+    ]);
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // best effort
+    }
+  }
+}
+
 // --- migrate -----------------------------------------------------------------
 //
 // Drives `legal_entities_migration:migrate` on partners-app (app-shedul), the
@@ -1777,7 +2009,25 @@ async function askMode() {
       aliases: ["migrate", "migration", "create"],
       value: "migrate",
     },
+    {
+      label: "Reset       — undo the migration for a provider (STAGING ONLY, destructive)",
+      aliases: ["reset", "undo", "clear", "wipe"],
+      value: "reset",
+    },
   ]);
+}
+
+// Reset takes an explicit list too — and, being destructive, no "all" option.
+async function askResetProviderIds() {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = await ask("\nProvider IDs to RESET (comma- or space-separated): ");
+    try {
+      return parseProviderIds(raw);
+    } catch (err) {
+      console.error(`  ${err.message}`);
+    }
+  }
+  throw new Error("No valid provider IDs given.");
 }
 
 // Migrate takes an explicit list and nothing else. Deliberately no "all" option:
@@ -1954,9 +2204,20 @@ async function main() {
   //    only makes sense in one mode has already answered this.
   if (!opts.mode) opts.mode = await askMode();
 
+  // Reset is destructive and has no undo, so it is staging-only — the same stance
+  // clear_provider_einvoicing takes. Checked before anything else happens.
+  if (opts.mode === "reset" && isProd(opts.namespace)) {
+    throw new Error(
+      `Refusing to reset against "${opts.namespace}".\n` +
+        "  Reset deletes migration state, location assignments and the primary\n" +
+        "  legal-entity pointer, and soft-deletes legal entities. There is no undo.\n" +
+        "  STAGING ONLY."
+    );
+  }
+
   // Fail loudly on flags that mean nothing in migrate mode rather than ignoring
   // them — silently dropping --all on a migration would be a nasty surprise.
-  if (opts.mode === "migrate") {
+  if (opts.mode === "migrate" || opts.mode === "reset") {
     const bad = [
       opts.all && "--all",
       opts.file && "--file",
@@ -1964,7 +2225,7 @@ async function main() {
     ].filter(Boolean);
     if (bad.length) {
       throw new Error(
-        `${bad.join(", ")} cannot be used with migrate — it takes an explicit ` +
+        `${bad.join(", ")} cannot be used with ${opts.mode} — it takes an explicit ` +
           "provider list only. Pass the IDs as arguments, or let it prompt you."
       );
     }
@@ -1980,6 +2241,111 @@ async function main() {
   // 3. Approve the data access itself, before any query goes out ------------
   if (!(await confirmDataAccess(opts, env))) {
     console.log("Aborted. Nothing was read.");
+    return;
+  }
+
+  // RESET — staging only, already enforced above. Preview, then one transaction
+  // per database.
+  if (opts.mode === "reset") {
+    const providerIds = opts.providerIds
+      ? parseProviderIds(opts.providerIds)
+      : await askResetProviderIds();
+
+    console.log(
+      `\nTarget: namespace=${opts.namespace} psql_env=${env}` + c.warn("   [STAGING ONLY]")
+    );
+    console.log(`Providers to reset: ${providerIds.length} — ${providerIds.join(", ")}`);
+
+    let failures = 0;
+
+    // One provider at a time: each gets its own preview and its own confirmation.
+    // A reset is not something to approve in bulk.
+    for (const providerId of providerIds) {
+      console.log(c.faint(`\nReading reset targets for provider=${providerId} (read-only)…`));
+      const preview = fetchResetPreview(env, providerId);
+      const total = printResetPreview(providerId, preview, opts);
+
+      if (opts.printOnly) {
+        console.log(c.head("\n── SQL (print-only) ────────────────────────────────────"));
+        console.log(c.sql(buildResetPluginSql(providerId)));
+        console.log(c.sql(buildResetShedulSql(providerId)));
+        if (opts.deleteLegalEntities && preview.legalEntityIds.length) {
+          console.log(c.sql(buildResetLegalEntitySql(preview.legalEntityIds)));
+        }
+        continue;
+      }
+
+      if (!total && !preview.legalEntityIds.length) {
+        console.log(c.faint(`\n  Nothing to reset for provider=${providerId}.`));
+        continue;
+      }
+
+      console.log(
+        c.bad(
+          `\n  ⚠ This permanently deletes the rows above for provider=${providerId}. No undo.`
+        )
+      );
+      const echo = (await ask(`  Type the provider_id (${providerId}) to confirm: `)).trim();
+      if (echo !== String(providerId)) {
+        console.error("  provider_id mismatch. Skipping this provider.");
+        failures++;
+        continue;
+      }
+      const final = (await ask('  Proceed? (type "yes"): ')).trim().toLowerCase();
+      if (final !== "yes") {
+        console.log(`  Skipped provider=${providerId}. Nothing was written.`);
+        continue;
+      }
+
+      // Unlink the plugins first: while the plugin still points at the entity the
+      // link is the thing most likely to confuse a later run.
+      psqlWrite(opts.namespace, AD_DB, buildResetPluginSql(providerId), `plugins_${providerId}`);
+      psqlWrite(opts.namespace, SHEDUL_DB, buildResetShedulSql(providerId), `shedul_${providerId}`);
+      if (opts.deleteLegalEntities && preview.legalEntityIds.length) {
+        psqlWrite(
+          opts.namespace,
+          LE_DB,
+          buildResetLegalEntitySql(preview.legalEntityIds),
+          `le_${providerId}`
+        );
+      }
+
+      // Read back: everything should now be zero.
+      console.log(c.faint(`\nVerifying provider=${providerId} (read-only)…`));
+      const after = fetchResetPreview(env, providerId);
+      const leftover =
+        after.shedul.reduce((n, s) => n + s.count, 0) + after.linkedPlugins;
+
+      if (leftover) {
+        console.log(
+          c.bad(`  ✗ provider=${providerId}: ${leftover} row(s) still present after reset.`)
+        );
+        for (const s of after.shedul.filter((x) => x.count)) {
+          console.log(`      ${s.table} = ${s.count}`);
+        }
+        if (after.linkedPlugins) console.log(`      linked plugins = ${after.linkedPlugins}`);
+        failures++;
+      } else {
+        console.log(c.ok(`  ✓ provider=${providerId} reset — all target rows cleared.`));
+      }
+    }
+
+    if (opts.printOnly) {
+      console.log("\n[print-only] Nothing was written.");
+      return;
+    }
+
+    console.log(
+      failures
+        ? c.bad("\n══ RESET: FAIL ═════════════════════════════════════════")
+        : c.ok("\n══ RESET: PASS ═════════════════════════════════════════")
+    );
+    console.log(
+      failures
+        ? `  ${c.bad("✗")} ${failures} provider(s) not fully reset. See above.`
+        : `  ${c.ok("✓")} done. Re-run migrate to recreate the legal entities.`
+    );
+    if (failures) process.exitCode = 1;
     return;
   }
 

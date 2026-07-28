@@ -16,7 +16,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 **write**
 - **process_missing_sales** — backfills invoices/credit notes for sales that never produced one (export → S3 → Houston task). Step-gated.
 - **retry_invoices** — re-drives stuck KSA e-invoices: flips tracker statuses retry-eligible, then force-retries sending.
-- **plugin_legal_entity_updates** — four modes, picked at the first prompt: **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), and **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
+- **plugin_legal_entity_updates** — four modes, picked at the first prompt: **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed), and **reset** (⚠️ _staging only, destructive_ — undoes the migration for a provider so it can be re-run). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
 
 ### `staging/` — non-prod
 
@@ -90,7 +90,7 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```sh
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
-#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate
+#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate / reset
 #   2. environment      — staging (eng-orion), production, or any namespace
 #   3. APPROVE READS    — target shown and confirmed BEFORE any query runs
 #   4. providers        — all of them (from account_configurations), or a list you type
@@ -133,6 +133,8 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
 #       --migrate          create legal entities (partners-app); explicit ids only
+#       --reset            STAGING ONLY, destructive: undo the migration for a provider
+#                          so it can be re-run. Refuses production. Per-provider confirm.
 #       --no-payment-methods / --copy-tax-number / --batch-size N   migrate params
 #       --preflight        read-only: billing info vs legal entity, PASS/FAIL
 #       --detail / --summary   force the per-provider field checklist on/off
