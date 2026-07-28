@@ -18,7 +18,7 @@ Workflow order: **migrate → pre-flight → link → post-flight**.
 | Mode | Question it answers | Service | Writes? | Exit 1 when |
 |---|---|---|---|---|
 | **migrate** | Create the legal entities in the first place | `partners-app` | yes, no dry run | a provider didn't migrate |
-| **pre-flight** *(default)* | Is the data consistent? `provider_billing_informations` vs the legal entity, field by field | — | never | any field differs |
+| **pre-flight** *(default)* | Is the data consistent, and does the legal entity carry everything the country requires? | — | never | any field differs, or a required field is missing (⛔ blocks e-invoicing) |
 | **link** | *do* the linking | `accounting-documents` | only via apply | a row didn't land |
 | **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | — | never | any link drift |
 
@@ -370,11 +370,55 @@ district          1234                       —                                
 inspecting them, so you get the checklists; `--all` is a bulk sweep, so you get
 one line each. `--detail` and `--summary` force either way.
 
+### Required fields per e-invoicing country
+
+Pre-flight knows what app-accounting-documents will actually demand, so it can
+tell a cosmetic difference from something that **blocks e-invoicing**. Both
+validators fetch the legal entity via `GetLegalEntityInvoiceDetails` and hard-fail
+with `{:error, :missing_required_fields}`:
+
+| Field | ES / IT | KSA (SA) |
+|---|---|---|
+| `company_name` | **required** | not checked — taken from the request |
+| `address` (street), `city`, `postal_code`, `state_province` | required | required |
+| `tax_number` | required — `TAX_IDENTIFICATION_NUMBER` | required — `TAX_NUMBER` (ZATCA TRN) |
+| `company_registration_number` | — | **required** |
+| `building_number`, `district` | — | **required** |
+| `country_code` | not checked | not checked |
+
+- `SA` → `AccountingDocuments.EInvoicing.Comarch.LegalEntityBillingDetails` `@required_fields`
+- `ES` / `IT` → `AccountingDocuments.EInvoicing.Common.LegalEntityBillingDetails` `@required_fields`
+
+The country comes from **`account_configurations.country_code`**, because that's
+what `BillingDetailsPolicy` dispatches on (`%{country_code: "SA"} =
+account_configuration`) — not the billing info's country, and not the legal
+entity's. Countries with no entry have no required set, and the comparison stays
+purely informational for them.
+
+A required field missing on the **legal-entity** side is reported as
+`⛔ BLOCKS e-invoicing` and fails the run. That's stronger than "differs": the
+onboarding/send path will refuse the provider outright.
+
+Note the KSA `tax_number` is a *different identifier kind* — present-and-equal
+here is necessary but not sufficient, since the ZATCA TRN and the ES/IT NIF/PIVA
+come from different `IDENTIFIER_KIND_*` entries.
+
+### Provider-only columns
+
 **`building_number`, `district` and `company_number`** are
-`provider_billing_informations` columns with no legal-entity equivalent at all.
-They're listed so the checklist is complete, but marked *informational*:
-"provider only" is the designed state, not a discrepancy, so they never count
-toward the verdict. Every other row does.
+`provider_billing_informations` columns that usually have no legal-entity
+equivalent, so they're marked *informational* — "provider only" is the designed
+state and doesn't count toward the verdict.
+
+**Except for SA.** `fields_configuration/country/sa.ex` defines
+`registeredAddress.buildingNumber` (4-digit) and `.district` with
+`is_required: true`, commented *"required, as ZATCA e-invoicing needs a complete
+seller address"*, and `InvoiceParty.Address` reads exactly those keys. So when the
+country's required set names a field, the informational exemption is dropped and a
+missing value blocks. The default config has neither key and uses
+`registeredAddress.street2` instead.
+
+`company_number` has no counterpart anywhere and is always informational.
 
 When nothing matched, the key column still names the key this entity *would* use
 — `individual.residentialAddress.street` for an individual, not the organization

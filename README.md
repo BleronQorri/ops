@@ -108,7 +108,10 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #                duplicating. MIGRATE_PAYMENT_METHODS defaults to true and also
 #                migrates cards on file via an RPC — --no-payment-methods skips it.
 #   pre-flight   READ-ONLY. Cross-checks provider_billing_informations (shedul)
-#                against the legal entity's jsonb fields (legal_entities) — legal
+#                against the legal entity's jsonb fields (legal_entities), AND checks
+#                the per-country REQUIRED set from app-accounting-documents (SA via
+#                Comarch, ES/IT via Common) — a required field missing on the legal
+#                entity side is flagged as blocking e-invoicing. Fields: legal
 #                name, person name, tax/VAT, registration no., activity code,
 #                address, country. PASS/FAIL, exit 1 on any difference. Doesn't
 #                read plugins at all. Run this BEFORE linking.

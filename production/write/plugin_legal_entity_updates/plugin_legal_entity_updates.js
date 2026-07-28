@@ -184,13 +184,72 @@ const FIELD_COMPARISON = [
       "_column.country_code",
     ],
   },
-  // Billing-info columns with NO legal-entity counterpart. They are listed so the
-  // per-provider checklist is complete, but marked informational: "provider only"
-  // is the designed state, not a discrepancy, so they never fail pre-flight.
-  { label: "building number", pbi: "building_number", le: [], informational: true },
-  { label: "district", pbi: "district", le: [], informational: true },
+  // buildingNumber / district exist as legal-entity keys ONLY where a country
+  // config defines them — today just SA, whose registered_address_fields marks
+  // both is_required: true because "ZATCA e-invoicing needs a complete seller
+  // address" (app-legal-entities .../fields_configuration/country/sa.ex). The
+  // default config has neither and uses registeredAddress.street2 instead.
+  //
+  // So they're `informational` — "provider only" is the designed state — EXCEPT
+  // where the country's required set names them, which un-marks it. See
+  // requiredFieldsFor() and compareFields().
+  {
+    label: "building number",
+    pbi: "building_number",
+    le: [
+      "organization.registeredAddress.buildingNumber",
+      "soleProprietorship.registeredAddress.buildingNumber",
+      "individual.residentialAddress.buildingNumber",
+    ],
+    informational: true,
+  },
+  {
+    label: "district",
+    pbi: "district",
+    le: [
+      "organization.registeredAddress.district",
+      "soleProprietorship.registeredAddress.district",
+      "individual.residentialAddress.district",
+    ],
+    informational: true,
+  },
   { label: "company number", pbi: "company_number", le: [], informational: true },
 ];
+
+// What app-accounting-documents demands of the legal entity before it will
+// onboard/send. Both modules fetch via GetLegalEntityInvoiceDetails and hard-fail
+// with {:error, :missing_required_fields}, so a field missing here is not a
+// cosmetic difference — it blocks e-invoicing.
+//
+//   SA      → EInvoicing.Comarch.LegalEntityBillingDetails  @required_fields
+//   ES / IT → EInvoicing.Common.LegalEntityBillingDetails   @required_fields
+//
+// KSA notably does NOT check company_name (it comes from the request) but DOES
+// require company_registration_number, building_number and district. Its
+// tax_number is also a different identifier kind — the ZATCA TRN
+// (IDENTIFIER_KIND_TAX_NUMBER) rather than the ES/IT NIF/PIVA
+// (IDENTIFIER_KIND_TAX_IDENTIFICATION_NUMBER) — so a present-and-equal
+// tax number here is necessary but not sufficient.
+const EINVOICING_REQUIRED = {
+  SA: [
+    "state_province",
+    "city",
+    "postal_code",
+    "address",
+    "tax_number",
+    "company_registration_number",
+    "building_number",
+    "district",
+  ],
+  ES: ["company_name", "state_province", "city", "postal_code", "address", "tax_number"],
+  IT: ["company_name", "state_province", "city", "postal_code", "address", "tax_number"],
+};
+
+// Country decides the required set. Non-e-invoicing countries have none, so the
+// comparison stays informational for them.
+function requiredFieldsFor(countryCode) {
+  return EINVOICING_REQUIRED[String(countryCode || "").toUpperCase()] || null;
+}
 
 // The provider_billing_informations columns the comparison needs, in the order
 // the query selects them.
@@ -833,6 +892,24 @@ function parseRowsLoose(out, fieldCount) {
     .filter(Boolean);
 }
 
+// provider_id -> account_configurations.country_code. This is the country that
+// decides which validator runs: BillingDetailsPolicy dispatches on
+// `%{country_code: "SA"} = account_configuration`, so the account configuration —
+// not the billing info, not the legal entity — is the routing truth.
+function fetchAccountConfigCountries(env, providerIds) {
+  const sql =
+    "SELECT provider_id::text, coalesce(country_code, '')\n" +
+    "FROM account_configurations\n" +
+    `WHERE provider_id IN (${providerIds.join(",")})\n` +
+    "ORDER BY provider_id;";
+
+  const map = new Map();
+  for (const [providerId, countryCode] of parseRows(psqlRead(env, AD_DB, sql), 2)) {
+    if (countryCode) map.set(providerId, countryCode.toUpperCase());
+  }
+  return map;
+}
+
 // The ACTIVE billing information row per provider. Same valid_to convention as
 // provider_purchases_primary_legal_entities: NULL means current, non-NULL is a
 // superseded history row.
@@ -914,35 +991,54 @@ function leValue(fields, keys) {
 
 // Per provider: which comparable fields agree, and which don't. A field where
 // both sides are empty isn't comparable and is skipped entirely.
-function compareFields(providerId, billing, fields) {
+function compareFields(providerId, billing, fields, countryCode) {
   const rows = [];
   // "individual" vs everything else (organization, trust, sole_proprietorship,
   // unincorporated_partnership) — see `only` on FIELD_COMPARISON.
   const entityType = (fields && fields.get("_column.type")) || "";
   const kind = entityType === "individual" ? "individual" : "organization";
 
+  const required = requiredFieldsFor(countryCode);
+
   for (const spec of FIELD_COMPARISON) {
     if (spec.only && spec.only !== kind) continue;
 
+    const isRequired = Boolean(required && required.includes(spec.pbi));
     const pbiValue = billing ? billing[spec.pbi] || "" : "";
     const { value: leVal, key: leKey } = leValue(fields, spec.le);
-    if (!pbiValue && !leVal) continue;
+
+    // A required field is reported even when BOTH sides are empty — that's the
+    // worst case for onboarding, not something to quietly skip.
+    if (!pbiValue && !leVal && !isRequired) continue;
 
     const same = normalizeValue(pbiValue) === normalizeValue(leVal);
-    // "present?" in the per-provider checklist.
-    const presence = pbiValue && leVal ? "both" : pbiValue ? "provider only" : "legal entity only";
+    const presence = pbiValue && leVal ? "both" : pbiValue ? "provider only" : leVal ? "legal entity only" : "neither";
 
     rows.push({
       label: spec.label,
       pbi: pbiValue,
       le: leVal,
       leKey: leKey || fallbackLeKey(spec.le, kind),
-      // No legal-entity counterpart exists for this column, so "provider only"
-      // is correct by design — reported, never counted against the verdict.
-      informational: Boolean(spec.informational),
+      required: isRequired,
+      // Informational means "no legal-entity counterpart by design" — but if the
+      // country's required set names the field, a counterpart is expected and the
+      // exemption no longer applies (SA's buildingNumber/district).
+      informational: Boolean(spec.informational) && !isRequired,
       same,
       presence,
-      note: same ? "" : !pbiValue ? "missing in billing info" : !leVal ? "missing in legal entity" : "differs",
+      // Missing a REQUIRED field on the legal-entity side is what actually breaks
+      // e-invoicing: the accounting-documents validator returns
+      // {:error, :missing_required_fields} and onboarding/send stops.
+      blocking: isRequired && !leVal,
+      note: same
+        ? ""
+        : isRequired && !leVal
+          ? "REQUIRED by e-invoicing — missing in legal entity"
+          : !pbiValue
+            ? "missing in billing info"
+            : !leVal
+              ? "missing in legal entity"
+              : "differs",
     });
   }
 
@@ -950,8 +1046,11 @@ function compareFields(providerId, billing, fields) {
     providerId,
     billing,
     entityType,
+    countryCode: countryCode || "",
+    required,
     rows,
     diffs: rows.filter((r) => !r.same && !r.informational),
+    blocking: rows.filter((r) => r.blocking),
   };
 }
 
@@ -960,24 +1059,33 @@ function compareFields(providerId, billing, fields) {
 // printFieldComparison's tables only surface what disagrees.
 function printProviderFieldTable(cmp) {
   const mark = (row) => {
+    if (row.blocking) return `${c.bad("⛔ BLOCKS e-invoicing")}`;
     if (row.informational) return `${c.faint("provider only")}`;
     if (row.same) return `${c.ok("✅")} both`;
     if (row.presence === "both") return `${c.bad("❌")} differs`;
+    if (row.presence === "neither") return `${c.bad("❌")} neither`;
     return `${c.warn("⚠")} ${row.presence}`;
   };
 
+  const country = cmp.countryCode || "?";
+  const scope = cmp.required
+    ? c.warn(`e-invoicing country ${country}`)
+    : c.faint(`${country} — not an e-invoicing country, nothing required`);
+
   console.log(
     c.head(
-      `\n── provider=${cmp.providerId} (${cmp.entityType || "unknown type"}) ` +
-        "─────────────────────────"
+      `\n── provider=${cmp.providerId} (${cmp.entityType || "unknown type"}, ${country}) ` +
+        "──────────────────"
     )
   );
+  console.log(`  ${scope}`);
 
   console.log(
     renderTable(
-      ["REQUIRED FIELD", `PROVIDER BILLING (${SHEDUL_DB})`, `LEGAL ENTITY (fields jsonb)`, "PRESENT?"],
+      ["FIELD", "REQ?", `PROVIDER BILLING (${SHEDUL_DB})`, `LEGAL ENTITY (fields jsonb)`, "PRESENT?"],
       cmp.rows.map((r) => [
         r.label,
+        r.required ? c.warn("yes") : "",
         r.pbi || "—",
         r.le ? `${c.sql(r.leKey)} = ${r.le}` : r.leKey ? c.faint(`${r.leKey} = ∅`) : "—",
         mark(r),
@@ -987,14 +1095,30 @@ function printProviderFieldTable(cmp) {
 
   const comparable = cmp.rows.filter((r) => !r.informational);
   const matched = comparable.filter((r) => r.same).length;
+  const informationalCount = cmp.rows.length - comparable.length;
+
   console.log(
     `\n  ${matched === comparable.length ? c.ok("✓") : c.bad("✗")} ` +
       `${matched}/${comparable.length} comparable fields agree` +
-      c.faint(
-        `   (${cmp.rows.length - comparable.length} provider-only column(s) shown for ` +
-          "completeness, not compared)"
-      )
+      (informationalCount
+        ? c.faint(`   (${informationalCount} provider-only column(s) not compared)`)
+        : "")
   );
+
+  if (cmp.blocking.length) {
+    console.log(
+      c.bad(
+        `  ⛔ ${cmp.blocking.length} required field(s) missing from the legal entity: ` +
+          cmp.blocking.map((r) => r.label).join(", ")
+      )
+    );
+    console.log(
+      c.faint(
+        `     ${country} e-invoicing onboarding/send will fail with ` +
+          "{:error, :missing_required_fields}."
+      )
+    );
+  }
 }
 
 function printFieldComparison(comparisons) {
@@ -1002,14 +1126,20 @@ function printFieldComparison(comparisons) {
     c.head("\n── Field comparison (provider_billing_informations ↔ legal entity) ──")
   );
 
-  const noBilling = comparisons.filter((cmp) => !cmp.billing);
+  // Blocked is checked FIRST. A provider can have no billing row *and* a legal
+  // entity missing required fields — calling that "nothing to compare" would bury
+  // the more serious fact.
+  const blockedSet = new Set(comparisons.filter((cmp) => cmp.blocking.length));
+  const noBilling = comparisons.filter((cmp) => !cmp.billing && !blockedSet.has(cmp));
   const withDiffs = comparisons.filter((cmp) => cmp.billing && cmp.diffs.length);
   const clean = comparisons.filter((cmp) => cmp.billing && !cmp.diffs.length);
 
   for (const cmp of clean) {
+    const comparable = cmp.rows.filter((r) => !r.informational).length;
     console.log(
       `  ${c.ok("✓")} provider=${cmp.providerId}  ` +
-        c.faint(`${cmp.rows.length}/${cmp.rows.length} comparable fields match`)
+        c.faint(`${comparable}/${comparable} comparable fields match`) +
+        (cmp.countryCode ? c.faint(`  [${cmp.countryCode}]`) : "")
     );
   }
 
@@ -1041,10 +1171,39 @@ function printFieldComparison(comparisons) {
   console.log(
     `\n  ${c.ok(`✓ ${clean.length} consistent`)}   ` +
       `${c.faint(`– ${noBilling.length} no billing row`)}   ` +
-      `${withDiffs.length ? c.bad(`✗ ${withDiffs.length} differ`) : `✗ 0 differ`}`
+      `${withDiffs.length ? c.bad(`✗ ${withDiffs.length} differ`) : `✗ 0 differ`}   ` +
+      `${blockedSet.size ? c.bad(`⛔ ${blockedSet.size} blocked`) : `⛔ 0 blocked`}`
   );
 
-  return { clean: clean.length, noBilling: noBilling.length, differ: withDiffs.length };
+  const blocked = [...blockedSet];
+  if (blocked.length) {
+    console.log(
+      c.bad(
+        `\n  ⛔ ${blocked.length} provider(s) missing REQUIRED e-invoicing fields on the legal entity:`
+      )
+    );
+    for (const cmp of blocked) {
+      console.log(
+        `      provider=${cmp.providerId} [${cmp.countryCode}] — ` +
+          c.bad(cmp.blocking.map((r) => r.label).join(", ")) +
+          (cmp.billing ? "" : c.faint("   (also has no billing row)"))
+      );
+    }
+    console.log(
+      c.faint(
+        "      Required sets come from app-accounting-documents:\n" +
+          "        SA      → EInvoicing.Comarch.LegalEntityBillingDetails @required_fields\n" +
+          "        ES / IT → EInvoicing.Common.LegalEntityBillingDetails  @required_fields"
+      )
+    );
+  }
+
+  return {
+    clean: clean.length,
+    noBilling: noBilling.length,
+    differ: withDiffs.length,
+    blocked: blocked.length,
+  };
 }
 
 // The pre-flight verdict. A field difference is a FAIL: the whole point of a
@@ -1056,7 +1215,7 @@ function printFieldComparison(comparisons) {
 // no primary legal entity has nothing to be inconsistent about. Those are gaps
 // to notice, not contradictions.
 function printPreflightVerdict(tally, missingLegalEntity) {
-  const failed = tally.differ > 0;
+  const failed = tally.differ > 0 || tally.blocked > 0;
   const warnings = tally.noBilling + missingLegalEntity;
 
   console.log(
@@ -1066,6 +1225,12 @@ function printPreflightVerdict(tally, missingLegalEntity) {
   );
 
   if (failed) {
+    if (tally.blocked) {
+      console.log(
+        `  ${c.bad("⛔")} ${tally.blocked} provider(s) missing REQUIRED e-invoicing fields — ` +
+          "onboarding/send WILL fail for these."
+      );
+    }
     console.log(
       `  ${c.bad("✗")} ${tally.differ} provider(s) where billing info and the legal entity disagree.`
     );
@@ -1909,8 +2074,18 @@ async function main() {
       ...new Set(withLegalEntity.map((id) => primaryByProvider.get(id))),
     ]);
 
+    // Which validator applies is decided by the account configuration's country,
+    // so the required-field set has to come from there.
+    console.log(c.faint(`Reading account configuration countries from ${AD_DB} (read-only)…`));
+    const countries = fetchAccountConfigCountries(env, withLegalEntity);
+
     const comparisons = withLegalEntity.map((id) =>
-      compareFields(id, billing.get(id), leFields.get(primaryByProvider.get(id)))
+      compareFields(
+        id,
+        billing.get(id),
+        leFields.get(primaryByProvider.get(id)),
+        countries.get(id)
+      )
     );
 
     // Auto: detail when you named the providers, summary for a bulk --all sweep.
