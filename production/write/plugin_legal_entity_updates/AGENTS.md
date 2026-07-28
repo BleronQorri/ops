@@ -11,7 +11,33 @@ the `link_plugins_to_legal_entities_from_env` Houston task.
 ./plugin_legal_entity_updates.js
 ```
 
-## Four modes
+## Guided — the whole procedure, step by step
+
+If you don't remember the order or what each step is for, pick **Guided** (option
+6, or `--guided`). It prints the procedure — every step, what it does, why it
+exists, and what to watch for — then walks you through them one at a time,
+letting you run, skip, or stop at each:
+
+```sh
+./plugin_legal_entity_updates.js --guided 33
+```
+
+Each step runs as **its own invocation** of this script. That keeps guided
+completely decoupled from the other modes — it adds no shared state — and means
+every step keeps its own gates and re-approves its own data access, which is
+right, because each reads something different.
+
+**Pre-flight failing stops the walkthrough** by default. That's the whole point of
+its position in the order: linking a provider whose legal entity is incomplete
+just defers the failure to the send path. You can override and continue.
+
+The summary at the end marks each step `pass` / `fail` / `skipped` / `not
+reached`, and the walkthrough exits 1 if any step failed.
+
+Reset is described but deliberately **not** in the sequence — it's remedial and
+destructive.
+
+## Five modes plus guided
 
 Workflow order: **migrate → pre-flight → link → post-flight**.
 
@@ -35,7 +61,7 @@ mode — it's valid in both migrate and link.
 
 | Step | Prompt | Default |
 |------|--------|---------|
-| 1 | **What do you want to do?** pre-flight / post-flight / link / migrate | **pre-flight** |
+| 1 | **What do you want to do?** pre-flight / post-flight / link / migrate / reset / guided | **pre-flight** |
 | 2 | **Which environment?** staging (`eng-orion`) / production / other namespace | staging |
 | 3 | **Read from these databases?** — target shown, approved *before any query runs* | — |
 | 4 | **Which providers?** every provider with an account configuration / a list you type | all |

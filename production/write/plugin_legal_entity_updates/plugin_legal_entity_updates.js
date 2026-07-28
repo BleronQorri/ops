@@ -419,6 +419,7 @@ function parseArgs(argv) {
     else if (a === "--detail") opts.detail = true;
     else if (a === "--summary") opts.detail = false;
     else if (a === "--migrate") opts.mode = "migrate";
+    else if (a === "--guided" || a === "--guide") opts.mode = "guided";
     else if (a === "--reset") opts.mode = "reset";
     else if (a === "--keep-legal-entities") opts.deleteLegalEntities = false;
     else if (a === "--no-payment-methods") opts.migratePaymentMethods = false;
@@ -464,6 +465,8 @@ Flags (each one just pre-answers a prompt):
                          comma/whitespace-separated mix; # starts a comment)
       --migrate          Run ${MIGRATE_TASK} on
                          ${MIGRATE_SERVICE}. Explicit provider list only.
+      --guided           Walk the WHOLE migration step by step, with each step
+                         defined. Runs each as its own invocation.
       --reset            STAGING ONLY, DESTRUCTIVE. Undo the migration for a
                          provider so it can run again. Refuses production.
       --keep-legal-entities  reset without soft-deleting the legal entities
@@ -512,7 +515,8 @@ Four modes, asked as the first prompt:
 Workflow order: MIGRATE → PRE-FLIGHT → LINK → POST-FLIGHT.
 
 The guided flow:
-  1. WHICH MODE?      — pre-flight (default), post-flight, link, migrate, or
+  1. WHICH MODE?      — guided (the whole sequence), pre-flight (default),
+                        post-flight, link, migrate, or
                         reset (staging only, destructive)
   2. environment      — staging (${DEFAULT_NAMESPACE}), production, or any namespace
   3. APPROVE READS    — the target is shown and confirmed before ANY query runs
@@ -603,6 +607,12 @@ let promptStream = output;
 
 function ensureRl() {
   if (rl) return rl;
+
+  // Reset the closed flag: closeRl() fires the `close` handler below, and guided
+  // mode closes the interface before every spawned step so the child owns stdin.
+  // Without this, the first prompt after a step would abort as end-of-input on a
+  // perfectly healthy terminal.
+  inputClosed = false;
 
   rl = readline.createInterface({ input, output: promptStream });
   rl.on("line", (line) => {
@@ -2014,7 +2024,28 @@ async function askMode() {
       aliases: ["reset", "undo", "clear", "wipe"],
       value: "reset",
     },
+    // Appended rather than inserted first: 1–5 keep the numbers they've always
+    // had. Blank still selects pre-flight.
+    {
+      label: "Guided      — walk the WHOLE migration step by step, with definitions",
+      aliases: ["guided", "guide", "walkthrough", "steps", "all"],
+      value: "guided",
+    },
   ]);
+}
+
+// Guided walks a specific set of providers through the whole sequence, so it takes
+// an explicit list — the migrate step it runs would refuse anything else.
+async function askGuidedProviderIds() {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = await ask("\nProvider IDs to walk through (comma- or space-separated): ");
+    try {
+      return parseProviderIds(raw);
+    } catch (err) {
+      console.error(`  ${err.message}`);
+    }
+  }
+  throw new Error("No valid provider IDs given.");
 }
 
 // Reset takes an explicit list too — and, being destructive, no "all" option.
@@ -2180,6 +2211,223 @@ async function confirmRun(opts) {
 
 // --- main ------------------------------------------------------------------
 
+// --- guided walkthrough -------------------------------------------------------
+//
+// The migration procedure written down: what each step is, why it exists, and in
+// what order. Runs each step as a SEPARATE INVOCATION of this script rather than
+// sharing state with the other modes — so guided adds no coupling to them, and
+// every step keeps its own gates (including re-approving its own data access,
+// which is the point: each step reads a different thing).
+//
+// Order is not arbitrary. migrate creates the legal entity; pre-flight can only
+// compare once one exists; link needs the primary pointer migrate sets;
+// post-flight can only confirm a link that link made.
+
+const WORKFLOW_STEPS = [
+  {
+    key: "migrate",
+    flag: "--migrate",
+    title: "MIGRATE — create the legal entities",
+    writes: true,
+    what:
+      "Runs legal_entities_migration:migrate on partners-app. Per provider it classifies (billing_only / adyen_fresha_pay / checkout_fresha_pay), creates the legal entity from provider_billing_informations, assigns locations, and sets it as the provider's primary.",
+    why:
+      "Nothing else can work without it — there is no entity to compare against and no primary pointer to link to.",
+    watch:
+      "This task has NO dry run; it writes on the first call. It IS resumable, so an already-migrated provider is resumed rather than duplicated.",
+  },
+  {
+    key: "preflight",
+    flag: "--preflight",
+    title: "PRE-FLIGHT — is the data fit to proceed on?",
+    writes: false,
+    what:
+      "Cross-checks provider_billing_informations (shedul) against the legal entity's jsonb fields (legal_entities), field by field, and applies the per-country REQUIRED set that app-accounting-documents enforces (SA via Comarch, ES/IT via Common).",
+    why:
+      "A required field missing on the legal-entity side makes onboarding/send fail with {:error, :missing_required_fields}. Cheaper to find here than after linking.",
+    watch:
+      "FAIL here means STOP. Linking a provider whose legal entity is incomplete just moves the failure downstream.",
+  },
+  {
+    key: "link",
+    flag: "--dry-run",
+    title: "LINK — point the plugins at the legal entity",
+    writes: true,
+    what:
+      "Resolves each provider's primary legal entity and its NULL-legal_entity_id plugin, then runs link_plugins_to_legal_entities_from_env to set it.",
+    why:
+      "The plugin is what the send path reads. Until it carries the legal_entity_id, e-invoicing still uses the legacy provider billing.",
+    watch:
+      "Defaults to DRY_RUN=true — this step runs the dry run. Re-run the step and choose APPLY to write. Only one plugin can hold a given legal entity.",
+  },
+  {
+    key: "postflight",
+    flag: "--postflight",
+    title: "POST-FLIGHT — did it actually land?",
+    writes: false,
+    what:
+      "Compares each plugin's legal_entity_id against its provider's primary and reports PASS/FAIL.",
+    why:
+      "The link task exits 0 even when it skips every row, so its exit code is not evidence. Only reading the rows back is.",
+    watch: "Drift here means the link did not take — check for a unique-index collision.",
+  },
+];
+
+// Not part of the happy path: remedial, staging-only, and destructive.
+const GUIDED_REMEDIAL = {
+  key: "reset",
+  flag: "--reset",
+  title: "RESET — undo the migration so it can be re-run (STAGING ONLY)",
+  what:
+    "Clears the plugin link, primary pointer, location assignments and migration state, and soft-deletes the legal entities.",
+  why:
+    "The migration is resumable, so an already-migrated provider is never rebuilt. Clearing that state is the only way to force a genuine re-run.",
+  watch:
+    "A reset only helps if re-running produces something better — it will not if the migrator itself is dropping fields. Verify with pre-flight first.",
+};
+
+// Reflow a definition to the terminal, with continuation lines aligned under the
+// first — the step text is stored unwrapped so it can be laid out for whichever
+// label prefix it appears under.
+function wrapText(text, label, indent) {
+  const pad = " ".repeat(indent);
+  const prefix = `${pad}${label}`;
+  const width = Math.max(40, (output.columns || 100) - prefix.length - 1);
+  const cont = " ".repeat(prefix.length);
+
+  const lines = [];
+  let line = "";
+  for (const word of String(text).split(/\s+/)) {
+    if (line && line.length + 1 + word.length > width) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = line ? `${line} ${word}` : word;
+    }
+  }
+  if (line) lines.push(line);
+
+  return lines.map((l, i) => (i === 0 ? `${prefix}${l}` : `${cont}${l}`)).join("\n");
+}
+
+function printGuidedPlan(opts, providerIds) {
+  console.log(c.head("\n══ The Billing Profiles migration, step by step ═════════"));
+  console.log(
+    `  namespace : ${opts.namespace}${isProd(opts.namespace) ? c.bad("   ⚠ PRODUCTION") : ""}`
+  );
+  console.log(`  providers : ${providerIds.length} — ${providerIds.join(", ")}`);
+
+  WORKFLOW_STEPS.forEach((step, i) => {
+    console.log(
+      `\n  ${c.head(`${i + 1}. ${step.title}`)}` +
+        (step.writes ? c.warn("   [writes]") : c.faint("   [read-only]"))
+    );
+    console.log(wrapText(step.what, "what:  ", 5));
+    console.log(wrapText(step.why, "why:   ", 5));
+    console.log(c.warn(wrapText(step.watch, "watch: ", 5)));
+  });
+
+  console.log(`\n  ${c.faint(`(remedial, not part of the sequence)`)}`);
+  console.log(`  ${c.head(GUIDED_REMEDIAL.title)}`);
+  console.log(wrapText(GUIDED_REMEDIAL.what, "what:  ", 5));
+  console.log(wrapText(GUIDED_REMEDIAL.why, "why:   ", 5));
+  console.log(c.warn(wrapText(GUIDED_REMEDIAL.watch, "watch: ", 5)));
+
+  console.log(
+    c.faint(
+      "\n  Each step runs as its own invocation of this script, so it keeps its own\n" +
+        "  gates and re-approves its own data access. Nothing is shared between them."
+    )
+  );
+}
+
+// Spawn one step. Inherits the terminal so the step's own prompts and Houston's
+// output work exactly as they do when run directly.
+function runGuidedStep(step, opts, providerIds) {
+  const args = [
+    process.argv[1],
+    step.flag,
+    "-n",
+    opts.namespace,
+    ...(step.key === "link" && opts.detail !== null ? [opts.detail ? "--detail" : "--summary"] : []),
+    providerIds.join(","),
+  ];
+
+  closeRl();
+  console.log(`\n$ ${process.argv[0]} ${args.join(" ")}\n`);
+  const res = spawnSync(process.argv[0], args, { stdio: "inherit" });
+  if (res.error) throw res.error;
+  return res.status === 0;
+}
+
+async function runGuided(opts, providerIds) {
+  printGuidedPlan(opts, providerIds);
+
+  const results = [];
+
+  for (const [i, step] of WORKFLOW_STEPS.entries()) {
+    console.log(c.head(`\n── Step ${i + 1}/${WORKFLOW_STEPS.length}: ${step.title} ─────────`));
+    console.log(wrapText(step.what, "", 2));
+    console.log(c.warn(wrapText(step.watch, "watch: ", 2)));
+
+    const choice = await askChoice(`Step ${i + 1}: ${step.key}`, [
+      { label: `Run it`, aliases: ["run", "yes", "y"], value: "run", default: true },
+      { label: "Skip this step", aliases: ["skip", "s"], value: "skip" },
+      { label: "Stop the walkthrough", aliases: ["stop", "quit", "q"], value: "stop" },
+    ]);
+
+    if (choice === "stop") {
+      console.log(c.faint("\nStopped. Nothing further was run."));
+      break;
+    }
+    if (choice === "skip") {
+      results.push({ step, outcome: "skipped" });
+      console.log(c.faint(`  Skipped ${step.key}.`));
+      continue;
+    }
+
+    const ok = runGuidedStep(step, opts, providerIds);
+    results.push({ step, outcome: ok ? "pass" : "fail" });
+
+    // Pre-flight failing is the one result that should stop you. It means the
+    // legal entity is not fit to link, and linking anyway defers the failure.
+    if (!ok && step.key === "preflight") {
+      console.log(
+        c.bad(
+          "\n  ⛔ Pre-flight FAILED. Linking now would carry an incomplete legal\n" +
+            "     entity into the send path, where it fails as missing_required_fields."
+        )
+      );
+      const go = await askChoice("Pre-flight failed — what now?", [
+        { label: "Stop here (recommended)", aliases: ["stop"], value: "stop", default: true },
+        { label: "Continue anyway", aliases: ["continue", "go"], value: "continue" },
+      ]);
+      if (go === "stop") {
+        console.log(c.faint("\nStopped after pre-flight."));
+        break;
+      }
+    } else if (!ok) {
+      console.log(c.bad(`  ✗ ${step.key} exited non-zero.`));
+    }
+  }
+
+  console.log(c.head("\n══ Walkthrough summary ══════════════════════════════════"));
+  const mark = { pass: c.ok("✓ pass"), fail: c.bad("✗ fail"), skipped: c.faint("– skipped") };
+  const done = new Set(results.map((r) => r.step.key));
+  for (const step of WORKFLOW_STEPS) {
+    const r = results.find((x) => x.step.key === step.key);
+    console.log(
+      `  ${r ? mark[r.outcome] : c.faint("· not reached")}   ${step.key}` +
+        (step.writes ? "" : c.faint("  (read-only)"))
+    );
+  }
+
+  const failed = results.filter((r) => r.outcome === "fail").length;
+  if (!done.size) console.log(c.faint("  Nothing was run."));
+  if (failed) process.exitCode = 1;
+  return failed === 0;
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) return usage();
@@ -2217,7 +2465,7 @@ async function main() {
 
   // Fail loudly on flags that mean nothing in migrate mode rather than ignoring
   // them — silently dropping --all on a migration would be a nasty surprise.
-  if (opts.mode === "migrate" || opts.mode === "reset") {
+  if (opts.mode === "migrate" || opts.mode === "reset" || opts.mode === "guided") {
     const bad = [
       opts.all && "--all",
       opts.file && "--file",
@@ -2237,6 +2485,17 @@ async function main() {
     opts.namespace = await askNamespace();
   }
   const env = psqlEnv(opts.namespace);
+
+  // GUIDED — the walkthrough itself queries nothing, so it does not pass the read
+  // gate; each step it spawns passes its own. Dispatched before that gate for
+  // exactly that reason.
+  if (opts.mode === "guided") {
+    const providerIds = opts.providerIds
+      ? parseProviderIds(opts.providerIds)
+      : await askGuidedProviderIds();
+    await runGuided(opts, providerIds);
+    return;
+  }
 
   // 3. Approve the data access itself, before any query goes out ------------
   if (!(await confirmDataAccess(opts, env))) {

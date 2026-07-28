@@ -90,7 +90,9 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```sh
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
-#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate / reset
+#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate / reset / guided
+#                         GUIDED walks the whole sequence with every step defined —
+#                         start there if you don't remember the order.
 #   2. environment      — staging (eng-orion), production, or any namespace
 #   3. APPROVE READS    — target shown and confirmed BEFORE any query runs
 #   4. providers        — all of them (from account_configurations), or a list you type
@@ -132,6 +134,7 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 # Flags just pre-answer a prompt — all optional:
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
+#       --guided           walk the WHOLE migration step by step, each step defined
 #       --migrate          create legal entities (partners-app); explicit ids only
 #       --reset            STAGING ONLY, destructive: undo the migration for a provider
 #                          so it can be re-run. Refuses production. Per-provider confirm.
