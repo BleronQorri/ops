@@ -456,6 +456,7 @@ function parseArgs(argv) {
     }
     else if (a === "--migrate") opts.mode = "migrate";
     else if (a === "--guided" || a === "--guide") opts.mode = "guided";
+    else if (a === "--plugins" || a === "--by-plugin") opts.mode = "plugins";
     else if (a === "--reset") opts.mode = "reset";
     else if (a === "--keep-legal-entities") opts.deleteLegalEntities = false;
     else if (a === "--no-payment-methods") opts.migratePaymentMethods = false;
@@ -514,6 +515,8 @@ Flags (each one just pre-answers a prompt):
                          too. Default: preflight-<namespace>-<date>.md
       --detail           Per-provider field checklist (default when you name ids)
       --summary          One line per provider instead (default with --all)
+      --plugins          READ-ONLY. Billing info vs each PLUGIN's own legal entity
+                         (what the send path reads). One section per plugin.
       --preflight        READ-ONLY. Cross-check provider_billing_informations
                          against the legal entity, field by field. PASS/FAIL.
       --postflight       READ-ONLY. Is every plugin pointing at its provider's
@@ -1173,7 +1176,7 @@ function compareFields(providerId, billing, fields, countryCode) {
 // The per-provider checklist: every comparable field, matching or not, with the
 // legal-entity key that supplied the value. This is the "are these good?" view —
 // printFieldComparison's tables only surface what disagrees.
-function printProviderFieldTable(cmp) {
+function printProviderFieldTable(cmp, heading) {
   const mark = (row) => {
     if (row.leBadFormat) return `${c.bad("⛔ INVALID FORMAT")}`;
     if (row.blocking) return `${c.bad("⛔ BLOCKS e-invoicing")}`;
@@ -1191,7 +1194,7 @@ function printProviderFieldTable(cmp) {
 
   console.log(
     c.head(
-      `\n── provider=${cmp.providerId} (${cmp.entityType || "unknown type"}, ${country}) ` +
+      `\n── ${heading || `provider=${cmp.providerId} (${cmp.entityType || "unknown type"}, ${country})`} ` +
         "──────────────────"
     )
   );
@@ -1211,7 +1214,9 @@ function printProviderFieldTable(cmp) {
   );
 
   const comparable = cmp.rows.filter((r) => !r.informational);
-  const matched = comparable.filter((r) => r.same).length;
+  // A row where BOTH sides are empty is "equal" but still blocking — agreement on
+  // nothing is not agreement, so it must not inflate the count.
+  const matched = comparable.filter((r) => r.same && !r.blocking).length;
   const informationalCount = cmp.rows.length - comparable.length;
 
   console.log(
@@ -1790,6 +1795,187 @@ function printMigrateReadback(providerIds, before, after) {
   return failures;
 }
 
+// --- plugin audit -------------------------------------------------------------
+//
+// Pre-flight compares billing info against the provider's PRIMARY legal entity.
+// This compares it against the legal entity each PLUGIN actually points at, which
+// is what the send path reads: BillingDetailsPolicy resolves the plugin, then uses
+// `plugin.legal_entity_id`. The two answers differ exactly when a plugin has
+// drifted off the primary — and it's the plugin's copy that decides whether an
+// invoice can be issued.
+//
+// One section per plugin row, because a provider can hold several and each carries
+// its own legal_entity_id.
+
+// Providers that actually have a plugin — a provider can have an
+// account_configuration with no plugin, in which case there is nothing to audit.
+function fetchProviderIdsWithPlugins(env) {
+  const sql =
+    "SELECT DISTINCT ac.provider_id\n" +
+    "FROM account_configuration_plugins p\n" +
+    "JOIN account_configurations ac ON ac.id = p.account_configuration_id\n" +
+    "WHERE ac.provider_id IS NOT NULL\n" +
+    "ORDER BY ac.provider_id;";
+
+  return parseRows(psqlRead(env, AD_DB, sql), 1)
+    .map(([id]) => id)
+    .filter((id) => /^\d+$/.test(id));
+}
+
+// Build one comparison per plugin. `primary` is carried only to flag divergence —
+// the comparison itself is against the plugin's own legal entity.
+function comparePlugins(pluginsByProvider, billing, leFields, countries, primaryByProvider) {
+  const out = [];
+
+  for (const [providerId, plugins] of [...pluginsByProvider.entries()].sort(
+    (a, b) => Number(a[0]) - Number(b[0])
+  )) {
+    for (const plugin of plugins) {
+      const primary = primaryByProvider.get(providerId) || null;
+
+      if (!plugin.legalEntityId) {
+        // Nothing to compare against — the plugin isn't linked yet.
+        out.push({
+          providerId,
+          plugin,
+          unlinked: true,
+          primary,
+          rows: [],
+          diffs: [],
+          blocking: [],
+          countryCode: countries.get(providerId) || "",
+        });
+        continue;
+      }
+
+      const cmp = compareFields(
+        providerId,
+        billing.get(providerId),
+        leFields.get(plugin.legalEntityId),
+        countries.get(providerId)
+      );
+
+      out.push({
+        ...cmp,
+        plugin,
+        unlinked: false,
+        primary,
+        // The plugin points somewhere other than the provider's primary. Not
+        // wrong by itself, but it means pre-flight and this mode are looking at
+        // different entities.
+        diverged: Boolean(primary && primary !== plugin.legalEntityId),
+      });
+    }
+  }
+
+  return out;
+}
+
+function printPluginAudit(opts, audits, detail) {
+  const linked = audits.filter((a) => !a.unlinked);
+  const unlinked = audits.filter((a) => a.unlinked);
+  const blocked = linked.filter((a) => a.blocking.length);
+  const diverged = linked.filter((a) => a.diverged);
+  const clean = linked.filter((a) => !a.blocking.length && !a.diffs.length);
+
+  console.log(c.head("\n── Plugin audit — billing info vs the plugin's legal entity ──"));
+  console.log(
+    renderTable(
+      ["", "PROVIDER", "PLUGIN", "TYPE", "STATUS", "PLUGIN'S LEGAL ENTITY", "RESULT"],
+      audits.map((a) => {
+        const mark = a.unlinked
+          ? c.faint("–")
+          : a.blocking.length
+            ? c.bad("✗")
+            : a.diffs.length
+              ? c.bad("✗")
+              : c.ok("✓");
+        const comparable = a.rows.filter((r) => !r.informational).length;
+        const matched = a.rows.filter((r) => !r.informational && r.same && !r.blocking).length;
+        return [
+          mark,
+          a.providerId,
+          a.plugin.id,
+          a.plugin.pluginType,
+          a.plugin.pluginStatus,
+          a.unlinked ? c.faint("∅ not linked") : a.plugin.legalEntityId,
+          a.unlinked
+            ? c.faint("nothing to compare — run link first")
+            : `${matched}/${comparable} agree` +
+              (a.blocking.length ? c.bad(`  ⛔ ${a.blocking.length} unusable`) : "") +
+              (a.diverged ? c.warn("  ⚠ not the primary") : ""),
+        ];
+      })
+    )
+  );
+
+  if (detail) {
+    for (const a of linked) {
+      printProviderFieldTable(
+        a,
+        `plugin=${a.plugin.id} (provider=${a.providerId}, ${a.plugin.pluginType}, ` +
+          `${a.entityType || "unknown"}, ${a.countryCode || "?"})`
+      );
+      if (a.diverged) {
+        console.log(
+          c.warn(
+            `  ⚠ this plugin points at ${a.plugin.legalEntityId}, but the provider's\n` +
+              `     primary is ${a.primary} — pre-flight compares the primary, this compares the plugin.`
+          )
+        );
+      }
+    }
+  }
+
+  if (blocked.length) {
+    console.log(c.bad("\n  ⛔ Plugins whose legal entity can't support e-invoicing:"));
+    for (const a of blocked) {
+      console.log(
+        `      plugin=${a.plugin.id} provider=${a.providerId} [${a.countryCode}] — ` +
+          c.bad(a.blocking.map(blockingLabel).join(", "))
+      );
+    }
+  }
+
+  if (diverged.length) {
+    console.log(
+      c.warn(`\n  ⚠ ${diverged.length} plugin(s) not pointing at their provider's primary:`)
+    );
+    for (const a of diverged) {
+      console.log(`      plugin=${a.plugin.id} provider=${a.providerId}`);
+      console.log(c.faint(`        plugin  ${a.plugin.legalEntityId}`));
+      console.log(c.faint(`        primary ${a.primary}`));
+    }
+  }
+
+  console.log(
+    `\n  ${c.ok(`✓ ${clean.length} consistent`)}   ` +
+      `${c.faint(`– ${unlinked.length} not linked`)}   ` +
+      `${blocked.length ? c.bad(`⛔ ${blocked.length} blocked`) : "⛔ 0 blocked"}   ` +
+      `${diverged.length ? c.warn(`⚠ ${diverged.length} diverged`) : "⚠ 0 diverged"}`
+  );
+
+  const failed = blocked.length > 0 || linked.some((a) => a.diffs.length);
+  console.log(
+    failed
+      ? c.bad("\n══ PLUGIN AUDIT: FAIL ══════════════════════════════════")
+      : c.ok("\n══ PLUGIN AUDIT: PASS ══════════════════════════════════")
+  );
+  console.log(
+    failed
+      ? `  ${c.bad("✗")} the legal entity behind at least one plugin does not match billing info.`
+      : `  ${c.ok("✓")} every linked plugin's legal entity agrees with billing info.`
+  );
+  console.log(
+    c.faint(
+      "\n  Read-only: SELECTs only. This compares the PLUGIN's legal_entity_id — what\n" +
+        "  the send path reads. Pre-flight compares the provider's primary instead."
+    )
+  );
+
+  return failed;
+}
+
 // --- markdown export ----------------------------------------------------------
 //
 // Built from the comparison objects, never from the rendered terminal output: that
@@ -1830,12 +2016,12 @@ function mdPresence(row) {
   return `⚠ ${row.presence}`;
 }
 
-function buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail) {
+function buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail, title) {
   const blocked = comparisons.filter((cmp) => cmp.blocking.length);
   const failed = tally.differ > 0 || tally.blocked > 0;
   const out = [];
 
-  out.push("# Pre-flight — provider billing informations vs legal entities");
+  out.push(`# ${title || "Pre-flight — provider billing informations vs legal entities"}`);
   out.push("");
   out.push(
     mdTable(
@@ -1884,7 +2070,9 @@ function buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, de
   if (detail) {
     for (const cmp of comparisons) {
       const comparable = cmp.rows.filter((r) => !r.informational);
-      const matched = comparable.filter((r) => r.same).length;
+      // A row where BOTH sides are empty is "equal" but still blocking — agreement on
+  // nothing is not agreement, so it must not inflate the count.
+  const matched = comparable.filter((r) => r.same && !r.blocking).length;
 
       out.push("");
       out.push(`## provider=${cmp.providerId} (${cmp.entityType || "unknown"}, ${cmp.countryCode || "?"})`);
@@ -2267,6 +2455,11 @@ async function askMode() {
       label: "Migrate     — create legal entities for providers (run BEFORE link)",
       aliases: ["migrate", "migration", "create"],
       value: "migrate",
+    },
+    {
+      label: "Plugin audit— billing info vs each PLUGIN's legal entity (read-only)",
+      aliases: ["plugins", "plugin", "audit", "by-plugin"],
+      value: "plugins",
     },
     {
       label: "Reset       — undo the migration for a provider (STAGING ONLY, destructive)",
@@ -2866,6 +3059,100 @@ async function main() {
         : `  ${c.ok("✓")} done. Re-run migrate to recreate the legal entities.`
     );
     if (failures) process.exitCode = 1;
+    return;
+  }
+
+  // PLUGIN AUDIT — self-contained. Discovers providers from the plugins table (a
+  // provider can have a config with no plugin, which has nothing to audit) and
+  // compares billing info against each PLUGIN's own legal entity. Read-only.
+  if (opts.mode === "plugins") {
+    let providerIds;
+    if (opts.providerIds || opts.file) {
+      let raw = opts.providerIds || "";
+      if (opts.file) {
+        const fromFile = fs.readFileSync(opts.file, "utf8");
+        raw = raw ? `${raw},${fromFile}` : fromFile;
+      }
+      providerIds = parseProviderIds(raw);
+    } else {
+      console.log(c.faint(`\nFinding providers with plugins in ${AD_DB}…`));
+      providerIds = fetchProviderIdsWithPlugins(env);
+      if (!providerIds.length) throw new Error("No providers with account_configuration_plugins.");
+      console.log(`Found ${providerIds.length} provider(s) with at least one plugin.`);
+    }
+
+    console.log(`\nTarget: namespace=${opts.namespace} psql_env=${env}`);
+
+    console.log(c.faint(`\nReading plugins from ${AD_DB} (read-only)…`));
+    const pluginsByProvider = fetchPlugins(env, providerIds);
+    if (!pluginsByProvider.size) {
+      console.log(c.warn("\nNone of these providers has a plugin — nothing to audit."));
+      return;
+    }
+
+    console.log(c.faint(`Reading primary legal entities from ${SHEDUL_DB} (read-only)…`));
+    const primaryByProvider = fetchPrimaryLegalEntities(env, providerIds);
+
+    console.log(c.faint(`Reading provider_billing_informations from ${SHEDUL_DB} (read-only)…`));
+    const billing = fetchBillingInformations(env, providerIds);
+
+    console.log(c.faint(`Reading account configuration countries from ${AD_DB} (read-only)…`));
+    const countries = fetchAccountConfigCountries(env, providerIds);
+
+    // Only the entities the plugins actually reference — not the primaries.
+    const pluginLegalEntityIds = [
+      ...new Set(
+        [...pluginsByProvider.values()]
+          .flat()
+          .map((p) => p.legalEntityId)
+          .filter(Boolean)
+      ),
+    ];
+    console.log(c.faint(`Reading legal entity fields from ${LE_DB} (read-only)…`));
+    const leFields = fetchLegalEntityFields(env, pluginLegalEntityIds);
+
+    const audits = comparePlugins(
+      pluginsByProvider,
+      billing,
+      leFields,
+      countries,
+      primaryByProvider
+    );
+
+    const detail = opts.detail === null ? providerIds.length <= 5 : opts.detail;
+    const failed = printPluginAudit(opts, audits, detail);
+
+    // Same export path as pre-flight — the linked audits carry the same shape.
+    let wantMd = opts.md;
+    if (!wantMd) {
+      const answer = (await ask("\n  Export this comparison as Markdown? (y/N): "))
+        .trim()
+        .toLowerCase();
+      wantMd = answer === "y" || answer === "yes";
+    }
+    if (wantMd) {
+      const linked = audits.filter((a) => !a.unlinked);
+      const target = preflightMarkdownPath(opts);
+      fs.writeFileSync(
+        target,
+        buildPreflightMarkdown(
+          opts,
+          linked,
+          {
+            clean: linked.filter((a) => !a.blocking.length && !a.diffs.length).length,
+            noBilling: 0,
+            differ: linked.filter((a) => a.diffs.length).length,
+            blocked: linked.filter((a) => a.blocking.length).length,
+          },
+          0,
+          detail,
+          "Plugin audit — provider billing informations vs each plugin's legal entity"
+        )
+      );
+      console.log(`  ${c.ok("✓")} written: ${target}`);
+    }
+
+    if (failed) process.exitCode = 1;
     return;
   }
 

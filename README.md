@@ -16,7 +16,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 **write**
 - **process_missing_sales** — backfills invoices/credit notes for sales that never produced one (export → S3 → Houston task). Step-gated.
 - **retry_invoices** — re-drives stuck KSA e-invoices: flips tracker statuses retry-eligible, then force-retries sending.
-- **plugin_legal_entity_updates** — six modes, picked at the first prompt (**guided** walks the sequence with every step defined — start there): **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed), and **reset** (⚠️ _staging only, destructive_ — undoes the migration for a provider so it can be re-run). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
+- **plugin_legal_entity_updates** — seven modes, picked at the first prompt (**guided** walks the sequence with every step defined — start there): **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed), and **reset** (⚠️ _staging only, destructive_ — undoes the migration for a provider so it can be re-run). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
 
 ### `staging/` — non-prod
 
@@ -90,7 +90,8 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```sh
 ./production/write/plugin_legal_entity_updates/plugin_legal_entity_updates.js
 # Fully interactive — just run it, no flags to remember. It asks, in order:
-#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate / reset / guided
+#   1. WHICH MODE?      — pre-flight (default) / post-flight / link / migrate /
+#                         plugin-audit / reset / guided
 #                         GUIDED walks the whole sequence with every step defined —
 #                         start there if you don't remember the order.
 #   2. environment      — staging (eng-orion), production, or any namespace
@@ -101,7 +102,10 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #   5. dry run or apply — asked after the resolution report is on screen
 #   6. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
 #
-# SIX MODES — workflow order is migrate → pre-flight → link → post-flight.
+# SEVEN MODES — workflow order is migrate → pre-flight → link → post-flight.
+#   plugin audit READ-ONLY. Billing info vs the legal entity each PLUGIN points at
+#                (BillingDetailsPolicy reads plugin.legal_entity_id, not the primary),
+#                one section per plugin. Providers discovered from the plugins table.
 #   guided       Walks pre-flight → link → post-flight, printing what each step is,
 #                why it exists and what to watch for, then running them one at a time
 #                as separate invocations. Does NOT run migrate (a precondition: no dry
@@ -139,6 +143,8 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 # Flags just pre-answer a prompt — all optional:
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
+#       --plugins          read-only: billing info vs each PLUGIN's own legal entity —
+#                          what the send path actually reads (pre-flight uses the primary)
 #       --guided           walk pre-flight -> link -> post-flight, each step defined.
 #                          Does NOT run migrate (precondition: no dry run, RPC side effect)
 #       --migrate          create legal entities (partners-app); explicit ids only

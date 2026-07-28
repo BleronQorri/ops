@@ -54,6 +54,7 @@ Workflow order: **migrate → pre-flight → link → post-flight**.
 | **pre-flight** *(default)* | Is the data consistent, and does the legal entity carry everything the country requires? | — | never | any field differs, or a required field is missing (⛔ blocks e-invoicing) |
 | **link** | *do* the linking | `accounting-documents` | only via apply | a row didn't land |
 | **post-flight** | Is everything linked? each plugin's `legal_entity_id` vs its provider's primary | — | never | any link drift |
+| **plugin audit** | Does billing info match the legal entity each **plugin** points at? | — | never | a plugin's legal entity is unusable or disagrees |
 | **reset** ⚠️ | Undo the migration so it can run again — **STAGING ONLY** | — | yes, destructive, no undo | rows survive the reset |
 
 Pre-flight and post-flight are strictly `SELECT`s. Neither reaches a Houston
@@ -272,6 +273,49 @@ A reset only helps if re-running the migration produces something better. It
 won't if the migrator itself is dropping fields — see the note on SA organization
 entities under [Required fields](#required-fields-per-e-invoicing-country). Run
 pre-flight after re-migrating to confirm you actually gained something.
+
+## Plugin audit — billing info vs each plugin's legal entity
+
+```sh
+./plugin_legal_entity_updates.js --plugins            # every provider with a plugin
+./plugin_legal_entity_updates.js --plugins 33         # or a named set
+```
+
+**Why this isn't pre-flight.** Pre-flight compares billing info against the
+provider's **primary** legal entity. This compares it against the legal entity each
+**plugin** actually points at — which is what the send path reads:
+`BillingDetailsPolicy` resolves the plugin, then uses `plugin.legal_entity_id`. The
+two answers differ exactly when a plugin has drifted off the primary, and it's the
+plugin's copy that decides whether an invoice can be issued.
+
+One section per **plugin row**, not per provider: a provider can hold several
+plugins and each carries its own `legal_entity_id`.
+
+```
+   PROVIDER  PLUGIN  TYPE        STATUS   PLUGIN'S LEGAL ENTITY  RESULT
+✓  18        1       einvoicing  pending  019fa326-f225…         7/7 agree
+✗  33        8       einvoicing  enabled  019fa8cf-8408…         8/10 agree  ⛔ 2 unusable
+✗  52        15      einvoicing  enabled  019f895b-0db5…         0/8 agree   ⛔ 5 unusable
+–  99        7       einvoicing  pending  ∅ not linked           nothing to compare — run link first
+```
+
+Providers are discovered from `account_configuration_plugins` (joined to
+`account_configurations` for `provider_id`), not from `account_configurations` — a
+provider can have a configuration with no plugin, and that has nothing to audit.
+
+Unlinked plugins are reported `–` and skipped: there's no entity to compare
+against yet. Plugins pointing somewhere other than their provider's primary get a
+`⚠ not the primary` marker and a dedicated section showing both UUIDs — not wrong
+by itself, but it means pre-flight and this mode are looking at different entities.
+
+Reuses the same required-field sets, KSA format rules and `--md` export as
+pre-flight, and the same `--detail` / `--summary` switch (detail defaults on for
+five providers or fewer).
+
+**On the counts:** a field empty on *both* sides is technically "equal" but still
+blocking, so it does not count toward `n/m agree` — agreement on nothing is not
+agreement. That's why providers whose legal entity carries no address at all read
+`0/8 agree`.
 
 ## Migrate — create the legal entities
 
