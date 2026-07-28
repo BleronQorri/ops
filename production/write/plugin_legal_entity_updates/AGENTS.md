@@ -15,8 +15,8 @@ the `link_plugins_to_legal_entities_from_env` Houston task.
 
 If you don't remember the order or what each step is for, pick **Guided** (option
 6, or `--guided`). It prints the procedure — every step, what it does, why it
-exists, and what to watch for — then walks you through them one at a time,
-letting you run, skip, or stop at each:
+exists, and what to watch for — then walks you through **pre-flight → link →
+post-flight**, letting you run, skip, or stop at each:
 
 ```sh
 ./plugin_legal_entity_updates.js --guided 33
@@ -34,8 +34,15 @@ just defers the failure to the send path. You can override and continue.
 The summary at the end marks each step `pass` / `fail` / `skipped` / `not
 reached`, and the walkthrough exits 1 if any step failed.
 
-Reset is described but deliberately **not** in the sequence — it's remedial and
-destructive.
+### What guided does NOT run
+
+Both are described in the plan so the procedure is written down, then listed under
+*Not run by this walkthrough*:
+
+| | Why it's excluded |
+|---|---|
+| **migrate** | It's a **precondition**, not a step. It's the only thing here that writes on the first call with **no dry run**, and `MIGRATE_PAYMENT_METHODS=true` migrates cards on file through an RPC. One keystroke from a default "Run it" is the wrong place for that — run it with `--migrate`, on purpose. If it hasn't run, pre-flight says so: *no active primary legal entity*. |
+| **reset** | Remedial and destructive, staging only. |
 
 ## Five modes plus guided
 
@@ -479,6 +486,44 @@ purely informational for them.
 A required field missing on the **legal-entity** side is reported as
 `⛔ BLOCKS e-invoicing` and fails the run. That's stronger than "differs": the
 onboarding/send path will refuse the provider outright.
+
+### KSA format rules — presence isn't the only bar
+
+`AccountingDocuments.Helpers.ValidationHelpers` also enforces *shape*, so a
+present-but-malformed value fails just as hard:
+
+| Field | Rule | Source |
+|---|---|---|
+| `company_registration_number` | exactly 10 characters | `valid_ksa_crn?` |
+| `tax_number` | 15 digits, starts `3`, ends `03` — `~r/^3\d{12}03$/` | `valid_ksa_tax_id?` |
+
+Checked against the **legal-entity** value, because that's what the onboarding path
+reads. Reported as `⛔ INVALID FORMAT`, and the blocked roster distinguishes
+`(missing)` from `(invalid format)` — different problems, different fixes.
+
+`@necessary_onboarding_fields` in `onboard_provider_to_ksa_action.ex` is the same
+eight-field set as Comarch's `@required_fields` (it lists `postal_code` twice —
+harmless), so there's nothing extra to model there.
+
+### Export it as Markdown
+
+`--md [path]` writes the comparison to a file — and if you don't pass the flag,
+pre-flight offers the export at the end anyway (default No):
+
+```sh
+./plugin_legal_entity_updates.js --preflight --all --md
+./plugin_legal_entity_updates.js --preflight 33 --md /tmp/provider-33.md
+```
+
+Without a path it writes `preflight-<namespace>-<YYYY-MM-DD>.md` in the working
+directory. The document leads with the **blocked roster** (the actionable part),
+then a per-provider field table, then the required-field and format rules with
+their source modules — so it stands on its own pasted into a ticket.
+
+Built from the comparison data, never from the terminal output: that carries ANSI
+escapes when stdout is a TTY, and its padding is meaningless in Markdown. Values
+containing `|` are escaped. `--summary` drops the per-provider tables and keeps the
+roster.
 
 Note the KSA `tax_number` is a *different identifier kind* — present-and-equal
 here is necessary but not sufficient, since the ZATCA TRN and the ES/IT NIF/PIVA

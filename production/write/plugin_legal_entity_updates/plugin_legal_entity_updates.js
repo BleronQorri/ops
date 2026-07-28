@@ -253,6 +253,33 @@ function requiredFieldsFor(countryCode) {
   return EINVOICING_REQUIRED[String(countryCode || "").toUpperCase()] || null;
 }
 
+// Presence is not the only bar. AccountingDocuments.Helpers.ValidationHelpers
+// enforces KSA *formats*, which a present-but-malformed value fails:
+//
+//   valid_ksa_crn?    — exactly 10 characters
+//   valid_ksa_tax_id? — ~r/^3\d{12}03$/ : 15 digits, starts "3", ends "03"
+//
+// Checked against the LEGAL ENTITY value, because that is what the onboarding path
+// reads; a malformed billing-info value is reported separately since migrate would
+// copy it forward.
+const EINVOICING_FORMATS = {
+  SA: {
+    company_registration_number: {
+      test: (v) => String(v).length === 10,
+      expected: "exactly 10 characters (valid_ksa_crn?)",
+    },
+    tax_number: {
+      test: (v) => /^3\d{12}03$/.test(String(v)),
+      expected: 'ZATCA TRN: 15 digits, starts "3", ends "03" (valid_ksa_tax_id?)',
+    },
+  },
+};
+
+function formatRuleFor(countryCode, field) {
+  const rules = EINVOICING_FORMATS[String(countryCode || "").toUpperCase()];
+  return (rules && rules[field]) || null;
+}
+
 // The provider_billing_informations columns the comparison needs, in the order
 // the query selects them.
 const PBI_COLUMNS = [
@@ -392,6 +419,10 @@ function parseArgs(argv) {
     // Reset mode: also soft-delete the orphaned legal entities. On by default —
     // leaving them live is what produced provider 33's duplicate.
     deleteLegalEntities: true,
+    // Pre-flight Markdown export. --md sets the flag; an optional value sets the
+    // path. Without the flag you're offered the export at the end anyway.
+    md: false,
+    mdPath: null,
     file: null,
     providerIds: null,
     help: false,
@@ -418,6 +449,11 @@ function parseArgs(argv) {
     } else if (a === "--all") opts.all = true;
     else if (a === "--detail") opts.detail = true;
     else if (a === "--summary") opts.detail = false;
+    else if (a === "--md" || a === "--markdown") {
+      opts.md = true;
+      // Optional value: only consume the next argv if it isn't another flag.
+      if (argv[i + 1] && !argv[i + 1].startsWith("-")) opts.mdPath = argv[++i];
+    }
     else if (a === "--migrate") opts.mode = "migrate";
     else if (a === "--guided" || a === "--guide") opts.mode = "guided";
     else if (a === "--reset") opts.mode = "reset";
@@ -465,14 +501,17 @@ Flags (each one just pre-answers a prompt):
                          comma/whitespace-separated mix; # starts a comment)
       --migrate          Run ${MIGRATE_TASK} on
                          ${MIGRATE_SERVICE}. Explicit provider list only.
-      --guided           Walk the WHOLE migration step by step, with each step
-                         defined. Runs each as its own invocation.
+      --guided           Walk the migration step by step (verify -> link -> verify),
+                         with each step defined. Runs each as its own invocation.
+                         Does NOT run migrate — that is a precondition.
       --reset            STAGING ONLY, DESTRUCTIVE. Undo the migration for a
                          provider so it can run again. Refuses production.
       --keep-legal-entities  reset without soft-deleting the legal entities
       --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (default true)
       --copy-tax-number      COPY_TAX_NUMBER=true (default false)
       --batch-size N         BATCH_SIZE=N (task default 100)
+      --md [path]        Export the comparison as Markdown. Offered as a prompt
+                         too. Default: preflight-<namespace>-<date>.md
       --detail           Per-provider field checklist (default when you name ids)
       --summary          One line per provider instead (default with --all)
       --preflight        READ-ONLY. Cross-check provider_billing_informations
@@ -1079,6 +1118,11 @@ function compareFields(providerId, billing, fields, countryCode) {
     const same = normalizeValue(pbiValue) === normalizeValue(leVal);
     const presence = pbiValue && leVal ? "both" : pbiValue ? "provider only" : leVal ? "legal entity only" : "neither";
 
+    // Format, not just presence — a present-but-malformed value still fails.
+    const rule = formatRuleFor(countryCode, spec.pbi);
+    const leBadFormat = Boolean(rule && leVal && !rule.test(leVal));
+    const pbiBadFormat = Boolean(rule && pbiValue && !rule.test(pbiValue));
+
     rows.push({
       label: spec.label,
       pbi: pbiValue,
@@ -1091,19 +1135,26 @@ function compareFields(providerId, billing, fields, countryCode) {
       informational: Boolean(spec.informational) && !isRequired,
       same,
       presence,
-      // Missing a REQUIRED field on the legal-entity side is what actually breaks
-      // e-invoicing: the accounting-documents validator returns
-      // {:error, :missing_required_fields} and onboarding/send stops.
-      blocking: isRequired && !leVal,
-      note: same
-        ? ""
-        : isRequired && !leVal
-          ? "REQUIRED by e-invoicing — missing in legal entity"
-          : !pbiValue
-            ? "missing in billing info"
-            : !leVal
-              ? "missing in legal entity"
-              : "differs",
+      rule,
+      leBadFormat,
+      pbiBadFormat,
+      // What actually breaks e-invoicing: a REQUIRED field missing from the legal
+      // entity ({:error, :missing_required_fields}), or one present but in a shape
+      // ValidationHelpers rejects.
+      blocking: (isRequired && !leVal) || leBadFormat,
+      note: leBadFormat
+        ? `INVALID FORMAT in legal entity — ${rule.expected}`
+        : same
+          ? pbiBadFormat
+            ? `both sides invalid — ${rule.expected}`
+            : ""
+          : isRequired && !leVal
+            ? "REQUIRED by e-invoicing — missing in legal entity"
+            : !pbiValue
+              ? "missing in billing info"
+              : !leVal
+                ? "missing in legal entity"
+                : "differs",
     });
   }
 
@@ -1124,6 +1175,7 @@ function compareFields(providerId, billing, fields, countryCode) {
 // printFieldComparison's tables only surface what disagrees.
 function printProviderFieldTable(cmp) {
   const mark = (row) => {
+    if (row.leBadFormat) return `${c.bad("⛔ INVALID FORMAT")}`;
     if (row.blocking) return `${c.bad("⛔ BLOCKS e-invoicing")}`;
     if (row.informational) return `${c.faint("provider only")}`;
     if (row.same) return `${c.ok("✅")} both`;
@@ -1173,8 +1225,8 @@ function printProviderFieldTable(cmp) {
   if (cmp.blocking.length) {
     console.log(
       c.bad(
-        `  ⛔ ${cmp.blocking.length} required field(s) missing from the legal entity: ` +
-          cmp.blocking.map((r) => r.label).join(", ")
+        `  ⛔ ${cmp.blocking.length} required field(s) unusable in the legal entity: ` +
+          cmp.blocking.map(blockingLabel).join(", ")
       )
     );
     console.log(
@@ -1197,7 +1249,11 @@ function printFieldComparison(comparisons) {
   const blockedSet = new Set(comparisons.filter((cmp) => cmp.blocking.length));
   const noBilling = comparisons.filter((cmp) => !cmp.billing && !blockedSet.has(cmp));
   const withDiffs = comparisons.filter((cmp) => cmp.billing && cmp.diffs.length);
-  const clean = comparisons.filter((cmp) => cmp.billing && !cmp.diffs.length);
+  // Blocked is never "clean", even when both sides agree — a value can match and
+  // still be malformed, which blocks onboarding just as hard as a missing one.
+  const clean = comparisons.filter(
+    (cmp) => cmp.billing && !cmp.diffs.length && !blockedSet.has(cmp)
+  );
 
   for (const cmp of clean) {
     const comparable = cmp.rows.filter((r) => !r.informational).length;
@@ -1250,7 +1306,7 @@ function printFieldComparison(comparisons) {
     for (const cmp of blocked) {
       console.log(
         `      provider=${cmp.providerId} [${cmp.countryCode}] — ` +
-          c.bad(cmp.blocking.map((r) => r.label).join(", ")) +
+          c.bad(cmp.blocking.map(blockingLabel).join(", ")) +
           (cmp.billing ? "" : c.faint("   (also has no billing row)"))
       );
     }
@@ -1732,6 +1788,199 @@ function printMigrateReadback(providerIds, before, after) {
   }
 
   return failures;
+}
+
+// --- markdown export ----------------------------------------------------------
+//
+// Built from the comparison objects, never from the rendered terminal output: that
+// carries ANSI escapes when stdout is a TTY, and its column padding is meaningless
+// in Markdown. No c.* helper may appear anywhere in this section.
+
+// A value can legitimately contain a pipe (a street, a legal name) — the same
+// reason parseRowsLoose exists. Escape it or the table silently gains a column.
+function mdCell(value, emptyAs = "—") {
+  return String(value === null || value === undefined || value === "" ? emptyAs : value)
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ");
+}
+
+function mdTable(headers, rows) {
+  return [
+    `| ${headers.join(" | ")} |`,
+    `|${headers.map(() => "---").join("|")}|`,
+    // Explicit arrow: Array#map would pass the index as mdCell's `emptyAs`.
+    ...rows.map((r) => `| ${r.map((cell) => mdCell(cell)).join(" | ")} |`),
+  ].join("\n");
+}
+
+// How a blocking row blocks — "missing" and "present but malformed" are different
+// problems and want different fixes, so never collapse them into one word.
+function blockingLabel(row) {
+  return row.leBadFormat ? `${row.label} (invalid format)` : `${row.label} (missing)`;
+}
+
+// Plain-text equivalents of the terminal symbols.
+function mdPresence(row) {
+  if (row.leBadFormat) return "⛔ **invalid format**";
+  if (row.blocking) return "⛔ **blocks e-invoicing**";
+  if (row.informational) return "provider only *(no LE counterpart)*";
+  if (row.same) return "✅ both";
+  if (row.presence === "both") return "❌ differs";
+  if (row.presence === "neither") return "❌ neither";
+  return `⚠ ${row.presence}`;
+}
+
+function buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail) {
+  const blocked = comparisons.filter((cmp) => cmp.blocking.length);
+  const failed = tally.differ > 0 || tally.blocked > 0;
+  const out = [];
+
+  out.push("# Pre-flight — provider billing informations vs legal entities");
+  out.push("");
+  out.push(
+    mdTable(
+      ["", ""],
+      [
+        ["namespace", opts.namespace],
+        ["generated", new Date().toISOString()],
+        ["providers compared", comparisons.length],
+        [
+          "verdict",
+          `**${failed ? "FAIL" : "PASS"}** — ${tally.blocked} blocked, ` +
+            `${tally.differ} differ, ${tally.clean} consistent` +
+            (missingLegalEntity ? `, ${missingLegalEntity} with no primary legal entity` : ""),
+        ],
+      ]
+    )
+  );
+
+  // Blocked first: it's the part someone has to act on.
+  out.push("");
+  out.push("## Blocked — required fields unusable in the legal entity");
+  out.push("");
+  if (blocked.length) {
+    out.push(
+      mdTable(
+        ["Provider", "Country", "Entity type", "Problem fields"],
+        blocked.map((cmp) => [
+          cmp.providerId,
+          cmp.countryCode,
+          cmp.entityType,
+          cmp.blocking.map(blockingLabel).join(", "),
+        ])
+      )
+    );
+    out.push("");
+    out.push(
+      "These providers will fail e-invoicing onboarding/send until the legal entity " +
+        "carries the fields above. `(missing)` means absent — " +
+        "`{:error, :missing_required_fields}`. `(invalid format)` means present but " +
+        "in a shape `ValidationHelpers` rejects."
+    );
+  } else {
+    out.push("None — every provider carries the fields its country requires.");
+  }
+
+  if (detail) {
+    for (const cmp of comparisons) {
+      const comparable = cmp.rows.filter((r) => !r.informational);
+      const matched = comparable.filter((r) => r.same).length;
+
+      out.push("");
+      out.push(`## provider=${cmp.providerId} (${cmp.entityType || "unknown"}, ${cmp.countryCode || "?"})`);
+      out.push("");
+      out.push(
+        `${matched}/${comparable.length} comparable fields agree` +
+          (cmp.required ? "" : " *(not an e-invoicing country — nothing required)*") +
+          "."
+      );
+      out.push("");
+      out.push(
+        mdTable(
+          ["Field", "Required?", "Provider billing (shedul)", "Legal entity (`fields` jsonb)", "Present?"],
+          cmp.rows.map((r) => [
+            r.label,
+            // Blank, not a dash: an unmarked row simply isn't required.
+            r.required ? "**yes**" : " ",
+            r.pbi,
+            r.le ? `\`${r.leKey}\` = ${r.le}` : r.leKey ? `\`${r.leKey}\` = ∅` : "—",
+            mdPresence(r),
+          ])
+        )
+      );
+    }
+  }
+
+  out.push("");
+  out.push('## Where "required" comes from');
+  out.push("");
+  out.push(
+    "Both validators fetch the legal entity via `GetLegalEntityInvoiceDetails` and " +
+      "hard-fail with `{:error, :missing_required_fields}`:"
+  );
+  out.push("");
+  out.push(
+    mdTable(
+      ["Field", "ES / IT", "KSA (SA)"],
+      [
+        ["`company_name`", "required", "not checked — taken from the request"],
+        ["`address` (street), `city`, `postal_code`, `state_province`", "required", "required"],
+        ["`tax_number`", "required — `TAX_IDENTIFICATION_NUMBER`", "required — `TAX_NUMBER` (ZATCA TRN)"],
+        ["`company_registration_number`", "—", "**required**"],
+        ["`building_number`, `district`", "—", "**required**"],
+        ["`country_code`", "not checked", "not checked"],
+      ]
+    )
+  );
+  out.push("");
+  out.push(
+    "- `SA` → `AccountingDocuments.EInvoicing.Comarch.LegalEntityBillingDetails` `@required_fields`\n" +
+      "- `ES` / `IT` → `AccountingDocuments.EInvoicing.Common.LegalEntityBillingDetails` `@required_fields`\n" +
+      "\n" +
+      "The country comes from `account_configurations.country_code` — that's what " +
+      "`BillingDetailsPolicy` dispatches on. Countries with no entry have no required set.\n" +
+      "\n" +
+      "The KSA `tax_number` is a *different identifier kind*, so present-and-equal here " +
+      "is necessary but not sufficient."
+  );
+
+  out.push("");
+  out.push("### KSA format rules");
+  out.push("");
+  out.push(
+    "Presence is not the only bar — `AccountingDocuments.Helpers.ValidationHelpers` " +
+      "also enforces shape, so a present-but-malformed value still fails:"
+  );
+  out.push("");
+  out.push(
+    mdTable(
+      ["Field", "Rule", "Source"],
+      [
+        ["`company_registration_number`", "exactly 10 characters", "`valid_ksa_crn?`"],
+        [
+          "`tax_number`",
+          "15 digits, starts `3`, ends `03` — `~r/^3\\d{12}03$/`",
+          "`valid_ksa_tax_id?`",
+        ],
+      ]
+    )
+  );
+
+  out.push("");
+  out.push(
+    `<sub>Generated by \`plugin_legal_entity_updates.js --preflight\` — read-only.</sub>`
+  );
+  out.push("");
+
+  return out.join("\n");
+}
+
+// Resolve the export path: --md with a value uses it, --md alone defaults to a
+// dated name in the working directory.
+function preflightMarkdownPath(opts) {
+  if (opts.mdPath) return path.resolve(opts.mdPath);
+  const day = new Date().toISOString().slice(0, 10);
+  return path.resolve(`preflight-${opts.namespace}-${day}.md`);
 }
 
 // --- audit (--verify) --------------------------------------------------------
@@ -2219,23 +2468,15 @@ async function confirmRun(opts) {
 // every step keeps its own gates (including re-approving its own data access,
 // which is the point: each step reads a different thing).
 //
-// Order is not arbitrary. migrate creates the legal entity; pre-flight can only
-// compare once one exists; link needs the primary pointer migrate sets;
-// post-flight can only confirm a link that link made.
+// The sequence is verify → link → verify. Order is not arbitrary: pre-flight can
+// only compare once a legal entity exists, and post-flight can only confirm a link
+// that link made.
+//
+// MIGRATE is a PRECONDITION of the walkthrough, not a step in it — it writes on the
+// first call with no dry run. It's described in the plan (GUIDED_ASIDES) so the
+// procedure is complete, but never offered for running here.
 
 const WORKFLOW_STEPS = [
-  {
-    key: "migrate",
-    flag: "--migrate",
-    title: "MIGRATE — create the legal entities",
-    writes: true,
-    what:
-      "Runs legal_entities_migration:migrate on partners-app. Per provider it classifies (billing_only / adyen_fresha_pay / checkout_fresha_pay), creates the legal entity from provider_billing_informations, assigns locations, and sets it as the provider's primary.",
-    why:
-      "Nothing else can work without it — there is no entity to compare against and no primary pointer to link to.",
-    watch:
-      "This task has NO dry run; it writes on the first call. It IS resumable, so an already-migrated provider is resumed rather than duplicated.",
-  },
   {
     key: "preflight",
     flag: "--preflight",
@@ -2273,18 +2514,35 @@ const WORKFLOW_STEPS = [
   },
 ];
 
-// Not part of the happy path: remedial, staging-only, and destructive.
-const GUIDED_REMEDIAL = {
-  key: "reset",
-  flag: "--reset",
-  title: "RESET — undo the migration so it can be re-run (STAGING ONLY)",
-  what:
-    "Clears the plugin link, primary pointer, location assignments and migration state, and soft-deletes the legal entities.",
-  why:
-    "The migration is resumable, so an already-migrated provider is never rebuilt. Clearing that state is the only way to force a genuine re-run.",
-  watch:
-    "A reset only helps if re-running produces something better — it will not if the migrator itself is dropping fields. Verify with pre-flight first.",
-};
+// Described in the plan so the whole procedure is written down, but never run by
+// the walkthrough. Migrate is deliberately excluded: it is the only step that
+// writes on the first call with no dry run, and with MIGRATE_PAYMENT_METHODS=true
+// it also migrates cards on file through an RPC. One keystroke away from a default
+// "Run it" is the wrong place for that — run it on its own, on purpose.
+const GUIDED_ASIDES = [
+  {
+    key: "migrate",
+    role: "PREREQUISITE — run separately, before this walkthrough",
+    title: "MIGRATE — create the legal entities",
+    what:
+      "Runs legal_entities_migration:migrate on partners-app. Per provider it classifies (billing_only / adyen_fresha_pay / checkout_fresha_pay), creates the legal entity from provider_billing_informations, assigns locations, and sets it as the provider's primary.",
+    why:
+      "This walkthrough assumes it has already happened — there has to be an entity to compare against and a primary pointer to link to. If it hasn't, pre-flight will tell you so: 'no active primary legal entity'.",
+    watch:
+      "Excluded from the sequence on purpose: NO dry run, it writes on the first call, and MIGRATE_PAYMENT_METHODS=true migrates cards via an RPC. Run it with `--migrate` when you mean to.",
+  },
+  {
+    key: "reset",
+    role: "REMEDIAL — staging only, destructive",
+    title: "RESET — undo the migration so it can be re-run",
+    what:
+      "Clears the plugin link, primary pointer, location assignments and migration state, and soft-deletes the legal entities.",
+    why:
+      "The migration is resumable, so an already-migrated provider is never rebuilt. Clearing that state is the only way to force a genuine re-run.",
+    watch:
+      "A reset only helps if re-running produces something better — it will not if the migrator itself is dropping fields. Verify with pre-flight first.",
+  },
+];
 
 // Reflow a definition to the terminal, with continuation lines aligned under the
 // first — the step text is stored unwrapped so it can be laid out for whichever
@@ -2327,11 +2585,14 @@ function printGuidedPlan(opts, providerIds) {
     console.log(c.warn(wrapText(step.watch, "watch: ", 5)));
   });
 
-  console.log(`\n  ${c.faint(`(remedial, not part of the sequence)`)}`);
-  console.log(`  ${c.head(GUIDED_REMEDIAL.title)}`);
-  console.log(wrapText(GUIDED_REMEDIAL.what, "what:  ", 5));
-  console.log(wrapText(GUIDED_REMEDIAL.why, "why:   ", 5));
-  console.log(c.warn(wrapText(GUIDED_REMEDIAL.watch, "watch: ", 5)));
+  console.log(c.faint("\n  ── Not run by this walkthrough ─────────────────────────"));
+  for (const aside of GUIDED_ASIDES) {
+    console.log(`\n  ${c.warn(aside.role)}`);
+    console.log(`  ${c.head(aside.title)}`);
+    console.log(wrapText(aside.what, "what:  ", 5));
+    console.log(wrapText(aside.why, "why:   ", 5));
+    console.log(c.warn(wrapText(aside.watch, "watch: ", 5)));
+  }
 
   console.log(
     c.faint(
@@ -2725,8 +2986,28 @@ async function main() {
     }
 
     const tally = printFieldComparison(comparisons);
+    const failed = printPreflightVerdict(tally, missingLegalEntity);
 
-    if (printPreflightVerdict(tally, missingLegalEntity)) process.exitCode = 1;
+    // Export. --md writes without asking; otherwise it's offered, because a flag
+    // nobody remembers is a flag that doesn't exist.
+    let wantMd = opts.md;
+    if (!wantMd && !opts.json) {
+      const answer = (await ask("\n  Export this comparison as Markdown? (y/N): "))
+        .trim()
+        .toLowerCase();
+      wantMd = answer === "y" || answer === "yes";
+    }
+
+    if (wantMd) {
+      const target = preflightMarkdownPath(opts);
+      fs.writeFileSync(
+        target,
+        buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail)
+      );
+      console.log(`  ${c.ok("✓")} written: ${target}`);
+    }
+
+    if (failed) process.exitCode = 1;
     return;
   }
 

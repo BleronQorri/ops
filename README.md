@@ -16,7 +16,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 **write**
 - **process_missing_sales** — backfills invoices/credit notes for sales that never produced one (export → S3 → Houston task). Step-gated.
 - **retry_invoices** — re-drives stuck KSA e-invoices: flips tracker statuses retry-eligible, then force-retries sending.
-- **plugin_legal_entity_updates** — four modes, picked at the first prompt: **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed), and **reset** (⚠️ _staging only, destructive_ — undoes the migration for a provider so it can be re-run). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
+- **plugin_legal_entity_updates** — six modes, picked at the first prompt (**guided** walks the sequence with every step defined — start there): **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed), and **reset** (⚠️ _staging only, destructive_ — undoes the migration for a provider so it can be re-run). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
 
 ### `staging/` — non-prod
 
@@ -101,7 +101,12 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #   5. dry run or apply — asked after the resolution report is on screen
 #   6. approve the run  — non-prod one "yes"; PRODUCTION: type the namespace back, then "yes"
 #
-# FOUR MODES — workflow order is migrate → pre-flight → link → post-flight:
+# SIX MODES — workflow order is migrate → pre-flight → link → post-flight.
+#   guided       Walks pre-flight → link → post-flight, printing what each step is,
+#                why it exists and what to watch for, then running them one at a time
+#                as separate invocations. Does NOT run migrate (a precondition: no dry
+#                run, and an RPC side effect) or reset — both are described, not run.
+#   reset        STAGING ONLY, destructive. Undoes the migration for a provider.
 #   migrate      Runs `legal_entities_migration:migrate` on the partners-app service
 #                to CREATE each provider's legal entity and set it primary. Explicit
 #                provider list only (no --all). This task has NO dry run, so a
@@ -134,12 +139,16 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 # Flags just pre-answer a prompt — all optional:
 #   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
 #       --all              every provider in account_configurations
-#       --guided           walk the WHOLE migration step by step, each step defined
+#       --guided           walk pre-flight -> link -> post-flight, each step defined.
+#                          Does NOT run migrate (precondition: no dry run, RPC side effect)
 #       --migrate          create legal entities (partners-app); explicit ids only
 #       --reset            STAGING ONLY, destructive: undo the migration for a provider
 #                          so it can be re-run. Refuses production. Per-provider confirm.
 #       --no-payment-methods / --copy-tax-number / --batch-size N   migrate params
-#       --preflight        read-only: billing info vs legal entity, PASS/FAIL
+#       --preflight        read-only: billing info vs legal entity + per-country REQUIRED
+#                          set and KSA format rules (CRN 10 chars, TRN ^3\d{12}03$)
+#       --md [path]        export the pre-flight comparison as Markdown (offered as a
+#                          prompt too); default preflight-<ns>-<date>.md
 #       --detail / --summary   force the per-provider field checklist on/off
 #                          (default: on when you name providers, off for --all)
 #       --postflight       read-only: link state, PASS/FAIL (--verify is an alias)
