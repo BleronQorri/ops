@@ -36,14 +36,19 @@ the script's own `AGENTS.md`.
 | Script | Run | Env | What it does |
 |--------|-----|-----|--------------|
 | [deregister_suppliers](staging/write/deregister_suppliers/) | `./deregister_suppliers.exs [--dry-run]` | Invopop sandbox | Fire Invopop supplier-deregistration workflow — one Transform job per supplier in a workspace. Refuses non-sandbox tokens. |
-| [confirm_sent_uat](staging/write/confirm_sent_uat/) | `./confirm_sent_uat.js` | Comarch UAT | Process Comarch UAT queue — confirms "sent" (`POST …/status/sent/confirm`) for invoice / onboarding queues via the edoc-online UAT REST API. |
+| [confirm_sent_uat](staging/write/confirm_sent_uat/) | `./confirm_sent_uat.js` | Comarch UAT | Process Comarch UAT queue — confirms "sent" (`POST …/status/sent/confirm`) for invoice / onboarding / aperak queues via the edoc-online UAT REST API. |
 | [clear_provider_einvoicing](staging/write/clear_provider_einvoicing/) | `./clear_provider_einvoicing.js <provider_id>` | staging DB | Wipe ALL of a provider's e-invoicing data (account_configurations + plugins + accounting_documents + trackers + logs, FK order, one transaction) via `houston psql --write`. Refuses production. |
 
 ## Danger tiers
 
 - **Read-only:** `invopop_supplier_check`, `onboard_location_scripts`,
-  `plugin_legal_entity_updates` in **pre-flight** or **post-flight** mode
-  (SELECTs only — cannot write at all), plus any dry-run path.
+  `plugin_legal_entity_updates` in **pre-flight**, **post-flight** or **plugin
+  audit** mode (SELECTs only — cannot write at all), plus any dry-run path.
+  These three are the only `plugin_legal_entity_updates` modes you can run
+  yourself: `--yes` lifts its TTY requirement for them and for `--link
+  --dry-run`, and `--json` gives you a result document instead of tables —
+  `--postflight --all --json --yes`. Everything that writes still refuses
+  without a terminal, in every namespace, and no flag overrides that.
 - **Prod writes (gated, reversible-ish):** `process_missing_sales`, `retry_invoices`,
   `plugin_legal_entity_updates` in **link** mode (dry run by default; requires a
   TTY; three confirmations on a prod apply).

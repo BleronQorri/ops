@@ -395,6 +395,26 @@ function echoSql(label, sql) {
   for (const line of shown.split("\n")) promptStream.write(`    ${c.sql(line)}\n`);
 }
 
+// --- exit codes ------------------------------------------------------------
+//
+// Three outcomes, kept distinct so a caller can branch on them. Before this the
+// script exited 1 for everything, which made "the data is wrong" and "you
+// mistyped a flag" indistinguishable — fine for a human reading the message,
+// useless to anything driving the script.
+const EXIT_DATA = 1; // drift, mismatch, a row that didn't land
+const EXIT_USAGE = 2; // the call was wrong, or approval was impossible
+
+// Thrown for anything wrong with the invocation itself: an unknown flag, a flag
+// missing its value, or an approval that could not be obtained. Carries the exit
+// code so the top-level handler doesn't have to guess.
+class UsageError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UsageError";
+    this.exitCode = EXIT_USAGE;
+  }
+}
+
 // --- arg parsing -----------------------------------------------------------
 
 function parseArgs(argv) {
@@ -403,6 +423,7 @@ function parseArgs(argv) {
     service: DEFAULT_SERVICE,
     apply: false,
     json: false,
+    yes: false,
     printOnly: false,
     all: false,
     // "preflight" | "postflight" | "link" | "migrate" — null until chosen.
@@ -422,35 +443,144 @@ function parseArgs(argv) {
     // Pre-flight Markdown export. --md sets the flag; an optional value sets the
     // path. Without the flag you're offered the export at the end anyway.
     md: false,
+    // --md PATH overrides the dated default name.
+    mdPath: null,
     file: null,
     providerIds: null,
     help: false,
     // Track what was supplied so the interactive flow only asks for the rest.
+    // Every flag that a prompt would otherwise overwrite needs one of these:
+    // without it, passing the flag and then being asked anyway is worse than
+    // having no flag at all.
     namespaceGiven: false,
     modeGiven: false,
+    applyGiven: false,
+    migratePaymentMethodsGiven: false,
+    deleteLegalEntitiesGiven: false,
   };
-  // NO FLAGS. This script is interactive: every choice is a prompt, so there is
-  // nothing to remember and nothing to get wrong on a command line. Only --help
-  // and bare provider IDs are accepted.
+  // Every flag is optional and only pre-answers a prompt: run the script bare and
+  // it still asks you everything, in order. Flags exist so a non-human caller can
+  // answer in advance — and so a human who already knows what they want can skip
+  // ahead. See --yes for the one thing flags alone cannot buy: approval.
   //
-  // Guided runs each step as a child process. It passes the step, namespace and
-  // provider list through the environment variables below rather than flags —
-  // internal plumbing, not a user interface. Set them by hand and you are simply
-  // pre-answering prompts; nothing validates that you meant to.
+  // Mode selectors. --verify is a long-standing alias for --postflight.
+  const MODES = {
+    "--guided": "guided",
+    "--migrate": "migrate",
+    "--preflight": "preflight",
+    "--postflight": "postflight",
+    "--verify": "postflight",
+    "--link": "link",
+    "--plugins": "plugins",
+    "--reset": "reset",
+  };
+
   const rest = [];
-  for (const a of argv) {
-    if (a === "--help" || a === "-h") {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+
+    // Consume the next token as this flag's value. Rejects a missing value and a
+    // following flag, so `-n --json` is an error rather than a namespace of
+    // "--json".
+    const value = () => {
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith("-")) {
+        throw new UsageError(`Option "${a}" needs a value.`);
+      }
+      i++;
+      return v;
+    };
+
+    if (a === "-h" || a === "--help") {
       opts.help = true;
+    } else if (MODES[a]) {
+      opts.mode = MODES[a];
+      opts.modeGiven = true;
+    } else if (a === "-n" || a === "--namespace") {
+      opts.namespace = value();
+      opts.namespaceGiven = true;
+    } else if (a === "-s" || a === "--service") {
+      opts.service = value();
+    } else if (a === "-f" || a === "--file") {
+      opts.file = value();
+    } else if (a === "--all") {
+      opts.all = true;
+    } else if (a === "--apply") {
+      opts.apply = true;
+      opts.applyGiven = true;
+    } else if (a === "--dry-run") {
+      opts.apply = false;
+      opts.applyGiven = true;
+    } else if (a === "--print-only") {
+      opts.printOnly = true;
+    } else if (a === "--json") {
+      opts.json = true;
+    } else if (a === "--yes") {
+      opts.yes = true;
+    } else if (a === "--detail") {
+      opts.detail = true;
+    } else if (a === "--summary") {
+      opts.detail = false;
+    } else if (a === "--md") {
+      opts.md = true;
+      // The path is optional, which makes `--md 33` ambiguous: a file name or a
+      // provider list? Anything that is only digits, commas and spaces is a
+      // provider list, so it stays in `rest` and --md keeps its dated default.
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("-") && !/^[\d,\s]+$/.test(next)) {
+        opts.mdPath = argv[++i];
+      }
+    } else if (a === "--no-payment-methods") {
+      opts.migratePaymentMethods = false;
+      opts.migratePaymentMethodsGiven = true;
+    } else if (a === "--copy-tax-number") {
+      opts.copyTaxNumber = true;
+    } else if (a === "--batch-size") {
+      const raw = value();
+      if (!/^\d+$/.test(raw)) throw new UsageError(`--batch-size needs a number, got "${raw}".`);
+      opts.batchSize = Number(raw);
+    } else if (a === "--keep-legal-entities") {
+      opts.deleteLegalEntities = false;
+      opts.deleteLegalEntitiesGiven = true;
     } else if (a.startsWith("-")) {
-      throw new Error(
-        `Unknown option "${a}". This script takes no flags — it asks you everything.\n` +
-          "  Run it with no arguments, or with provider IDs: ./plugin_legal_entity_updates.js 33,41"
+      throw new UsageError(
+        `Unknown option "${a}".\n` +
+          "  Run with --help for the full list, or with no flags at all to be asked instead."
       );
     } else {
       rest.push(a);
     }
   }
   if (rest.length) opts.providerIds = rest.join(",");
+
+  // --file is just another way to supply the provider list; parseProviderIds
+  // already strips `#` comments so the file can be annotated.
+  if (opts.file) {
+    let raw;
+    try {
+      raw = fs.readFileSync(opts.file, "utf8");
+    } catch (err) {
+      throw new UsageError(`Cannot read --file ${opts.file}: ${err.message}`);
+    }
+    // parseProviderIds throws a plain Error on an empty or malformed list; coming
+    // from --file that is a bad invocation, not bad data, so it exits 2 like every
+    // other argument problem.
+    let fromFile;
+    try {
+      fromFile = parseProviderIds(raw);
+    } catch (err) {
+      throw new UsageError(`--file ${opts.file}: ${err.message}`);
+    }
+    // Arguments win over the file, and both are merged rather than one silently
+    // replacing the other.
+    opts.providerIds = [...new Set([...(opts.providerIds ? [opts.providerIds] : []), ...fromFile])]
+      .join(",");
+  }
+
+  // Guided runs each step as a child process. It passes the step, namespace and
+  // provider list through the environment variables below rather than flags —
+  // internal plumbing, not a user interface. Set them by hand and you are simply
+  // pre-answering prompts; nothing validates that you meant to.
 
   // Guided → child handoff.
   if (process.env.PLE_STEP) opts.mode = process.env.PLE_STEP;
@@ -460,6 +590,16 @@ function parseArgs(argv) {
   }
   if (process.env.PLE_PROVIDERS) opts.providerIds = process.env.PLE_PROVIDERS;
 
+  // Migrate and reset take an explicit provider list and nothing else. "Every
+  // provider with an account configuration" is the wrong set for a migration and
+  // catastrophic for a reset, so --all is rejected outright rather than ignored.
+  if (opts.all && (opts.mode === "migrate" || opts.mode === "reset")) {
+    throw new UsageError(
+      `--all is not allowed with --${opts.mode === "migrate" ? "migrate" : "reset"}.\n` +
+        "  Name the providers explicitly: this mode writes, and a stray --all would hit everything."
+    );
+  }
+
   return opts;
 }
 
@@ -467,10 +607,10 @@ function usage() {
   console.log(`plugin_legal_entity_updates — providers ↔ primary legal entities
 
 Usage:
-  ./plugin_legal_entity_updates.js [PROVIDER_IDS]
+  ./plugin_legal_entity_updates.js [FLAGS] [PROVIDER_IDS]
 
-THERE ARE NO FLAGS. The script asks you everything, in order, so there is nothing
-to remember and nothing to mistype. Just run it:
+Run it bare and it asks you everything, in order — nothing to remember. Every
+flag below is optional and simply pre-answers one of those questions:
 
   ./plugin_legal_entity_updates.js
 
@@ -480,11 +620,58 @@ Arguments:
                  option where that makes sense.
   -h, --help     This help.
 
-REQUIRES A TERMINAL. If stdin is not a TTY the script refuses before touching
-anything — a piped "yes" is not explicit approval, so cron/CI cannot drive it.
-There is deliberately no --force.
+FLAGS
+  Target
+    -n, --namespace NAME   namespace / env; drives the psql env AND the task's
+                           --namespace. Default ${DEFAULT_NAMESPACE}.
+    -s, --service NAME     Houston service. Default ${DEFAULT_SERVICE}.
+  Providers
+        --all              every provider in account_configurations. Rejected by
+                           migrate and reset — they need an explicit list.
+    -f, --file PATH        read provider IDs from a file ("#" starts a comment)
+  Mode (any of these skips the mode prompt)
+        --guided           the whole procedure, step by step
+        --migrate          create the legal entities (partners-app)
+        --preflight        READ-ONLY: billing info vs the PRIMARY legal entity
+        --postflight       READ-ONLY: is every plugin linked? (--verify is an alias)
+        --link             run ${TASK}
+        --plugins          READ-ONLY: billing info vs each PLUGIN's legal entity
+        --reset            STAGING ONLY, destructive: undo the migration
+  Link
+        --apply            DRY_RUN="false" — actually write
+        --dry-run          DRY_RUN="true" — logs only (the default)
+        --print-only       print the command and stop; run nothing
+  Migrate
+        --no-payment-methods   MIGRATE_PAYMENT_METHODS=false (defaults to true,
+                               which migrates cards on file through an RPC)
+        --copy-tax-number      COPY_TAX_NUMBER=true
+        --batch-size N         BATCH_SIZE=N
+  Reset
+        --keep-legal-entities  don't soft-delete the orphaned legal entities
+  Reporting
+        --md [PATH]        write the report as Markdown; default
+                           preflight-<namespace>-<YYYY-MM-DD>.md
+        --detail           force the per-provider field checklist on
+        --summary          force it off (default: on unless --all)
+  Non-interactive
+        --json             emit one result document on stdout; every human-readable
+                           line goes to stderr instead. Exit code is in "exit".
+        --yes              run without a terminal. READ-ONLY MODES ONLY —
+                           see below.
 
-WHAT IT ASKS, IN ORDER
+WRITES STILL REQUIRE A TERMINAL. --yes covers the modes that only issue SELECTs:
+pre-flight, post-flight, plugin audit, and link with --dry-run. Every write path
+(--link --apply, --migrate, --reset) refuses without a TTY in every namespace,
+production or not, and --yes never answers a write confirmation. Exit ${EXIT_USAGE}.
+
+EXIT CODES
+  0   pass, or nothing to do
+  ${EXIT_DATA}   the data is wrong — drift, a mismatch, a row that didn't land, or a
+      pre-flight that could compare nothing at all (no primary legal entity
+      for any provider given: run migrate first)
+  ${EXIT_USAGE}   the call is wrong — bad flag, or approval was impossible
+
+WHAT IT ASKS, IN ORDER (for anything a flag didn't already answer)
   1. Which mode          grouped into MIGRATION / REPORTING / STAGING ONLY, each
                          option tagged with its stage and what it does.
   2. Which environment   staging (${DEFAULT_NAMESPACE}), production, or any namespace.
@@ -598,6 +785,81 @@ const waitingAskers = []; // resolvers parked until the next line shows up
 // Where prompts are written. --json keeps stdout pure for the payload, so its
 // gate has to talk on stderr instead. Set once, before the first ask().
 let promptStream = output;
+
+// --- json output -------------------------------------------------------------
+//
+// The contract: with --json, stdout carries exactly one JSON document and
+// nothing else; every line a human would read goes to stderr. One run therefore
+// gives you both — `2>/dev/null | jq .` for the data, `1>/dev/null` for the
+// report — instead of forcing a choice between them.
+//
+// Rerouting `console` once, here, is deliberate. The alternative is threading a
+// stream through ~200 call sites, where one missed call silently corrupts the
+// payload and the corruption only shows up in whatever is parsing it.
+
+let jsonMode = false;
+
+function startJsonMode() {
+  jsonMode = true;
+  promptStream = process.stderr;
+  const toStderr = (...args) => process.stderr.write(`${args.join(" ")}\n`);
+  console.log = toStderr;
+  console.info = toStderr;
+  // console.error and console.warn already write to stderr.
+}
+
+// The common envelope. `exit` mirrors process.exitCode, so a caller reading the
+// document never has to also check $?, and the two can never disagree — which is
+// why this is called after the exit code has been decided, not before.
+function emitJson(opts, body) {
+  if (!jsonMode) return;
+  const doc = {
+    schema_version: 1,
+    mode: opts.mode,
+    namespace: opts.namespace,
+    service: opts.service,
+    exit: process.exitCode || 0,
+    ...body,
+  };
+  process.stdout.write(`${JSON.stringify(doc, null, 2)}\n`);
+}
+
+const verdictOf = (failed) => (failed ? "FAIL" : "PASS");
+
+// Field rows, built from the comparison structures rather than the rendered
+// tables: those carry ANSI escapes and column padding, and a value that has been
+// through a formatter is no longer the value. `rule` is dropped to its expected
+// form — it holds a RegExp, which JSON.stringify would flatten to {}.
+function jsonFieldRows(rows) {
+  return rows.map((r) => ({
+    field: r.label,
+    billing_info: r.pbi || null,
+    legal_entity: r.le || null,
+    legal_entity_key: r.leKey || null,
+    same: Boolean(r.same),
+    required: Boolean(r.required),
+    blocking: Boolean(r.blocking),
+    informational: Boolean(r.informational),
+    invalid_format: r.leBadFormat ? "legal_entity" : r.pbiBadFormat ? "billing_info" : null,
+    expected_format: r.rule ? r.rule.expected : null,
+    note: r.note || null,
+  }));
+}
+
+// One entry per comparison — shared by pre-flight and the plugin audit, which
+// compare the same fields against a different legal entity.
+function jsonComparison(cmp) {
+  return {
+    provider_id: cmp.providerId,
+    country_code: cmp.countryCode || null,
+    entity_type: cmp.entityType || null,
+    required_fields: cmp.required || [],
+    blocking: cmp.blocking.map((r) => r.label),
+    differs: cmp.diffs.map((r) => r.label),
+    status: cmp.blocking.length ? "blocked" : cmp.diffs.length ? "differs" : "clean",
+    fields: jsonFieldRows(cmp.rows),
+  };
+}
 
 function ensureRl() {
   if (rl) return rl;
@@ -1205,7 +1467,53 @@ function printProviderFieldTable(cmp, heading) {
   }
 }
 
-function printFieldComparison(comparisons) {
+// One banner, two states. In a helper so the dead-end block in pre-flight and
+// printPreflightVerdict below cannot drift apart visually.
+const verdictBanner = (failed) =>
+  failed
+    ? c.bad("\n══ PRE-FLIGHT: FAIL ════════════════════════════════════")
+    : c.ok("\n══ PRE-FLIGHT: PASS ════════════════════════════════════");
+
+// The providers pre-flight could not check at all. Red, not yellow: a provider
+// with no primary legal entity was never compared against anything, and saying so
+// quietly next to a green PASS reads as approval of data nobody looked at.
+//
+// `hasBilling` picks the fix line, and the two cases are genuinely different.
+// migrate builds the legal entity FROM provider_billing_informations, so a
+// provider that has that row is simply waiting for migrate to run; one that
+// doesn't gives migrate nothing to build from, and stays stuck until someone puts
+// billing details on the provider.
+//
+// ⊘ and not ⛔: ⛔ already means "legal entity missing REQUIRED e-invoicing
+// fields", which is a different problem with a different fix.
+function printNoPrimaryLegalEntity(missing) {
+  if (!missing.length) return;
+
+  const n = missing.length;
+  console.log(
+    c.bad(
+      `\n  ⊘ ${n === 1 ? "1 provider was" : `${n} providers were`} NOT checked — ` +
+        "no active primary legal entity:"
+    )
+  );
+
+  for (const { providerId, hasBilling } of missing) {
+    console.log(
+      wrapText(
+        hasBilling
+          ? "billing details are present, so migrate has not run yet. " +
+              `Fix: run migrate for provider ${providerId}, then re-run pre-flight.`
+          : "no active provider_billing_informations row either, so migrate would " +
+              "have nothing to build an entity from. Fix: get billing details onto " +
+              "the provider first.",
+        `provider=${providerId} — `,
+        6
+      )
+    );
+  }
+}
+
+function printFieldComparison(comparisons, missing = []) {
   console.log(
     c.head("\n── Field comparison (provider_billing_informations ↔ legal entity) ──")
   );
@@ -1260,7 +1568,11 @@ function printFieldComparison(comparisons) {
     `\n  ${c.ok(`✓ ${clean.length} consistent`)}   ` +
       `${c.faint(`– ${noBilling.length} no billing row`)}   ` +
       `${withDiffs.length ? c.bad(`✗ ${withDiffs.length} differ`) : `✗ 0 differ`}   ` +
-      `${blockedSet.size ? c.bad(`⛔ ${blockedSet.size} blocked`) : `⛔ 0 blocked`}`
+      `${blockedSet.size ? c.bad(`⛔ ${blockedSet.size} blocked`) : `⛔ 0 blocked`}` +
+      // Not part of the comparison — these providers had nothing to compare. Shown
+      // on the same line because this is where you count the run up, and a provider
+      // that was silently never checked belongs in that count.
+      (missing.length ? `   ${c.bad(`⊘ ${missing.length} no primary legal entity`)}` : "")
   );
 
   const blocked = [...blockedSet];
@@ -1299,18 +1611,21 @@ function printFieldComparison(comparisons) {
 // disagreeing about a legal name or a tax number is precisely what you want to
 // know before linking anything.
 //
-// Missing rows are warnings, not failures — a provider with no billing info or
-// no primary legal entity has nothing to be inconsistent about. Those are gaps
-// to notice, not contradictions.
-function printPreflightVerdict(tally, missingLegalEntity) {
+// Missing rows don't decide the verdict here — a provider with no billing info or
+// no primary legal entity has nothing to be inconsistent about, so it can't
+// contradict anything. It is still reported, and a provider with no primary legal
+// entity is reported in RED: it was not checked at all, which is a worse thing to
+// overlook than a difference you can see in a table.
+//
+// The one place that rule flips is a run where NOTHING was comparable — see the
+// dead-end block in pre-flight, which fails outright. The asymmetry is deliberate:
+// "some providers checked and consistent" is a real pass, while "nothing checked"
+// is a pre-flight that never happened. A bulk --all sweep legitimately contains
+// plenty of un-migrated providers and must not be permanently red.
+function printPreflightVerdict(tally, missing) {
   const failed = tally.differ > 0 || tally.blocked > 0;
-  const warnings = tally.noBilling + missingLegalEntity;
 
-  console.log(
-    failed
-      ? c.bad("\n══ PRE-FLIGHT: FAIL ════════════════════════════════════")
-      : c.ok("\n══ PRE-FLIGHT: PASS ════════════════════════════════════")
-  );
+  console.log(verdictBanner(failed));
 
   if (failed) {
     if (tally.blocked) {
@@ -1329,13 +1644,19 @@ function printPreflightVerdict(tally, missingLegalEntity) {
     );
   }
 
-  if (warnings) {
+  if (tally.noBilling) {
     console.log(
-      `  ${c.warn("⚠")} ${warnings} skipped: ` +
-        `${tally.noBilling} with no billing row, ` +
-        `${missingLegalEntity} with no primary legal entity.` +
+      `  ${c.warn("⚠")} ${tally.noBilling} provider(s) skipped — no billing row.` +
         c.faint("  (Nothing to compare — not counted as a failure.)")
     );
+  }
+
+  if (missing.length) {
+    console.log(
+      `  ${c.bad("⊘")} ${missing.length} provider(s) NOT checked at all — no primary ` +
+        "legal entity."
+    );
+    console.log(c.faint("    Nothing to link for those; run migrate first — listed above."));
   }
 
   console.log(c.faint("\n  Read-only: this mode issues SELECTs and nothing else."));
@@ -2148,7 +2469,7 @@ function buildPreflightMarkdown(
   opts,
   comparisons,
   tally,
-  missingLegalEntity,
+  missing,
   detail,
   title,
   kycRows
@@ -2170,7 +2491,7 @@ function buildPreflightMarkdown(
           "verdict",
           `**${failed ? "FAIL" : "PASS"}** — ${tally.blocked} blocked, ` +
             `${tally.differ} differ, ${tally.clean} consistent` +
-            (missingLegalEntity ? `, ${missingLegalEntity} with no primary legal entity` : ""),
+            (missing.length ? `, ${missing.length} not checked` : ""),
         ],
       ]
     )
@@ -2201,6 +2522,32 @@ function buildPreflightMarkdown(
     );
   } else {
     out.push("None — every provider carries the fields its country requires.");
+  }
+
+  // Only when there is something to report — the plugin audit passes [] here, and
+  // an empty section would read as a claim that every provider was checked.
+  if (missing.length) {
+    out.push("");
+    out.push("## Not checked — no active primary legal entity");
+    out.push("");
+    out.push(
+      mdTable(
+        ["Provider", "Billing details", "Fix"],
+        missing.map(({ providerId, hasBilling }) => [
+          providerId,
+          hasBilling ? "present" : "**none**",
+          hasBilling
+            ? "migrate has not run yet — run it, then re-run pre-flight"
+            : "migrate has nothing to build an entity from — add billing details first",
+        ])
+      )
+    );
+    out.push("");
+    out.push(
+      "These providers were compared against nothing. No row with `valid_to IS NULL` " +
+        "in `provider_purchases_primary_legal_entities`, so there is no entity to " +
+        "check and nothing for `link` to link."
+    );
   }
 
   if (detail) {
@@ -2342,6 +2689,8 @@ function buildPreflightMarkdown(
 // Resolve the export path: --md with a value uses it, --md alone defaults to a
 // dated name in the working directory.
 function preflightMarkdownPath(opts) {
+  // --md PATH wins; --md on its own gets the dated default.
+  if (opts.mdPath) return path.resolve(opts.mdPath);
   const day = new Date().toISOString().slice(0, 10);
   return path.resolve(`preflight-${opts.namespace}-${day}.md`);
 }
@@ -2845,20 +3194,53 @@ async function askProviderIds(env) {
   throw new Error("No valid provider IDs given.");
 }
 
-// Approval must come from a human at a keyboard. Piped stdin is refused outright
-// rather than allowed to answer the gates: a "yes" arriving down a pipe is an
-// automated approval, which is exactly what these gates exist to prevent. This
-// also rules out cron/CI driving the script by accident.
+// Approval for a WRITE must come from a human at a keyboard. A "yes" arriving
+// down a pipe is an automated approval, which is exactly what these gates exist
+// to prevent, so no flag can supply one — --yes is not --force.
 //
-// There is deliberately no --force/--yes escape hatch. Tests allocate a real pty
-// (`script -q /dev/null …`) instead of piping.
-function requireInteractive() {
+// What --yes does buy is the read-only half of the script. Pre-flight,
+// post-flight and the plugin audit issue SELECTs and cannot write under any
+// combination of flags; link with a dry run runs the task with DRY_RUN=true.
+// Refusing those without a TTY bought no safety and made the script unusable by
+// anything except a person, which is why they now have a door.
+//
+// The boundary is deliberately drawn at "can this mode write?", not at "is this
+// production?": a read-only mode is safe in prod, and a write is not safe in
+// staging just because it is staging.
+const READ_ONLY_MODES = new Set(["preflight", "postflight", "plugins"]);
+
+function writesAnything(opts) {
+  if (READ_ONLY_MODES.has(opts.mode)) return false;
+  // Link only writes on an apply. Guided is treated as writing: it is a
+  // run/skip/stop walkthrough that spawns link, so it needs a human regardless.
+  if (opts.mode === "link") return opts.apply;
+  return true;
+}
+
+function requireInteractive(opts) {
   if (input.isTTY) return;
 
-  throw new Error(
-    "Refusing to touch real data without an interactive terminal.\n" +
-      "  stdin is not a TTY, so approval could only come from a pipe or a script —\n" +
-      "  and a piped \"yes\" is not explicit approval. Run this from a terminal.\n" +
+  if (opts.yes && !writesAnything(opts)) return;
+
+  const why = !opts.yes
+    ? "stdin is not a TTY, so approval could only come from a pipe or a script —\n" +
+      '  and a piped "yes" is not explicit approval.'
+    : opts.mode === "guided"
+      ? // Guided runs nothing itself, so this is not about writing: it is a
+        // run/skip/stop walkthrough, which needs someone to do the choosing.
+        "guided is a walkthrough — it asks at every step which is why it needs a\n" +
+        "  terminal. Run its steps directly instead: --preflight, then --link, then --postflight."
+      : `--yes covers read-only modes only, and "${opts.mode}"` +
+        (opts.mode === "link" ? " with --apply writes." : " writes.");
+
+  const what =
+    opts.mode === "guided" ? "run guided" : writesAnything(opts) ? "write" : "touch real data";
+
+  throw new UsageError(
+    `Refusing to ${what} without an interactive terminal.\n` +
+      `  ${why}\n` +
+      "  Run it from a terminal, or use a read-only mode with --yes:\n" +
+      "    --preflight / --postflight / --plugins / --link --dry-run\n" +
       "  Nothing was read and nothing was run."
   );
 }
@@ -2877,14 +3259,49 @@ async function confirmDataAccess(opts, env) {
   say(`  databases : ${[SHEDUL_DB, AD_DB, LE_DB, ADYEN_DB].join(", ")}`);
   say("  access    : read-only SELECTs — no writes at this stage");
 
-  const ans = (await ask('Read from these databases? (type "yes"): ')).trim().toLowerCase();
-  return prod ? ans === "yes" : ans === "yes" || ans === "y";
+  // --yes IS the approval for reads. The target is still printed above, so an
+  // unattended run leaves the same record of what it touched; it just doesn't
+  // stop to be told what it was already told on the command line.
+  if (opts.yes) {
+    say("  approved  : --yes (non-interactive)");
+    return true;
+  }
+
+  // Same numbered menu as every other decision in the script: "1" confirms, and
+  // "yes"/"y" still work for anyone with the muscle memory. The prod/non-prod
+  // asymmetry lives in the DEFAULT — in production a bare Enter cancels, so it
+  // still takes a deliberate keystroke to read real production data.
+  return askChoice("Read from these databases?", [
+    { label: "Yes — run the reads", aliases: ["yes", "y", "read"], value: true, default: !prod },
+    {
+      label: "Cancel — nothing is read",
+      aliases: ["no", "n", "cancel", "abort"],
+      value: false,
+      default: prod,
+    },
+  ]);
 }
 
 // Confirmation gate for the write. Non-prod takes a single "yes"/"y"; production
 // makes you type the namespace back first and then requires an exact "yes".
+//
+// --yes is NOT accepted here, by design. requireInteractive() should already have
+// refused any write without a TTY, so this is the backstop: if a future change
+// ever lets a write reach this point unattended, it fails loudly instead of
+// approving itself.
 async function confirmRun(opts) {
   const prod = isProd(opts.namespace);
+
+  if (!input.isTTY) {
+    // A dry run writes nothing — DRY_RUN=true only logs — so --yes can approve it.
+    // An apply cannot be approved by a flag, ever, in any namespace.
+    if (opts.yes && !opts.apply) return true;
+
+    throw new UsageError(
+      "Refusing to confirm a write without an interactive terminal.\n" +
+        "  --yes approves reads and dry runs, never an apply. Run this from a terminal."
+    );
+  }
 
   if (prod) {
     console.log(
@@ -3131,7 +3548,7 @@ async function runGuided(opts, providerIds) {
 
   const failed = results.filter((r) => r.outcome === "fail").length;
   if (!done.size) console.log(c.faint("  Nothing was run."));
-  if (failed) process.exitCode = 1;
+  if (failed) process.exitCode = EXIT_DATA;
   return failed === 0;
 }
 
@@ -3139,19 +3556,34 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) return usage();
 
-  // Nothing below this line may touch a database without a human present.
-  requireInteractive();
+  // --json: stdout carries the result document and nothing else, so every
+  // human-readable line has to be rerouted before the first one is written.
+  if (opts.json) startJsonMode();
 
   console.log("plugin_legal_entity_updates — plugins ↔ primary legal entities");
 
-  // 1. Which mode? Asked first — it decides everything downstream. Any flag that
-  //    only makes sense in one mode has already answered this.
-  if (!opts.mode) opts.mode = await askMode();
+  // 1. Which mode? Asked first — it decides everything downstream, including
+  //    whether this invocation needs a terminal at all. Any mode flag has already
+  //    answered it; with no TTY a flag is the only way to answer it.
+  if (!opts.mode) {
+    if (!input.isTTY) {
+      throw new UsageError(
+        "No mode given, and no terminal to ask for one.\n" +
+          "  Pass a mode flag: --preflight, --postflight, --plugins, --link,\n" +
+          "  --migrate, --reset or --guided."
+      );
+    }
+    opts.mode = await askMode();
+  }
+
+  // 1b. Now the mode is known, so "does this need a human?" can be answered.
+  //     Read-only modes proceed under --yes; anything that writes does not.
+  requireInteractive(opts);
 
   // Reset is destructive and has no undo, so it is staging-only — the same stance
   // clear_provider_einvoicing takes. Checked before anything else happens.
   if (opts.mode === "reset" && isProd(opts.namespace)) {
-    throw new Error(
+    throw new UsageError(
       `Refusing to reset against "${opts.namespace}".\n` +
         "  Reset deletes migration state, location assignments and the primary\n" +
         "  legal-entity pointer, and soft-deletes legal entities. There is no undo.\n" +
@@ -3161,7 +3593,10 @@ async function main() {
 
   // 2. Environment — -n, or prompt. Before the reads, because discovering
   //    providers is itself a query against the chosen namespace.
-  if (!opts.namespaceGiven) {
+  // Without a terminal there is nobody to ask, and -n has a default worth taking
+  // (staging). An unattended run that meant production has to say so explicitly,
+  // which is the right way round.
+  if (!opts.namespaceGiven && input.isTTY) {
     opts.namespace = await askNamespace();
   }
   const env = psqlEnv(opts.namespace);
@@ -3180,6 +3615,7 @@ async function main() {
   // 3. Approve the data access itself, before any query goes out ------------
   if (!(await confirmDataAccess(opts, env))) {
     console.log("Aborted. Nothing was read.");
+    emitJson(opts, { verdict: "ABORTED", read: false });
     return;
   }
 
@@ -3195,9 +3631,15 @@ async function main() {
     );
     console.log(`Providers to reset: ${providerIds.length} — ${providerIds.join(", ")}`);
 
-    opts.deleteLegalEntities = await askDeleteLegalEntities();
+    // --keep-legal-entities already answered this.
+    if (!opts.deleteLegalEntitiesGiven) {
+      opts.deleteLegalEntities = await askDeleteLegalEntities();
+    }
 
     let failures = 0;
+    // Per-provider outcome, for --json. A reset is approved one provider at a time,
+    // so "what actually happened" is a list, not a single verdict.
+    const outcomes = [];
 
     // One provider at a time: each gets its own preview and its own confirmation.
     // A reset is not something to approve in bulk.
@@ -3216,6 +3658,7 @@ async function main() {
 
       if (!total && !preview.legalEntityIds.length) {
         console.log(c.faint(`\n  Nothing to reset for provider=${providerId}.`));
+        outcomes.push({ provider_id: providerId, status: "nothing_to_reset", rows_left: 0 });
         continue;
       }
 
@@ -3228,11 +3671,13 @@ async function main() {
       if (echo !== String(providerId)) {
         console.error("  provider_id mismatch. Skipping this provider.");
         failures++;
+        outcomes.push({ provider_id: providerId, status: "mismatch", rows_left: null });
         continue;
       }
       const final = (await ask('  Proceed? (type "yes"): ')).trim().toLowerCase();
       if (final !== "yes") {
         console.log(`  Skipped provider=${providerId}. Nothing was written.`);
+        outcomes.push({ provider_id: providerId, status: "declined", rows_left: null });
         continue;
       }
 
@@ -3264,8 +3709,10 @@ async function main() {
         }
         if (after.linkedPlugins) console.log(`      linked plugins = ${after.linkedPlugins}`);
         failures++;
+        outcomes.push({ provider_id: providerId, status: "incomplete", rows_left: leftover });
       } else {
         console.log(c.ok(`  ✓ provider=${providerId} reset — all target rows cleared.`));
+        outcomes.push({ provider_id: providerId, status: "reset", rows_left: 0 });
       }
     }
 
@@ -3279,7 +3726,13 @@ async function main() {
         ? `  ${c.bad("✗")} ${failures} provider(s) not fully reset. See above.`
         : `  ${c.ok("✓")} done. Re-run migrate to recreate the legal entities.`
     );
-    if (failures) process.exitCode = 1;
+    if (failures) process.exitCode = EXIT_DATA;
+
+    emitJson(opts, {
+      verdict: verdictOf(failures),
+      soft_deleted_legal_entities: opts.deleteLegalEntities,
+      providers: outcomes,
+    });
     return;
   }
 
@@ -3303,6 +3756,7 @@ async function main() {
     const pluginsByProvider = fetchPlugins(env, providerIds);
     if (!pluginsByProvider.size) {
       console.log(c.warn("\nNone of these providers has a plugin — nothing to audit."));
+      emitJson(opts, { verdict: "PASS", tally: { linked: 0, unlinked: 0 }, plugins: [] });
       return;
     }
 
@@ -3340,7 +3794,9 @@ async function main() {
 
     // Same export path as pre-flight — the linked audits carry the same shape.
     let wantMd = opts.md;
-    if (!wantMd) {
+    // No terminal means nobody to offer it to — --md is how a non-interactive
+    // caller asks for the export.
+    if (!wantMd && input.isTTY) {
       const answer = (await ask("\n  Export this comparison as Markdown? (y/N): "))
         .trim()
         .toLowerCase();
@@ -3360,7 +3816,7 @@ async function main() {
             differ: linked.filter((a) => a.diffs.length).length,
             blocked: linked.filter((a) => a.blocking.length).length,
           },
-          0,
+          [],
           detail,
           "Plugin audit — provider billing informations vs each plugin's legal entity"
         )
@@ -3368,7 +3824,35 @@ async function main() {
       console.log(`  ${c.ok("✓")} written: ${target}`);
     }
 
-    if (failed) process.exitCode = 1;
+    if (failed) process.exitCode = EXIT_DATA;
+
+    emitJson(opts, {
+      verdict: verdictOf(failed),
+      tally: {
+        linked: audits.filter((a) => !a.unlinked).length,
+        unlinked: audits.filter((a) => a.unlinked).length,
+        blocked: audits.filter((a) => !a.unlinked && a.blocking.length).length,
+        differ: audits.filter((a) => !a.unlinked && a.diffs.length).length,
+        diverged: audits.filter((a) => a.diverged).length,
+      },
+      // One entry per PLUGIN, not per provider: a provider can hold more than one,
+      // and the send path reads whichever the plugin points at.
+      plugins: audits.map((a) => ({
+        provider_id: a.providerId,
+        plugin_id: Number(a.plugin.id),
+        plugin_type: a.plugin.pluginType || null,
+        integrator: a.plugin.integrator || null,
+        plugin_status: a.plugin.pluginStatus || null,
+        legal_entity_id: a.plugin.legalEntityId || null,
+        primary_legal_entity_id: a.primary,
+        // Points at something other than the provider's primary — not wrong by
+        // itself, but pre-flight is then comparing a different entity.
+        diverged: Boolean(a.diverged),
+        ...(a.unlinked
+          ? { status: "unlinked", country_code: a.countryCode || null }
+          : jsonComparison(a)),
+      })),
+    });
     return;
   }
 
@@ -3384,7 +3868,10 @@ async function main() {
     );
     console.log(`Providers to migrate: ${providerIds.length} — ${providerIds.join(", ")}`);
 
-    opts.migratePaymentMethods = await askMigratePaymentMethods();
+    // --no-payment-methods already answered this.
+    if (!opts.migratePaymentMethodsGiven) {
+      opts.migratePaymentMethods = await askMigratePaymentMethods();
+    }
 
     // Preview stands in for the dry run this task doesn't have.
     console.log(c.faint(`\nReading migration state from ${SHEDUL_DB} (read-only)…`));
@@ -3396,8 +3883,25 @@ async function main() {
 
     printMigrateWarning(opts);
 
+    // --print-only: the command is the deliverable. Nothing runs, so nothing needs
+    // approving — which is also why this sits before the gate.
+    if (opts.printOnly) {
+      console.log(c.faint("--print-only: nothing was run."));
+      emitJson(opts, {
+        verdict: "PRINTED",
+        command: buildMigrateCommand(opts, providerIds),
+        migrate_payment_methods: opts.migratePaymentMethods,
+        providers: providerIds.map((id) => ({
+          provider_id: id,
+          before: migrateVerdict(before.get(id)),
+        })),
+      });
+      return;
+    }
+
     if (!(await confirmRun(opts))) {
       console.log("Aborted. Nothing was run.");
+      emitJson(opts, { verdict: "ABORTED", ran: false });
       return;
     }
 
@@ -3405,7 +3909,21 @@ async function main() {
 
     console.log(c.faint(`\nVerifying against ${SHEDUL_DB} (read-only)…`));
     const after = fetchMigrationStatuses(env, providerIds);
-    if (printMigrateReadback(providerIds, before, after)) process.exitCode = 1;
+    const migrateFailed = printMigrateReadback(providerIds, before, after);
+    if (migrateFailed) process.exitCode = EXIT_DATA;
+
+    emitJson(opts, {
+      verdict: verdictOf(migrateFailed),
+      command: buildMigrateCommand(opts, providerIds),
+      migrate_payment_methods: opts.migratePaymentMethods,
+      // This task is resumable and has no dry run, so before/after is the only way
+      // to tell "it worked" from "it was already done".
+      providers: providerIds.map((id) => ({
+        provider_id: id,
+        before: migrateVerdict(before.get(id)),
+        after: migrateVerdict(after.get(id)),
+      })),
+    });
     return;
   }
 
@@ -3417,6 +3935,14 @@ async function main() {
     console.log(c.faint(`\nFinding providers in ${AD_DB}.account_configurations…`));
     providerIds = fetchAllProviderIds(env);
     if (!providerIds.length) throw new Error("No providers found in account_configurations.");
+  } else if (!input.isTTY) {
+    // Nobody to ask, and guessing is not an option: "every provider" and "these
+    // three" are very different requests. Name the flag rather than pick one.
+    throw new UsageError(
+      "No providers given, and no terminal to ask for them.\n" +
+        "  Pass provider IDs (e.g. 33,41), --all for every provider with an\n" +
+        "  account configuration, or -f/--file PATH to read them from a file."
+    );
   } else {
     const chosen = await askProviderIds(env);
     providerIds = chosen.ids;
@@ -3435,17 +3961,59 @@ async function main() {
   // linking anything. Strictly SELECTs.
   if (opts.mode === "preflight") {
     const withLegalEntity = providerIds.filter((id) => primaryByProvider.has(id));
-    const missingLegalEntity = providerIds.length - withLegalEntity.length;
 
+    // Read billing info for EVERY provider, not only those with a primary legal
+    // entity. The ones without are the reason: migrate builds the entity FROM this
+    // table, so whether the row exists is exactly what separates "waiting for
+    // migrate" from "migrate would have nothing to build from".
+    console.log(c.faint(`Reading provider_billing_informations from ${SHEDUL_DB} (read-only)…`));
+    const billing = fetchBillingInformations(env, providerIds);
+
+    const missing = providerIds
+      .filter((id) => !primaryByProvider.has(id))
+      .map((id) => ({ providerId: id, hasBilling: Boolean(billing.get(id)) }));
+
+    // Nothing comparable at all is a FAIL, and the loudest thing on screen. Every
+    // mode downstream reads the same primary pointer, so there is no next step that
+    // could work either — and a green PASS here would be approval of data nobody
+    // looked at. (A run where only SOME providers lack a pointer still passes on
+    // the rest; see printPreflightVerdict for why the two differ.)
     if (!withLegalEntity.length) {
+      printNoPrimaryLegalEntity(missing);
+      console.log(verdictBanner(true));
       console.log(
-        c.warn("\nNone of these providers has an active primary legal entity — nothing to compare.")
+        `  ${c.bad("⊘")} Nothing was compared — ` +
+          (providerIds.length === 1
+            ? `provider=${providerIds[0]} has no active primary legal entity.`
+            : `not one of these ${providerIds.length} providers has an active ` +
+              "primary legal entity.")
       );
+      console.log(
+        c.bad(
+          wrapText(
+            "Going further is pointless: link has nothing to link and post-flight " +
+              "nothing to audit. Run migrate first.",
+            "",
+            4
+          )
+        )
+      );
+      console.log(c.faint("\n  Read-only: this mode issues SELECTs and nothing else."));
+
+      // Set before emitJson — the envelope reports process.exitCode as `exit`.
+      process.exitCode = EXIT_DATA;
+      emitJson(opts, {
+        verdict: verdictOf(true),
+        tally: { clean: 0, differ: 0, blocked: 0, no_primary_legal_entity: providerIds.length },
+        providers: [],
+        skipped: missing.map(({ providerId, hasBilling }) => ({
+          provider_id: providerId,
+          reason: "no active primary legal entity",
+          has_billing_details: hasBilling,
+        })),
+      });
       return;
     }
-
-    console.log(c.faint(`Reading provider_billing_informations from ${SHEDUL_DB} (read-only)…`));
-    const billing = fetchBillingInformations(env, withLegalEntity);
 
     console.log(c.faint(`Reading legal entity fields from ${LE_DB} (read-only)…`));
     const leFields = fetchLegalEntityFields(env, [
@@ -3477,7 +4045,8 @@ async function main() {
       for (const cmp of comparisons) printProviderFieldTable(cmp);
     }
 
-    const tally = printFieldComparison(comparisons);
+    const tally = printFieldComparison(comparisons, missing);
+    printNoPrimaryLegalEntity(missing);
 
     // KYC / payments gate — a separate concern from field consistency, but the
     // other thing that decides whether a provider can onboard.
@@ -3509,12 +4078,14 @@ async function main() {
 
     printKycStatus(kycRows);
 
-    const failed = printPreflightVerdict(tally, missingLegalEntity);
+    const failed = printPreflightVerdict(tally, missing);
 
     // Export. --md writes without asking; otherwise it's offered, because a flag
     // nobody remembers is a flag that doesn't exist.
     let wantMd = opts.md;
-    if (!wantMd) {
+    // No terminal means nobody to offer it to — --md is how a non-interactive
+    // caller asks for the export.
+    if (!wantMd && input.isTTY) {
       const answer = (await ask("\n  Export this comparison as Markdown? (y/N): "))
         .trim()
         .toLowerCase();
@@ -3525,12 +4096,46 @@ async function main() {
       const target = preflightMarkdownPath(opts);
       fs.writeFileSync(
         target,
-        buildPreflightMarkdown(opts, comparisons, tally, missingLegalEntity, detail, null, kycRows)
+        buildPreflightMarkdown(opts, comparisons, tally, missing, detail, null, kycRows)
       );
       console.log(`  ${c.ok("✓")} written: ${target}`);
     }
 
-    if (failed) process.exitCode = 1;
+    if (failed) process.exitCode = EXIT_DATA;
+
+    emitJson(opts, {
+      verdict: verdictOf(failed),
+      tally: {
+        clean: tally.clean,
+        differ: tally.differ,
+        blocked: tally.blocked,
+        no_billing_info: tally.noBilling,
+        no_primary_legal_entity: missing.length,
+      },
+      providers: comparisons.map((cmp) => ({
+        ...jsonComparison(cmp),
+        primary_legal_entity_id: primaryByProvider.get(cmp.providerId) || null,
+      })),
+      // The other thing that blocks onboarding. "unknown" is not a pass: the
+      // authoritative verification lives behind the adyen-platform RPC, so the
+      // database cannot confirm it either way.
+      kyc: kycRows.map((r) => ({
+        provider_id: r.providerId,
+        payments: r.payments,
+        synced_to_kyc_provider: Boolean(r.adyenLegalEntityId),
+        adyen_legal_entity_id: r.adyenLegalEntityId,
+        gate: r.verdict.state,
+        detail: r.verdict.text,
+        // Whether the database can prove this. false means the authoritative
+        // answer is behind the adyen-platform RPC — do not treat it as decided.
+        exact: r.verdict.exact,
+      })),
+      skipped: missing.map(({ providerId, hasBilling }) => ({
+        provider_id: providerId,
+        reason: "no active primary legal entity",
+        has_billing_details: hasBilling,
+      })),
+    });
     return;
   }
 
@@ -3564,7 +4169,25 @@ async function main() {
         c.faint("\n  For data consistency between billing info and the legal entity, run pre-flight.")
     );
 
-    if (drift) process.exitCode = 1;
+    if (drift) process.exitCode = EXIT_DATA;
+
+    emitJson(opts, {
+      verdict: verdictOf(drift),
+      tally: {
+        ok: audit.filter((a) => a.state === "ok").length,
+        drift: audit.filter((a) => a.state === "drift").length,
+        exempt: audit.filter((a) => a.state === "exempt").length,
+      },
+      providers: audit.map((a) => ({
+        provider_id: a.providerId,
+        // "exempt" is a pass: nothing to link, so nothing can be wrong.
+        status: a.state,
+        detail: a.status,
+        plugin_id: a.plugin ? Number(a.plugin.id) : null,
+        expected_legal_entity_id: a.expected,
+        actual_legal_entity_id: a.plugin ? a.plugin.legalEntityId || null : null,
+      })),
+    });
     return;
   }
 
@@ -3600,13 +4223,26 @@ async function main() {
 
   if (!updates.length) {
     console.log("\nNothing to link. No command to run.");
+    // Nothing to do is a pass, not a failure — every provider was either already
+    // linked or exempt, and both are correct states.
+    emitJson(opts, {
+      verdict: "PASS",
+      dry_run: !opts.apply,
+      command: null,
+      tally: { requested: 0, verified: 0, failed: 0, skipped: skipped.length },
+      updates: [],
+      skipped: skipped.map((s) => ({ provider_id: s.providerId, reason: s.reason })),
+    });
     return;
   }
 
   // 8. Dry run or apply — --apply/--dry-run, or prompt ---------------------
   // Asked here, after the report, so the decision is made with the actual
   // plugin list on screen.
-  if (!opts.modeGiven) {
+  // --apply / --dry-run already answered this. Without a terminal there is nobody
+  // to ask, and the safe reading of silence is a dry run — requireInteractive()
+  // only let us this far because apply was false.
+  if (!opts.applyGiven && input.isTTY) {
     opts.apply = await askApply(opts.namespace);
   }
 
@@ -3617,11 +4253,30 @@ async function main() {
   );
   console.log(`\n${c.cmd(buildCommand(opts, updates))}\n`);
 
+  // --print-only stops here: the command above is the whole deliverable. Nothing
+  // has been run and nothing needs approving, so there is no gate to pass.
+  if (opts.printOnly) {
+    console.log(c.faint("--print-only: nothing was run."));
+    emitJson(opts, {
+      verdict: "PRINTED",
+      dry_run: !opts.apply,
+      command: buildCommand(opts, updates),
+      updates: updates.map((u) => ({
+        provider_id: u._providerId,
+        plugin_id: u.plugin_id,
+        legal_entity_id: u.legal_entity_id,
+      })),
+      skipped: skipped.map((s) => ({ provider_id: s.providerId, reason: s.reason })),
+    });
+    return;
+  }
+
   // 10. Confirm + run -------------------------------------------------------
   // --no-tui -w are appended so the task's logs stream into this terminal;
   // runInherit echoes the full argv before it spawns.
   if (!(await confirmRun(opts))) {
     console.log("Aborted. Nothing was run.");
+    emitJson(opts, { verdict: "ABORTED", ran: false, command: buildCommand(opts, updates) });
     return;
   }
 
@@ -3641,20 +4296,59 @@ async function main() {
       `\n✗ ${TASK}: ${updates.length - failures}/${updates.length} verified, ` +
         `${failures} did not. Nothing to undo — the rest simply weren't written.`
     );
-    process.exitCode = 1;
-    return;
+    process.exitCode = EXIT_DATA;
+  } else {
+    console.log(
+      `\n✓ Ran ${TASK} for ${scope}` +
+        (opts.apply ? " — all verified." : " (DRY_RUN=true — nothing written, verified unchanged).")
+    );
   }
 
-  console.log(
-    `\n✓ Ran ${TASK} for ${scope}` +
-      (opts.apply ? " — all verified." : " (DRY_RUN=true — nothing written, verified unchanged).")
-  );
+  // The read-back is the only evidence that anything landed: the task exits 0 even
+  // when it skips every row, so `verified` — not the exit code — is the signal.
+  emitJson(opts, {
+    verdict: verdictOf(failures),
+    dry_run: !opts.apply,
+    command: buildCommand(opts, updates),
+    tally: {
+      requested: updates.length,
+      verified: updates.length - failures,
+      failed: failures,
+      skipped: skipped.length,
+    },
+    // verdictFor carries the dry-run semantics — "verified" on a dry run means the
+    // row is still NULL, not that it matches. Reused rather than re-derived so the
+    // JSON and the table can never disagree.
+    updates: updates.map((u) => {
+      const verdict = verdictFor(u, applied, !opts.apply);
+      return {
+        provider_id: u._providerId,
+        plugin_id: u.plugin_id,
+        legal_entity_id: u.legal_entity_id,
+        applied_legal_entity_id: applied.get(String(u.plugin_id)) ?? null,
+        verified: verdict.ok,
+        detail: verdict.note,
+      };
+    }),
+    skipped: skipped.map((s) => ({ provider_id: s.providerId, reason: s.reason })),
+  });
 }
 
 main()
   .catch((err) => {
     console.error(`\nError: ${err.message}`);
-    process.exitCode = 1;
+    // A UsageError carries its own code: "the call was wrong" is a different
+    // outcome from "the data was wrong", and a caller needs to tell them apart.
+    process.exitCode = err.exitCode || EXIT_DATA;
+    if (jsonMode) {
+      process.stdout.write(
+        `${JSON.stringify(
+          { schema_version: 1, verdict: "ERROR", exit: process.exitCode, error: err.message },
+          null,
+          2
+        )}\n`
+      );
+    }
   })
   // The single readline holds the event loop open; always let go of stdin.
   .finally(closeRl);

@@ -138,12 +138,38 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 #
 # Providers it can't resolve are listed in an "Exempt providers" table with reasons.
 # Every SQL statement is echoed (cyan) before it runs; NO_COLOR is honoured.
-# REQUIRES A TERMINAL: if stdin isn't a TTY it refuses outright (exit 1) — a piped
-# "yes" is not explicit approval, so cron/CI can't drive it. There is no --force.
 #
-# NO FLAGS. Every choice is a prompt: mode, environment, read approval, providers,
-# dry-run-vs-apply, payment methods, soft-delete, Markdown export. The only
-# arguments are -h/--help and bare provider IDs.
+# WRITES REQUIRE A TERMINAL. --link --apply, --migrate and --reset refuse outright
+# if stdin isn't a TTY, in every namespace — a piped "yes" is not explicit approval,
+# and no flag can supply one. There is no --force.
+#
+# READ-ONLY MODES CAN BE AUTOMATED. --yes lifts the TTY requirement for the modes
+# that only issue SELECTs (--preflight, --postflight, --plugins) and for
+# --link --dry-run, and --json emits one result document on stdout with every
+# human-readable line on stderr. Exit: 0 pass, 1 the data is wrong, 2 the call is
+# wrong. So an agent or a CI job can report, but never write:
+#
+#   ./plugin_legal_entity_updates.js --postflight --all --json --yes | jq .verdict
+#
+# Run it with no flags and every choice is a prompt instead: mode, environment,
+# read approval, providers, dry-run-vs-apply, payment methods, soft-delete,
+# Markdown export. Flags only pre-answer those questions.
+#
+# Flags — all optional:
+#   -n, --namespace NAME   namespace / env; drives the psql env AND the task's --namespace
+#   -s, --service NAME     Houston service (default: accounting-documents)
+#   -f, --file PATH        read provider IDs from a file (# starts a comment)
+#       --all              every provider in account_configurations (not for migrate/reset)
+#       --guided --migrate --preflight --postflight --link --plugins --reset
+#                          pick the mode up front (--verify is an alias for --postflight)
+#       --apply / --dry-run    DRY_RUN="false" / "true" (dry run is the default)
+#       --print-only       print the command and stop; run nothing
+#       --no-payment-methods / --copy-tax-number / --batch-size N   migrate params
+#       --keep-legal-entities  reset: don't soft-delete the orphaned legal entities
+#       --md [PATH]        export the report as Markdown (default preflight-<ns>-<date>.md)
+#       --detail / --summary   force the per-provider field checklist on/off
+#       --json             machine-readable result on stdout, report on stderr
+#       --yes              run without a terminal — READ-ONLY MODES ONLY
 
 # Reads three DBs: provider_purchases_primary_legal_entities + provider_billing_informations
 # (shedul, valid_to IS NULL — the primary-LE query is the same SQL as the
@@ -170,7 +196,7 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 **confirm_sent_uat** — process the Comarch UAT "sent" queue.
 ```sh
 ./staging/write/confirm_sent_uat/confirm_sent_uat.js
-# Fully interactive: prompts for queue type (invoice/onboarding) and, unless
+# Fully interactive: prompts for queue type (invoice/onboarding/aperak) and, unless
 # COMARCH_UAT_JWT is set, the Comarch JWT.
 ```
 

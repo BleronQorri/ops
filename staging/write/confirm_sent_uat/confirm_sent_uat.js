@@ -34,6 +34,7 @@ const CONFIG_TYPE = 1;
 const CONFIG_IDS = {
   invoice: 119208,
   onboarding: 119286,
+  aperak: 119328,
 };
 
 function buildHeaders(token) {
@@ -45,12 +46,15 @@ function buildHeaders(token) {
 
 async function promptQueueType(rl) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const answer = (await rl.question("Queue type? (invoice/onboarding): "))
+    const answer = (await rl.question("Queue type? (invoice/onboarding/aperak): "))
       .trim()
       .toLowerCase();
     if (answer === "invoice" || answer === "i") return "invoice";
     if (answer === "onboarding" || answer === "o") return "onboarding";
-    console.error(`Invalid input: "${answer}". Expected invoice/i or onboarding/o.`);
+    if (answer === "aperak" || answer === "a") return "aperak";
+    console.error(
+      `Invalid input: "${answer}". Expected invoice/i, onboarding/o or aperak/a.`
+    );
   }
   throw new Error("Too many invalid attempts.");
 }

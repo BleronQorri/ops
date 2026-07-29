@@ -6,10 +6,11 @@ queue by confirming "sent" status via the edoc-online UAT REST API.
 ## What it does
 
 - Talks to the edoc-online UAT API (`https://edi-uat.edoc-online.com/EdiRest`).
-- Prompts for a **queue type** (`invoice` or `onboarding`) and a **Comarch JWT
-  token**.
+- Prompts for a **queue type** (`invoice`, `onboarding` or `aperak`) and a
+  **Comarch JWT token**.
 - Fetches the queue's "sent" items (`POST /api/status/sent`) for the matching
-  `ConfigId` (invoice = 119208, onboarding = 119286) and confirms them.
+  `ConfigId` (invoice = 119208, onboarding = 119286, aperak = 119328) and
+  confirms them.
 
 UAT-only: the base URL is hardcoded to the UAT host — there is no production
 path in this script.
