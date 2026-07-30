@@ -63,7 +63,8 @@
 // legal_entity_id are left alone (the task would skip them anyway —
 // BackfillAccountConfigurationPluginLegalEntityIdAction never overwrites).
 //
-// FOUR MODES, picked at the first prompt. Workflow order:
+// MODES, picked at the first prompt. Workflow order:
+//   report       what have we got? every account configuration, migrated or not READ-ONLY
 //   migrate      create the legal entities (legal_entities_migration:migrate on
 //                partners-app) — run FIRST; everything else depends on it
 //   pre-flight   is the data consistent? (billing info vs legal entity)  READ-ONLY
@@ -72,6 +73,7 @@
 //
 // Usage:
 //   ./plugin_legal_entity_updates.js                        # guided — just run it
+//   ./plugin_legal_entity_updates.js --report               # scout before rolling out
 //   ./plugin_legal_entity_updates.js --migrate 12345        # create legal entities
 //   ./plugin_legal_entity_updates.js --preflight --all      # data consistency, pass/fail
 //   ./plugin_legal_entity_updates.js --postflight --all     # link state, pass/fail
@@ -125,25 +127,32 @@ const FIELD_COMPARISON = [
     le: ["individual.name.lastName"],
     only: "individual",
   },
+  // ONLY `*.vatNumber`. LegalEntities.InvoiceParty.Identifiers emits that slot as
+  // IDENTIFIER_KIND_TAX_NUMBER and `*.taxInformation.number` as
+  // IDENTIFIER_KIND_TAX_IDENTIFICATION_NUMBER — a different kind, which
+  // LegalEntityBillingDetails does NOT read for `tax_number`. Probing the TIN slot
+  // here would report a tax number as present that the RPC would leave nil, masking
+  // exactly the failure app-accounting-documents designed for ("a TIN-slot country
+  // would fail validation loudly rather than silently emit its TIN as a VAT").
   {
     label: "tax / VAT no.",
     pbi: "tax_number",
-    le: [
-      "organization.vatNumber",
-      "organization.taxInformation.number",
-      "trust.taxInformation.number",
-    ],
+    le: ["organization.vatNumber", "soleProprietorship.vatNumber"],
   },
   {
     label: "registration no.",
     pbi: "company_registration_number",
-    le: ["organization.registrationNumber", "trust.registrationNumber"],
+    le: [
+      "organization.registrationNumber",
+      "soleProprietorship.registrationNumber",
+      "trust.registrationNumber",
+    ],
     only: "organization",
   },
   {
     label: "activity code",
     pbi: "activity_code",
-    le: ["organization.activityCode"],
+    le: ["organization.activityCode", "soleProprietorship.activityCode"],
     only: "organization",
   },
   {
@@ -151,19 +160,25 @@ const FIELD_COMPARISON = [
     pbi: "address",
     le: [
       "organization.registeredAddress.street",
+      "soleProprietorship.registeredAddress.street",
       "individual.residentialAddress.street",
     ],
   },
   {
     label: "city",
     pbi: "city",
-    le: ["organization.registeredAddress.city", "individual.residentialAddress.city"],
+    le: [
+      "organization.registeredAddress.city",
+      "soleProprietorship.registeredAddress.city",
+      "individual.residentialAddress.city",
+    ],
   },
   {
     label: "postal code",
     pbi: "postal_code",
     le: [
       "organization.registeredAddress.postalCode",
+      "soleProprietorship.registeredAddress.postalCode",
       "individual.residentialAddress.postalCode",
     ],
   },
@@ -172,6 +187,7 @@ const FIELD_COMPARISON = [
     pbi: "state_province",
     le: [
       "organization.registeredAddress.stateOrProvince",
+      "soleProprietorship.registeredAddress.stateOrProvince",
       "individual.residentialAddress.stateOrProvince",
     ],
   },
@@ -182,6 +198,7 @@ const FIELD_COMPARISON = [
     // pseudo-key by the query below.
     le: [
       "organization.registeredAddress.country",
+      "soleProprietorship.registeredAddress.country",
       "individual.residentialAddress.country",
       "_column.country_code",
     ],
@@ -232,8 +249,22 @@ const FIELD_COMPARISON = [
 // (IDENTIFIER_KIND_TAX_NUMBER) rather than the ES/IT NIF/PIVA
 // (IDENTIFIER_KIND_TAX_IDENTIFICATION_NUMBER) — so a present-and-equal
 // tax number here is necessary but not sufficient.
+// Each country's set is the UNION of the two paths, because a provider that onboards
+// and then cannot send is not usable:
+//
+//   onboarding  SA     → Comarch.LegalEntityBillingDetails @required_fields
+//               ES/IT  → Common.LegalEntityBillingDetails  @required_fields
+//   sending     ALL    → Common.LegalEntityBillingDetails, via
+//                        BillingDetailsPolicy.resolve/2 → fetch_billing_informations/2
+//                        (the only exception is the allow-listed legacy KSA
+//                        per-location flow, @legacy_ksa_multi_plugin_provider_ids)
+//
+// So SA needs Comarch's building_number + district AND Common's company_name. Comarch's
+// own @required_fields does NOT list company_name — KSA onboarding takes it from the
+// request — but the send path validates it, so it is required in practice.
 const EINVOICING_REQUIRED = {
   SA: [
+    "company_name",
     "state_province",
     "city",
     "postal_code",
@@ -246,6 +277,11 @@ const EINVOICING_REQUIRED = {
   ES: ["company_name", "state_province", "city", "postal_code", "address", "tax_number"],
   IT: ["company_name", "state_province", "city", "postal_code", "address", "tax_number"],
 };
+
+// Which path demands a field, where it isn't the country's onboarding validator. Shown
+// so a reader who checks Comarch's @required_fields and finds no company_name can see
+// why the script asks for it anyway.
+const REQUIRED_BY_SEND_PATH_ONLY = { SA: ["company_name"] };
 
 // Country decides the required set. Non-e-invoicing countries have none, so the
 // comparison stays informational for them.
@@ -356,6 +392,67 @@ const RESET_UNTOUCHED = [
   "blast_marketing_campaigns",
 ];
 
+// --- the optional e-invoicing wipe (reset, opt-in) ----------------------------
+//
+// A reset undoes the legal-entities migration. This clears something WIDER and
+// separate: the provider's whole e-invoicing domain in accounting_documents,
+// rooted at `account_configurations` (keyed by provider_id). The migration never
+// created any of it, so it is off unless you ask for it.
+//
+// Same SQL as staging/write/clear_provider_einvoicing/clear_provider_einvoicing.js
+// — kept in step by hand, because scripts here stay self-contained. NOT touched,
+// by design: the invoicing/ domain (invoice_parties / invoices / invoicing_periods
+// — Fresha periodic billing, keyed by legal_entity_id), and anything keyed only
+// by invoice_entity_id.
+//
+// The delete is one data-modifying-CTE statement (cfg → plg → doc anchors, then
+// one DELETE per table). Because it's a SINGLE statement, all referential-
+// integrity checks fire at statement end — every parent and its children are
+// already gone by then — so the CTE order can't cause an FK violation. The
+// preview reuses the same predicates, so the counts match what the wipe removes.
+//
+// Everything is driven off provider_id, which parseProviderIds has already
+// validated as an integer, so interpolation is safe.
+
+// The three anchor sets (account configs, their plugins, their documents),
+// expressed either as CTE-name references (delete) or inline subqueries (preview).
+function einvoicingAnchors(pid, mode) {
+  const cfgInline = `SELECT id FROM account_configurations WHERE provider_id = ${pid}`;
+  if (mode === "cte") {
+    return { cfg: "SELECT id FROM cfg", plg: "SELECT id FROM plg", doc: "SELECT id FROM doc" };
+  }
+  const plgInline = `SELECT id FROM account_configuration_plugins WHERE account_configuration_id IN (${cfgInline})`;
+  const docInline =
+    `SELECT id FROM accounting_documents ` +
+    `WHERE account_configuration_id IN (${cfgInline}) OR provider_id = ${pid}`;
+  return { cfg: cfgInline, plg: plgInline, doc: docInline };
+}
+
+// Ordered [table, predicate] list, children-first. `r` holds the cfg/plg/doc
+// references for the chosen mode. account_configurations is last (the root).
+function einvoicingTargets(pid, r) {
+  return [
+    // accounting_documents + children
+    ["einvoicing_accounting_document_line_items", `accounting_document_id IN (${r.doc})`],
+    ["accounting_document_error_logs", `accounting_document_id IN (${r.doc})`],
+    ["accounting_documents_logs", `accounting_document_id IN (${r.doc})`],
+    ["e_invoice_compliance_records", `accounting_document_id IN (${r.doc})`],
+    ["e_invoice_trackers", `accounting_document_id IN (${r.doc})`],
+    ["accounting_documents", `id IN (${r.doc})`],
+    // account_configuration tree
+    ["einvoice_integration_issues", `account_configuration_plugin_id IN (${r.plg})`],
+    [
+      "einvoice_integration_application_requests",
+      `account_configuration_plugin_id IN (${r.plg}) OR account_configuration_id IN (${r.cfg})`,
+    ],
+    ["e_invoicing_configuration_logs", `account_configuration_id IN (${r.cfg})`],
+    ["account_configuration_addresses", `account_configuration_id IN (${r.cfg})`],
+    ["e_invoice_it_smart_receipts_configuration", `plugin_id IN (${r.plg}) OR provider_id = ${pid}`],
+    ["account_configuration_plugins", `account_configuration_id IN (${r.cfg})`],
+    ["account_configurations", `id IN (${r.cfg})`],
+  ];
+}
+
 // Namespaces that get the second confirmation gate.
 const PROD_NAMESPACES = new Set(["production", "prod"]);
 
@@ -433,13 +530,26 @@ function parseArgs(argv) {
     migratePaymentMethods: true,
     copyTaxNumber: false,
     batchSize: null,
+    // Report: restrict to a subset of countries. null = every country.
+    countries: null,
+    // Report: restrict to providers in these states. null = every state.
+    states: null,
     // Pre-flight detail view. null = auto: full per-provider field tables when you
     // named providers yourself (you're inspecting them), compact summary for a
     // bulk --all sweep. --detail / --summary force it either way.
     detail: null,
+    // Report prose: banners, caveats, footnotes, progress lines. OFF by default — the
+    // concise report is the numbers and the tables. A SEPARATE axis from `detail`,
+    // which decides whether the tables print at all. --full turns it on; without the
+    // flag an interactive run is asked. See reportView.
+    verbose: false,
     // Reset mode: also soft-delete the orphaned legal entities. On by default —
     // leaving them live is what produced provider 33's duplicate.
     deleteLegalEntities: true,
+    // Reset mode: also wipe the provider's e-invoicing data. OFF by default —
+    // it is a wider blast radius than the migration's own footprint; the
+    // migration never created account_configurations or accounting_documents.
+    clearEinvoicing: false,
     // Pre-flight Markdown export. --md sets the flag; an optional value sets the
     // path. Without the flag you're offered the export at the end anyway.
     md: false,
@@ -454,9 +564,11 @@ function parseArgs(argv) {
     // having no flag at all.
     namespaceGiven: false,
     modeGiven: false,
+    verboseGiven: false,
     applyGiven: false,
     migratePaymentMethodsGiven: false,
     deleteLegalEntitiesGiven: false,
+    clearEinvoicingGiven: false,
   };
   // Every flag is optional and only pre-answers a prompt: run the script bare and
   // it still asks you everything, in order. Flags exist so a non-human caller can
@@ -472,6 +584,8 @@ function parseArgs(argv) {
     "--verify": "postflight",
     "--link": "link",
     "--plugins": "plugins",
+    "--report": "report",
+    "--scout": "report",
     "--reset": "reset",
   };
 
@@ -521,6 +635,49 @@ function parseArgs(argv) {
       opts.detail = true;
     } else if (a === "--summary") {
       opts.detail = false;
+    } else if (a === "--full" || a === "--verbose") {
+      // The prose axis, NOT the table axis — --full --summary is a legitimate pair:
+      // every caveat, no per-provider tables.
+      opts.verbose = true;
+      opts.verboseGiven = true;
+    } else if (a === "--concise" || a === "--terse") {
+      opts.verbose = false;
+      opts.verboseGiven = true;
+    } else if (a === "--states" || a === "--state" || a === "--condition") {
+      // Report only providers in these states. The prompt is the usual way in; this
+      // exists so a non-interactive caller can ask the same question.
+      opts.states = new Set(
+        value()
+          .split(",")
+          .map((x) => x.trim().toLowerCase().replace(/[\s-]+/g, "_"))
+          .filter(Boolean)
+      );
+      if (!opts.states.size) {
+        throw new UsageError("--states needs at least one state, e.g. --states blocked,no_billing");
+      }
+      {
+        const unknown = [...opts.states].filter((x) => !REPORT_STATES.includes(x));
+        if (unknown.length) {
+          throw new UsageError(
+            `--states: unknown state(s) ${unknown.join(", ")}. ` +
+              `Known: ${REPORT_STATES.join(", ")}`
+          );
+        }
+      }
+    } else if (a === "-C" || a === "--countries" || a === "--country") {
+      // Report on a subset of countries. Codes are upper-cased; "none" selects the
+      // providers whose account configuration has no country at all, which is a real
+      // group you may want to look at on its own.
+      opts.countries = new Set(
+        value()
+          .split(",")
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean)
+          .map((s) => (s === "NONE" ? "" : s))
+      );
+      if (!opts.countries.size) {
+        throw new UsageError("--countries needs at least one country code, e.g. --countries SA,ES");
+      }
     } else if (a === "--md") {
       opts.md = true;
       // The path is optional, which makes `--md 33` ambiguous: a file name or a
@@ -542,6 +699,9 @@ function parseArgs(argv) {
     } else if (a === "--keep-legal-entities") {
       opts.deleteLegalEntities = false;
       opts.deleteLegalEntitiesGiven = true;
+    } else if (a === "--clear-einvoicing") {
+      opts.clearEinvoicing = true;
+      opts.clearEinvoicingGiven = true;
     } else if (a.startsWith("-")) {
       throw new UsageError(
         `Unknown option "${a}".\n` +
@@ -636,6 +796,12 @@ FLAGS
         --postflight       READ-ONLY: is every plugin linked? (--verify is an alias)
         --link             run ${TASK}
         --plugins          READ-ONLY: billing info vs each PLUGIN's legal entity
+        --report           READ-ONLY: scout EVERY provider in account_configurations
+                           before rolling out — migrated vs not, ready vs blocked,
+                           and why. No country filter; providers whose country has
+                           no e-invoicing rules are reported as such rather than
+                           scored. Never pass/fail; exits 0. (--scout is an alias.)
+                           Full per-provider tables go to the Markdown export.
         --reset            STAGING ONLY, destructive: undo the migration
   Link
         --apply            DRY_RUN="false" — actually write
@@ -648,11 +814,33 @@ FLAGS
         --batch-size N         BATCH_SIZE=N
   Reset
         --keep-legal-entities  don't soft-delete the orphaned legal entities
+        --clear-einvoicing     ALSO wipe the provider's e-invoicing data:
+                               account_configurations and their tree,
+                               accounting_documents and their children. Wider
+                               than the migration's footprint; without the flag
+                               you're asked, and the default is no.
   Reporting
         --md [PATH]        write the report as Markdown; default
-                           preflight-<namespace>-<YYYY-MM-DD>.md
+                           preflight-<namespace>-<YYYY-MM-DD>.md, or
+                           rollout-report-<namespace>-<YYYY-MM-DD>.md for --report
+    -C, --countries LIST   report only these countries, e.g. SA or SA,ES ("none"
+                           selects configurations with no country). Report mode.
+        --states LIST      report only these conditions, e.g. blocked,no_billing.
+                           Report mode. Without it you are asked.
         --detail           force the per-provider field checklist on
-        --summary          force it off (default: on unless --all)
+        --summary          force it off. Pre-flight: checklist on unless --all.
+                           Report: on by default — the tables ARE the report
+        --full             report the prose too: the caveats, the footnotes, the
+                           per-country required-field sets, the Fresha B2B exclusion
+                           banner and the progress lines. A SEPARATE axis from
+                           --detail/--summary, so --full --summary is valid (every
+                           caveat, no tables). Report mode; without it an interactive
+                           run is asked, and a non-interactive one is concise.
+        --concise          force it off (the default). Report mode.
+
+                           A report narrowed to ONE country prints nothing about any
+                           other: no B2B banner, no cross-country counts, no ALL
+                           roll-up. --full does not override that.
   Non-interactive
         --json             emit one result document on stdout; every human-readable
                            line goes to stderr instead. Exit code is in "exit".
@@ -660,7 +848,7 @@ FLAGS
                            see below.
 
 WRITES STILL REQUIRE A TERMINAL. --yes covers the modes that only issue SELECTs:
-pre-flight, post-flight, plugin audit, and link with --dry-run. Every write path
+pre-flight, post-flight, plugin audit, report, and link with --dry-run. Every write path
 (--link --apply, --migrate, --reset) refuses without a TTY in every namespace,
 production or not, and --yes never answers a write confirmation. Exit ${EXIT_USAGE}.
 
@@ -1022,8 +1210,13 @@ function fetchPrimaryLegalEntities(env, providerIds) {
 
 // Every provider that has an account configuration at all — the default target
 // set when you don't name providers yourself. DISTINCT because a provider can
-// have more than one configuration; NULL provider_id rows (migrated configs that
-// only link through invoice_entity_id) can't be resolved here, so they're excluded.
+// have more than one configuration.
+//
+// `provider_id IS NULL` excludes the Fresha B2B account: the configuration that
+// releases Fresha's own B2B invoices, which is not a provider and so has no
+// provider_id to key on. Every query in this script keys on provider_id, so it
+// cannot be covered here at all. It may need a legal entity of its own — NOT
+// confirmed as of 2026-07-29; check it by hand.
 function fetchAllProviderIds(env) {
   const sql =
     "SELECT DISTINCT provider_id\n" +
@@ -1285,6 +1478,11 @@ function fetchLegalEntityFields(env, legalEntityIds) {
     if (!map.has(id)) map.set(id, new Map());
     map.get(id).set(key, value);
   }
+  // The map is keyed by id, but callers hand compareFields only the inner map — so the
+  // entity it read stays unnameable in the output unless the id travels inside it too.
+  // Set here rather than as another UNION: the `_column.*` rows already guarantee an
+  // entry for every id that exists, so this costs nothing.
+  for (const [id, entityFields] of map) entityFields.set("_column.id", id);
   return map;
 }
 
@@ -1322,7 +1520,11 @@ function leValue(fields, keys) {
 
 // Per provider: which comparable fields agree, and which don't. A field where
 // both sides are empty isn't comparable and is skipped entirely.
-function compareFields(providerId, billing, fields, countryCode) {
+// `opts` is the report's alone: pre-flight and the plugin audit pass nothing and keep
+// today's behaviour exactly. showAll keeps every comparable field in the table; source is
+// carried through so the printer can say where the country came from.
+function compareFields(providerId, billing, fields, countryCode, opts = {}) {
+  const { showAll = false, countrySource = "configuration" } = opts;
   const rows = [];
   // "individual" vs everything else (organization, trust, sole_proprietorship,
   // unincorporated_partnership) — see `only` on FIELD_COMPARISON.
@@ -1332,15 +1534,28 @@ function compareFields(providerId, billing, fields, countryCode) {
   const required = requiredFieldsFor(countryCode);
 
   for (const spec of FIELD_COMPARISON) {
-    if (spec.only && spec.only !== kind) continue;
-
     const isRequired = Boolean(required && required.includes(spec.pbi));
+
+    // `only` says this entity type has no key for the field — an individual has no
+    // organization.legalName. That is a reason not to compare it, never a reason to hide a
+    // field the country REQUIRES: ES and IT both require company_name, and an individual
+    // entity satisfies it through legal-entities' own legal_name, derived from the person's
+    // name (Common.LegalEntityBillingDetails maps company_name from invoice_details
+    // .legal_name). So the row stays, marked entity-type-dependent — neither dropped, which
+    // hides a required field, nor called missing, which this side cannot establish.
+    const wrongKind = Boolean(spec.only && spec.only !== kind);
+    if (wrongKind && !isRequired) continue;
+
     const pbiValue = billing ? billing[spec.pbi] || "" : "";
     const { value: leVal, key: leKey } = leValue(fields, spec.le);
 
     // A required field is reported even when BOTH sides are empty — that's the
     // worst case for onboarding, not something to quietly skip.
-    if (!pbiValue && !leVal && !isRequired) continue;
+    //
+    // showAll keeps the optional ones too. Pre-flight prints a verdict, so a field nothing
+    // required and nothing has is noise there; the report's table IS the answer, and a row
+    // you cannot see cannot tell you the field is missing.
+    if (!pbiValue && !leVal && !isRequired && !showAll) continue;
 
     const same = normalizeValue(pbiValue) === normalizeValue(leVal);
     const presence = pbiValue && leVal ? "both" : pbiValue ? "provider only" : leVal ? "legal entity only" : "neither";
@@ -1354,12 +1569,17 @@ function compareFields(providerId, billing, fields, countryCode) {
       label: spec.label,
       pbi: pbiValue,
       le: leVal,
-      leKey: leKey || fallbackLeKey(spec.le, kind),
+      // No key for a wrongKind row: naming organization.legalName on an individual entity
+      // asserts a slot that entity type does not have. The note says where it comes from.
+      leKey: wrongKind ? "" : leKey || fallbackLeKey(spec.le, kind),
       required: isRequired,
       // Informational means "no legal-entity counterpart by design" — but if the
       // country's required set names the field, a counterpart is expected and the
       // exemption no longer applies (SA's buildingNumber/district).
       informational: Boolean(spec.informational) && !isRequired,
+      // Required, but the entity type has no key to hold it. Not blocking: whether it is
+      // satisfied is decided inside legal-entities, not by any key this script can read.
+      entityTypeDependent: wrongKind,
       same,
       presence,
       rule,
@@ -1368,20 +1588,23 @@ function compareFields(providerId, billing, fields, countryCode) {
       // What actually breaks e-invoicing: a REQUIRED field missing from the legal
       // entity ({:error, :missing_required_fields}), or one present but in a shape
       // ValidationHelpers rejects.
-      blocking: (isRequired && !leVal) || leBadFormat,
-      note: leBadFormat
-        ? `INVALID FORMAT in legal entity — ${rule.expected}`
-        : same
-          ? pbiBadFormat
-            ? `both sides invalid — ${rule.expected}`
-            : ""
-          : isRequired && !leVal
-            ? "REQUIRED by e-invoicing — missing in legal entity"
-            : !pbiValue
-              ? "missing in billing info"
-              : !leVal
-                ? "missing in legal entity"
-                : "differs",
+      blocking: !wrongKind && ((isRequired && !leVal) || leBadFormat),
+      note: wrongKind
+        ? `REQUIRED by e-invoicing — a ${kind} entity has no ${spec.only} key for it; ` +
+          "legal-entities derives it from the entity's own legal name"
+        : leBadFormat
+          ? `INVALID FORMAT in legal entity — ${rule.expected}`
+          : same
+            ? pbiBadFormat
+              ? `both sides invalid — ${rule.expected}`
+              : ""
+            : isRequired && !leVal
+              ? "REQUIRED by e-invoicing — missing in legal entity"
+              : !pbiValue
+                ? "missing in billing info"
+                : !leVal
+                  ? "missing in legal entity"
+                  : "differs",
     });
   }
 
@@ -1389,12 +1612,25 @@ function compareFields(providerId, billing, fields, countryCode) {
     providerId,
     billing,
     entityType,
+    legalEntityId: (fields && fields.get("_column.id")) || "",
     countryCode: countryCode || "",
+    countrySource,
     required,
     rows,
-    diffs: rows.filter((r) => !r.same && !r.informational),
+    // entityTypeDependent is not a difference to reconcile — nothing here can settle it —
+    // so it stays out of both buckets and out of the pre-flight verdict it would otherwise
+    // move.
+    diffs: rows.filter((r) => !r.same && !r.informational && !r.entityTypeDependent),
     blocking: rows.filter((r) => r.blocking),
   };
+}
+
+// The rows the "N/M comparable fields" counts are about. Informational rows have no
+// legal-entity counterpart by design; entityTypeDependent rows have none on THIS entity
+// type, which is equally not a comparison. In a helper because three places count them and
+// they must not drift.
+function comparableRows(cmp) {
+  return cmp.rows.filter((r) => !r.informational && !r.entityTypeDependent);
 }
 
 // The per-provider checklist: every comparable field, matching or not, with the
@@ -1404,6 +1640,8 @@ function printProviderFieldTable(cmp, heading) {
   const mark = (row) => {
     if (row.leBadFormat) return `${c.bad("⛔ INVALID FORMAT")}`;
     if (row.blocking) return `${c.bad("⛔ BLOCKS e-invoicing")}`;
+    // Required, and settled inside legal-entities rather than by a key here.
+    if (row.entityTypeDependent) return `${c.warn("?")} REQUIRED — entity type decides`;
     if (row.informational) return `${c.faint("provider only")}`;
     if (row.same) return `${c.ok("✅")} both`;
     if (row.presence === "both") return `${c.bad("❌")} differs`;
@@ -1412,9 +1650,15 @@ function printProviderFieldTable(cmp, heading) {
   };
 
   const country = cmp.countryCode || "?";
-  const scope = cmp.required
-    ? c.warn(`e-invoicing country ${country}`)
-    : c.faint(`${country} — not an e-invoicing country, nothing required`);
+  const scope =
+    (cmp.required
+      ? c.warn(`e-invoicing country ${country}`)
+      : cmp.countryCode
+        ? c.faint(`${country} — not an e-invoicing country, nothing required`)
+        : c.warn("no country anywhere — cannot tell which required set applies")) +
+    // Which country was used, when it did not come from the account configuration. The
+    // validator dispatches on the configuration's country, so an inferred one has to say so.
+    c.faint(countrySourceNote(cmp.countrySource));
 
   console.log(
     c.head(
@@ -1422,7 +1666,11 @@ function printProviderFieldTable(cmp, heading) {
         "──────────────────"
     )
   );
+  // Its own line, not folded into the heading: callers pass their own heading (the plugin
+  // audit does), and a uuid there would push the rule past a terminal width anyway.
+  if (cmp.legalEntityId) console.log(`  ${c.faint("legal entity")} ${cmp.legalEntityId}`);
   console.log(`  ${scope}`);
+  printRequiredRule(cmp.countryCode);
 
   console.log(
     renderTable(
@@ -1437,18 +1685,24 @@ function printProviderFieldTable(cmp, heading) {
     )
   );
 
-  const comparable = cmp.rows.filter((r) => !r.informational);
+  const comparable = comparableRows(cmp);
   // A row where BOTH sides are empty is "equal" but still blocking — agreement on
   // nothing is not agreement, so it must not inflate the count.
   const matched = comparable.filter((r) => r.same && !r.blocking).length;
-  const informationalCount = cmp.rows.length - comparable.length;
+  // Counted apart: "provider-only" is true of an informational column and false of a
+  // required field this entity type has no key for. One number for both named the second
+  // one wrongly.
+  const informationalCount = cmp.rows.filter((r) => r.informational).length;
+  const entityTypeCount = cmp.rows.filter((r) => r.entityTypeDependent).length;
+  const asides = [
+    informationalCount ? `${informationalCount} provider-only column(s)` : null,
+    entityTypeCount ? `${entityTypeCount} settled by entity type` : null,
+  ].filter(Boolean);
 
   console.log(
     `\n  ${matched === comparable.length ? c.ok("✓") : c.bad("✗")} ` +
       `${matched}/${comparable.length} comparable fields agree` +
-      (informationalCount
-        ? c.faint(`   (${informationalCount} provider-only column(s) not compared)`)
-        : "")
+      (asides.length ? c.faint(`   (not compared: ${asides.join(", ")})`) : "")
   );
 
   if (cmp.blocking.length) {
@@ -1531,7 +1785,7 @@ function printFieldComparison(comparisons, missing = []) {
   );
 
   for (const cmp of clean) {
-    const comparable = cmp.rows.filter((r) => !r.informational).length;
+    const comparable = comparableRows(cmp).length;
     console.log(
       `  ${c.ok("✓")} provider=${cmp.providerId}  ` +
         c.faint(`${comparable}/${comparable} comparable fields match`) +
@@ -1663,6 +1917,749 @@ function printPreflightVerdict(tally, missing) {
   return failed;
 }
 
+// --- rollout report (--report) -------------------------------------------------
+//
+// The scout you run BEFORE the guided rollout: one pass over every provider with an
+// e-invoicing account configuration, answering "what have we got?" rather than
+// "does this one provider pass?".
+//
+// The awkward part is that before the rollout most providers have no legal entity,
+// so the billing ↔ legal-entity comparison has nothing on its right-hand side.
+// Those providers get a different table — the same fields read from
+// provider_billing_informations alone, asking whether migrate will have what it
+// needs. Providers that HAVE been migrated get the ordinary comparison.
+
+// Every account_configuration with the country that decides its required-field set.
+// Unlike fetchAccountConfigCountries this keeps what it cannot use — a config with
+// no provider_id, or a country with no e-invoicing rules — so the report can state
+// what it left out instead of quietly shrinking. providerIds null means "all".
+function fetchAccountConfigSurvey(env, providerIds) {
+  const sql =
+    "SELECT coalesce(provider_id::text, ''), coalesce(country_code, '')\n" +
+    "FROM account_configurations\n" +
+    (providerIds ? `WHERE provider_id IN (${providerIds.join(",")})\n` : "") +
+    "ORDER BY provider_id;";
+
+  const countries = new Map(); // provider_id -> country code
+  const configCount = new Map(); // provider_id -> how many configurations it has
+  let noProviderId = 0; // the Fresha B2B account — see printB2bBanner
+
+  for (const [providerId, countryCode] of parseRows(psqlRead(env, AD_DB, sql), 2)) {
+    if (!providerId) {
+      noProviderId++;
+      continue;
+    }
+    configCount.set(providerId, (configCount.get(providerId) || 0) + 1);
+
+    // A provider can hold more than one configuration and they can disagree. The
+    // e-invoicing country is the one that decides the required set, so it wins;
+    // otherwise first non-empty. Providers with more than one config are counted so
+    // a disagreement is visible rather than resolved silently.
+    const country = countryCode.toUpperCase();
+    const seen = countries.get(providerId);
+    if (!seen || (!requiredFieldsFor(seen) && requiredFieldsFor(country))) {
+      countries.set(providerId, country);
+    }
+  }
+
+  return { countries, configCount, noProviderId };
+}
+
+// The one thing this report cannot cover, stated up front rather than as a footnote.
+//
+// `account_configurations` rows with `provider_id IS NULL` are the Fresha B2B
+// account — the configuration that releases Fresha's own B2B invoices. It is not a
+// provider, so it has no provider_id, and every query in this script keys on
+// provider_id. There is no way to fold it in without a different lookup entirely.
+//
+// Whether it needs a legal entity of its own is OPEN as of 2026-07-29. The banner
+// says so rather than implying the exclusion is harmless.
+function printB2bBanner(noProviderId) {
+  if (!noProviderId) return;
+  // Prose, and cross-country prose at that: the B2B account belongs to no country, so a
+  // report narrowed to one has no business raising it.
+  if (!reportView.verbose || !reportView.crossCountry) return;
+
+  console.log(c.warn("\n── EXCLUDED FROM THIS REPORT: the Fresha B2B account ───"));
+  console.log(
+    `  ${noProviderId} account_configurations row(s) have ` +
+      `${c.warn("provider_id = NULL")}.`
+  );
+  console.log(
+    c.faint(
+      "  That is the Fresha B2B account — the one that releases B2B invoices — not a\n" +
+        "  provider. Every query here keys on provider_id, so nothing below covers it."
+    )
+  );
+  console.log(
+    c.warn("  It may need a legal entity of its own. NOT CONFIRMED — check separately.")
+  );
+}
+
+// The two fields observed present in provider_billing_informations and empty on the
+// legal entity built from it (provider 33: building_number and district both 1234 in
+// billing, ∅ in the entity). A value in billing therefore does NOT predict a value
+// on the entity, so the report shows them and refuses to count them as ready.
+const UNVERIFIED_PROPAGATION = new Set(["building_number", "district"]);
+
+// The billing-side readiness view, for a provider with no legal entity yet. Same
+// field spec and same required set as compareFields — read from one side, because
+// that is the only side that exists.
+function assessBilling(providerId, billing, countryCode, opts = {}) {
+  const { showAll = false, countrySource = "configuration" } = opts;
+  const required = requiredFieldsFor(countryCode) || [];
+  const rows = [];
+
+  for (const spec of FIELD_COMPARISON) {
+    const isRequired = required.includes(spec.pbi);
+    const value = billing ? billing[spec.pbi] || "" : "";
+
+    // An empty optional field is not a finding — but with showAll it is still a row. The
+    // table is the checklist, and it can only say a field is missing if the field is in it.
+    if (!isRequired && !value && !showAll) continue;
+
+    // The format rules apply to the billing value here, not the entity's: migrate
+    // copies this value forward, so a malformed one arrives malformed.
+    const rule = formatRuleFor(countryCode, spec.pbi);
+    const badFormat = Boolean(rule && value && !rule.test(value));
+
+    let state = "present";
+    if (isRequired && !value) state = "absent";
+    else if (badFormat) state = "bad_format";
+    else if (isRequired && UNVERIFIED_PROPAGATION.has(spec.pbi)) state = "unverified";
+
+    // ES and IT require company_name, but FIELD_COMPARISON marks that field
+    // only: "organization" — compareFields skips it entirely for an individual legal
+    // entity, whose name lives in individual.name.*. Here there is no entity yet, so
+    // there is no type to branch on. When the person-name columns are filled and the
+    // company column is not, calling it "absent" asserts something we cannot know:
+    // migrate may create an individual entity, for which the required name field is
+    // the person's and this row is not a gap at all.
+    if (
+      state === "absent" &&
+      spec.pbi === "company_name" &&
+      billing &&
+      billing.first_name &&
+      billing.last_name
+    ) {
+      state = "entity_type";
+    }
+
+    rows.push({
+      label: spec.label,
+      field: spec.pbi,
+      required: isRequired,
+      value,
+      state,
+      expected: rule ? rule.expected : null,
+      // Where migrate has to land this value. Shown so the readiness table has the
+      // same shape as the comparison; the organization variant, since entity type
+      // isn't decided yet.
+      leKey: spec.le[0] || "",
+    });
+  }
+
+  return {
+    providerId,
+    countryCode,
+    countrySource,
+    hasBilling: Boolean(billing),
+    rows,
+    absent: rows.filter((r) => r.state === "absent"),
+    badFormat: rows.filter((r) => r.state === "bad_format"),
+    unverified: rows.filter((r) => r.state === "unverified"),
+    entityType: rows.filter((r) => r.state === "entity_type"),
+    personName: Boolean(billing && billing.first_name && billing.last_name),
+  };
+}
+
+function printBillingReadinessTable(a) {
+  const mark = {
+    present: `${c.ok("✅")} present`,
+    absent: `${c.bad("⛔ ABSENT")} — migrate has nothing to copy`,
+    bad_format: `${c.bad("⛔ INVALID FORMAT")}`,
+    unverified: `${c.warn("⚠")} in billing — propagation unverified`,
+    entity_type: `${c.warn("?")} absent — but a person's name is present`,
+  };
+
+  console.log(
+    c.head(
+      `\n── provider=${a.providerId} (${a.countryCode || "?"}) — NOT MIGRATED ` +
+        "──────────────────"
+    )
+  );
+  const rules = requiredFieldsFor(a.countryCode);
+  console.log(
+    `  ${
+      rules
+        ? c.warn(`e-invoicing country ${a.countryCode}`)
+        : a.countryCode
+          ? c.faint(`${a.countryCode} — not an e-invoicing country, nothing required`)
+          : c.warn("no country anywhere — no required set can be determined")
+    }${c.faint(countrySourceNote(a.countrySource))}` +
+      c.faint(" · no legal entity yet, reporting on billing info alone")
+  );
+  printRequiredRule(a.countryCode);
+
+  if (!a.hasBilling) {
+    console.log(
+      c.bad("\n  ⛔ No active provider_billing_informations row.") +
+        c.faint("\n     migrate builds the legal entity from that row, so there is nothing") +
+        c.faint("\n     for it to build from. This provider cannot be rolled out yet.")
+    );
+    return;
+  }
+
+  // Same five columns as the comparison table, so every provider in the report reads
+  // the same way. The legal-entity column names the key migrate has to fill and shows
+  // ∅ — the identical rendering the comparison uses for a field the entity is missing.
+  console.log(
+    renderTable(
+      ["FIELD", "REQ?", `PROVIDER BILLING (${SHEDUL_DB})`, "LEGAL ENTITY (fields jsonb)", "READY?"],
+      a.rows.map((r) => [
+        r.label,
+        r.required ? c.warn("yes") : "",
+        r.value || c.faint("∅"),
+        r.leKey ? c.faint(`${r.leKey} = ∅`) : "—",
+        mark[r.state] || r.state,
+      ])
+    )
+  );
+
+  const problems = a.absent.length + a.badFormat.length;
+  console.log(
+    problems
+      ? c.bad(
+          `\n  ⛔ ${problems} required field(s) not usable: ` +
+            [...a.absent, ...a.badFormat]
+              .map((r) => `${r.label} (${r.state === "absent" ? "absent" : "invalid format"})`)
+              .join(", ")
+        )
+      : rules
+        ? `\n  ${c.ok("✓")} every field ${a.countryCode} requires is present in billing info.`
+        : // No required set, so "complete" would be a claim about nothing. Say that.
+          c.faint(
+            `\n  – no required fields for ${a.countryCode || "an unknown country"} — ` +
+              "nothing here can fall short."
+          )
+  );
+
+  for (const r of a.badFormat) {
+    console.log(c.faint(`     ${r.label}: "${r.value}" — expected ${r.expected}`));
+  }
+  if (a.unverified.length) {
+    console.log(
+      c.warn(
+        `  ⚠ ${a.unverified.length} required field(s) present in billing but not ` +
+          "confirmed to reach the entity: " +
+          a.unverified.map((r) => r.label).join(", ")
+      )
+    );
+    console.log(
+      c.faint(
+        "     Provider 33 carries both in billing info and has neither on its legal\n" +
+          "     entity, so migrate is not known to copy them. Re-check with pre-flight\n" +
+          "     after migrating — this report cannot promise them."
+      )
+    );
+  }
+}
+
+// One row per provider, worst first. `state` drives both the ordering and the glyph;
+// everything else is what the one-liner needs to say.
+//
+// no_country and no_rules exist because the report covers EVERY account
+// configuration, not just the e-invoicing countries. Without them a provider with no
+// required-field set would be scored "ready" — trivially true, since nothing was
+// required of it — and the ready count would mean two different things at once.
+const REPORT_STATES = [
+  "no_billing",
+  "blocked",
+  "differ",
+  "entity_type_unclear",
+  "no_country",
+  "not_linked",
+  "ready",
+  "no_rules",
+  "done",
+];
+
+// How much of the report to print. Two independent axes, and conflating them was the
+// old bug: `detail` decides whether the per-provider tables are drawn, so the only way
+// to shorten the report used to be to throw away its data.
+//
+//   verbose      the prose — banners, caveats, footnotes, progress chatter. OFF by
+//                default: concise is the numbers and the tables, with nothing that
+//                explains them. The verbosity prompt, --full and the refine menu set it.
+//   crossCountry false the moment the shown set is a single country, and then NOTHING
+//                about any other country is printed — no exclusion banner, no
+//                other-country counts, no ALL roll-up. This overrides verbose: asking
+//                for one country means that country and no other.
+//
+// Set once per render, read by the report printers and the Markdown builder. Pre-flight
+// shares printProviderFieldTable / printBillingReadinessTable and is unaffected — those
+// print verdicts, which are data, not prose.
+const reportView = { verbose: false, crossCountry: true };
+
+// The states that mean somebody has to do something. no_rules is not one of them,
+// and neither is ready — those are the report working as intended.
+const ATTENTION_STATES = new Set([
+  "no_billing",
+  "blocked",
+  "differ",
+  "entity_type_unclear",
+  "no_country",
+  "not_linked",
+]);
+
+function classifyProvider({
+  providerId,
+  country,
+  migrated,
+  cmp,
+  assessment,
+  plugins,
+  primary,
+  // Only the report sets this false, and only for a provider it was asked about by name.
+  // It changes no verdict — a missing configuration and a configuration with a NULL
+  // country_code are both "no country, so no validator" — only which of the two the note
+  // names, because "NO country on the account configuration" asserts a row that is not
+  // there.
+  hasConfig = true,
+}) {
+  const linkedToPrimary = plugins.filter((p) => p.legalEntityId && p.legalEntityId === primary);
+  const linkedElsewhere = plugins.filter((p) => p.legalEntityId && p.legalEntityId !== primary);
+  const unlinked = plugins.filter((p) => !p.legalEntityId);
+
+  const base = {
+    providerId,
+    country,
+    migrated,
+    primary: primary || null,
+    plugins,
+    linkedToPrimary: linkedToPrimary.length,
+    linkedElsewhere: linkedElsewhere.length,
+    unlinked: unlinked.length,
+    cmp: cmp || null,
+    assessment: assessment || null,
+    hasConfig,
+  };
+
+  // Not migrated: the only questions are whether billing exists and whether it
+  // carries the required set. Nothing downstream can be assessed yet.
+  if (!migrated) {
+    if (!assessment.hasBilling) {
+      return { ...base, state: "no_billing", note: "NO active billing row — migrate has nothing to build from" };
+    }
+    const problems = assessment.absent.length + assessment.badFormat.length;
+    if (problems) {
+      return {
+        ...base,
+        state: "blocked",
+        note: `${problems} required field(s) not usable in billing info — migrate would produce a blocked entity`,
+      };
+    }
+    // Not scored as blocked: whether this is a gap depends on the entity type migrate
+    // chooses, which does not exist yet. Someone has to decide, so it stays an
+    // attention state — but conflating it with a hard blocker overstated the problem
+    // by 60 providers on the first production run.
+    if (assessment.entityType.length) {
+      return {
+        ...base,
+        state: "entity_type_unclear",
+        note:
+          `company name absent but a person's name is present — ${country} requires a ` +
+          "legal name, and which field satisfies it depends on whether migrate creates an " +
+          "organization or an individual entity",
+      };
+    }
+    // No country means no validator can be identified: BillingDetailsPolicy
+    // dispatches on the account configuration's country, so "nothing required" and
+    // "we cannot tell what is required" are different answers.
+    if (!country) {
+      return {
+        ...base,
+        state: "no_country",
+        note: hasConfig
+          ? "NO country on the account configuration — cannot tell which validator applies"
+          : "NO account configuration at all — cannot tell which validator applies",
+      };
+    }
+    if (!requiredFieldsFor(country)) {
+      return {
+        ...base,
+        state: "no_rules",
+        note: `no e-invoicing rules for ${country} — billing row present, nothing required of it`,
+      };
+    }
+    return {
+      ...base,
+      state: "ready",
+      note:
+        "billing info complete — ready to migrate" +
+        (assessment.unverified.length ? `  (${assessment.unverified.length} unverified)` : ""),
+    };
+  }
+
+  // Migrated: the ordinary comparison decides, and only then does the link state
+  // matter — a correctly linked plugin holding a blocked entity is not progress.
+  if (cmp.blocking.length) {
+    return {
+      ...base,
+      state: "blocked",
+      note: `${cmp.blocking.length} required field(s) unusable on the legal entity`,
+    };
+  }
+  if (!cmp.billing) {
+    return { ...base, state: "no_billing", note: "migrated, but no active billing row to check against" };
+  }
+  if (cmp.diffs.length) {
+    return { ...base, state: "differ", note: `${cmp.diffs.length} field(s) differ from billing info` };
+  }
+  if (!plugins.length) {
+    return { ...base, state: "not_linked", note: "consistent, but no e-invoicing plugin exists yet" };
+  }
+  if (!linkedToPrimary.length) {
+    return {
+      ...base,
+      state: "not_linked",
+      note:
+        `consistent, but ${unlinked.length} plugin(s) unlinked` +
+        (linkedElsewhere.length ? ` and ${linkedElsewhere.length} linked elsewhere` : "") +
+        " — link has work to do",
+    };
+  }
+  if (linkedElsewhere.length || unlinked.length) {
+    return {
+      ...base,
+      state: "not_linked",
+      note: `${linkedToPrimary.length} plugin(s) linked, ${unlinked.length + linkedElsewhere.length} not`,
+    };
+  }
+  return { ...base, state: "done", note: `consistent, ${linkedToPrimary.length} plugin(s) linked` };
+}
+
+const REPORT_MARKS = {
+  no_billing: () => c.bad("⛔"),
+  blocked: () => c.bad("⛔"),
+  differ: () => c.bad("✗"),
+  entity_type_unclear: () => c.warn("?"),
+  no_country: () => c.warn("⚠"),
+  not_linked: () => c.warn("·"),
+  ready: () => c.ok("✓"),
+  no_rules: () => c.faint("–"),
+  done: () => c.ok("✓"),
+};
+
+// The three e-invoicing countries are the point of the exercise and each has its own
+// required set, its own validator and — on the first production run — its own
+// distinct failure mode. So they're reported separately rather than pooled.
+const COUNTRY_NAMES = { SA: "KSA", ES: "Spain", IT: "Italy" };
+
+// Fields the country's own onboarding validator does not list but the send path does.
+// Without this, a reader who checks Comarch's @required_fields and finds no
+// company_name would think the script invented the requirement.
+function sendPathOnlyNote(country) {
+  const extra = REQUIRED_BY_SEND_PATH_ONLY[country];
+  if (!extra) return "";
+  return `${extra.map((f) => f.replace(/_/g, " ")).join(", ")} is required by the SEND path ` +
+    "(Common.LegalEntityBillingDetails), not by this country's onboarding validator";
+}
+
+function countryLabel(country) {
+  if (!country) return "NO COUNTRY on the configuration";
+  return COUNTRY_NAMES[country] ? `${COUNTRY_NAMES[country]} (${country})` : country;
+}
+
+// Which module in app-accounting-documents declares the country's @required_fields. Printed
+// with the rule so a reader can check the list against the source instead of trusting it.
+// See the EINVOICING_REQUIRED comment for why SA differs and why company_name is in both.
+const REQUIRED_SOURCE = {
+  SA: "Comarch.LegalEntityBillingDetails @required_fields (onboarding)",
+  ES: "Common.LegalEntityBillingDetails @required_fields (onboarding + send)",
+  IT: "Common.LegalEntityBillingDetails @required_fields (onboarding + send)",
+};
+
+// The rule the PRESENT?/READY? column is judging against, printed above every table in that
+// format. Without it the marks are a verdict with no stated standard — a reader can see that
+// state/province blocks but not that ES is what demands it, or where that is written down.
+// Both printers call this so the two cannot drift.
+function printRequiredRule(country, indent = "  ") {
+  const required = requiredFieldsFor(country);
+  if (!required) return;
+
+  const pad = `${indent}      `;
+  const human = (f) => f.replace(/_/g, " ");
+
+  console.log(`${indent}${c.faint("rule:")} ${country} requires ${required.map(human).join(", ")}`);
+  if (REQUIRED_SOURCE[country]) console.log(pad + c.faint(REQUIRED_SOURCE[country]));
+
+  const sendOnly = sendPathOnlyNote(country);
+  if (sendOnly) console.log(pad + c.faint(sendOnly));
+
+  // Presence is not the whole rule where ValidationHelpers also constrains the shape.
+  for (const [field, rule] of Object.entries(EINVOICING_FORMATS[country] || {})) {
+    console.log(pad + c.faint(`${human(field)} — ${rule.expected}`));
+  }
+}
+
+// The report's country, and where it came from. account_configurations.country_code is the
+// one BillingDetailsPolicy actually dispatches on, so it wins — but its absence is not a
+// reason to stop knowing what a country requires. The required set is a property of the
+// country alone: which fields onboarding demands, and which of them are missing, does not
+// depend on whether a configuration row exists to name the country.
+//
+// Both fallbacks are already in hand by the time this runs — fetchLegalEntityFields unions
+// legal_entities.country_code in as `_column.country_code`, and country_code is one of
+// PBI_COLUMNS — so resolving costs no query. Entity before billing: the entity is the side
+// e-invoicing reads, so where the two disagree its own country is the more relevant one.
+function resolveCountry(configCountry, leFields, billing) {
+  if (configCountry) return { country: configCountry, source: "configuration" };
+  const le = ((leFields && leFields.get("_column.country_code")) || "").toUpperCase();
+  if (le) return { country: le, source: "legal entity" };
+  const pbi = ((billing && billing.country_code) || "").toUpperCase();
+  if (pbi) return { country: pbi, source: "billing info" };
+  return { country: "", source: "" };
+}
+
+// Said once, so the two tables cannot word it differently. Empty when the country came from
+// the configuration, which is the case that needs no qualifier.
+function countrySourceNote(source) {
+  if (!source || source === "configuration") return "";
+  return `  (from the ${source} — no country on the account configuration)`;
+}
+
+// E-invoicing countries first, in the order their required sets are declared, then
+// everything else alphabetically, then the no-country group last.
+function groupByCountry(rows) {
+  const order = Object.keys(EINVOICING_REQUIRED);
+  const groups = new Map();
+  for (const r of rows) {
+    if (!groups.has(r.country)) groups.set(r.country, []);
+    groups.get(r.country).push(r);
+  }
+  return [...groups.entries()].sort(([a], [b]) => {
+    const ia = order.indexOf(a);
+    const ib = order.indexOf(b);
+    if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    if (!a) return 1;
+    if (!b) return -1;
+    return a.localeCompare(b);
+  });
+}
+
+function printReportRoster(rows) {
+  const stateOrder = (r) => REPORT_STATES.indexOf(r.state);
+
+  for (const [country, group] of groupByCountry(rows)) {
+    const required = requiredFieldsFor(country);
+    console.log(
+      c.head(`\n── ${countryLabel(country)} — ${group.length} provider(s) `.padEnd(56, "─"))
+    );
+    // The required set explains the verdicts rather than adding to them, so it belongs
+    // to the prose. Each provider line already names what it is short of.
+    if (reportView.verbose) {
+      console.log(
+        required
+          ? c.faint(
+              `  requires: ${required.map((f) => f.replace(/_/g, " ")).join(", ")}`
+            )
+          : c.faint("  no e-invoicing required-field set")
+      );
+      if (sendPathOnlyNote(country)) console.log(c.faint(`  note: ${sendPathOnlyNote(country)}`));
+    }
+
+    const width = Math.max(...group.map((r) => String(r.providerId).length));
+    for (const r of [...group].sort(
+      (a, b) => stateOrder(a) - stateOrder(b) || Number(a.providerId) - Number(b.providerId)
+    )) {
+      console.log(
+        `  ${REPORT_MARKS[r.state]()} provider=${String(r.providerId).padEnd(width)}  ` +
+          `${(r.migrated ? "migrated" : "not migrated").padEnd(12)}  ${r.note}`
+      );
+    }
+  }
+}
+
+function printReportSummary(rows, survey, scope) {
+  const count = (state) => rows.filter((r) => r.state === state).length;
+  const migrated = rows.filter((r) => r.migrated);
+  const fresh = rows.filter((r) => !r.migrated);
+  const of = (subset, state) => subset.filter((r) => r.state === state).length;
+
+  console.log(c.head("\n══ Rollout readiness ════════════════════════════════════"));
+  console.log(`  ${rows.length} provider(s) with an account configuration`);
+  // The breakdown names other countries, so it goes when the report is about one.
+  if (reportView.crossCountry) console.log(`    ${c.faint(countryBreakdown(rows))}`);
+
+  // Per country first — that's the unit the rollout is planned in, and the totals
+  // underneath mean little on their own when each country fails differently.
+  for (const [country, group] of groupByCountry(rows)) {
+    const gm = group.filter((r) => r.migrated);
+    const gf = group.filter((r) => !r.migrated);
+    console.log(
+      `\n  ${c.head(countryLabel(country))} ${c.faint(`— ${group.length} provider(s)`)}`
+    );
+    if (gm.length) {
+      console.log(
+        `    ${"migrated".padEnd(14)}${String(gm.length).padStart(6)}   ` +
+          `${c.ok(`✓ ${of(gm, "done")} consistent & linked`)}   ` +
+          `${c.warn(`· ${of(gm, "not_linked")} not linked`)}   ` +
+          `${c.bad(`✗ ${of(gm, "differ")} differ`)}   ` +
+          `${c.bad(`⛔ ${of(gm, "blocked") + of(gm, "no_billing")} blocked`)}`
+      );
+    }
+    if (gf.length) {
+      const bits = [
+        c.ok(`✓ ${of(gf, "ready")} ready`),
+        of(gf, "no_rules") ? c.faint(`– ${of(gf, "no_rules")} no rules`) : null,
+        of(gf, "entity_type_unclear")
+          ? c.warn(`? ${of(gf, "entity_type_unclear")} entity type unclear`)
+          : null,
+        of(gf, "no_country") ? c.warn(`⚠ ${of(gf, "no_country")} no country`) : null,
+        of(gf, "blocked") ? c.bad(`⛔ ${of(gf, "blocked")} incomplete billing`) : null,
+        of(gf, "no_billing") ? c.bad(`⛔ ${of(gf, "no_billing")} no billing row`) : null,
+      ].filter(Boolean);
+      console.log(`    ${"not migrated".padEnd(14)}${String(gf.length).padStart(6)}   ${bits.join("   ")}`);
+    }
+
+    // The propagation caveat is per country: it only bites where the required set
+    // names building number / district, which today is KSA alone.
+    const unv = group.filter((r) => r.assessment && r.assessment.unverified.length);
+    if (unv.length) {
+      console.log(
+        c.warn(
+          `    ${"".padEnd(14)}${"".padStart(6)}   ⚠ ${unv.length} of those depend on building ` +
+            "number / district (unproven)"
+        )
+      );
+    }
+  }
+
+  // The cross-country total. With one country shown its block above already IS the
+  // total, so printing it again just makes the reader check whether they match.
+  if (reportView.crossCountry) {
+    console.log(
+      `\n  ${c.head("ALL".padEnd(14))}${String(rows.length).padStart(6)}   ` +
+        `${c.ok(`✓ ${count("ready") + count("done")} ready or done`)}   ` +
+        `${c.warn(`? ${count("entity_type_unclear")} entity type unclear`)}   ` +
+        `${c.bad(`⛔ ${count("blocked") + count("no_billing")} blocked`)}   ` +
+        `${c.bad(`✗ ${count("differ")} differ`)}   ` +
+        `${c.warn(`· ${count("not_linked")} not linked`)}   ` +
+        `${c.faint(`– ${count("no_rules")} no rules`)}   ` +
+        `${c.warn(`⚠ ${count("no_country")} no country`)}`
+    );
+  }
+  // Explains two states, so it is worth nothing when neither is present — it used to
+  // print regardless, which is the same failing as naming countries you filtered out.
+  if (reportView.verbose && (count("no_rules") || count("no_country"))) {
+    console.log(
+      c.faint(
+        "\n  \"no e-invoicing rules\" is not a problem — those countries have no required\n" +
+          "  field set, so there is nothing for migrate to fall short of. \"no country\" is:\n" +
+          "  the country is what selects the validator, so nothing can be assessed."
+      )
+    );
+  }
+  if (reportView.verbose && of(fresh, "entity_type_unclear")) {
+    console.log(
+      c.warn(
+        `\n  ? ${of(fresh, "entity_type_unclear")} provider(s): the country requires a legal ` +
+          "name, billing info has\n    no company name but does have a person's name. Whether that " +
+          "is a gap depends on\n    whether migrate builds an organization or an individual entity — " +
+          "an individual's\n    required name field is the person's. NOT counted as blocked; decide " +
+          "per provider."
+      )
+    );
+  }
+
+  // The per-country blocks above already carry this as a one-line count; this is the
+  // paragraph that says why it matters.
+  const unverified = rows.filter((r) => r.assessment && r.assessment.unverified.length).length;
+  if (reportView.verbose && unverified) {
+    console.log(
+      c.warn(
+        `\n  ⚠ ${unverified} of the "ready" providers rely on building number / district,`
+      )
+    );
+    console.log(
+      c.faint(
+        "    which migrate is not confirmed to copy from billing info onto the entity.\n" +
+          "    Treat those as unproven until pre-flight confirms them after migrating."
+      )
+    );
+  }
+
+  // Repeated at the tail as well as the banner up top: this is the number someone
+  // reads last, and "every provider" needs its exception attached to it. Neither is
+  // printed for a single-country report — the B2B account is not in that country's
+  // scope, so raising it there is exactly the noise this mode was asked to drop.
+  if (reportView.verbose && reportView.crossCountry && survey.noProviderId) {
+    console.log(
+      c.warn(
+        `\n  ⚠ Excludes the Fresha B2B account (${survey.noProviderId} row(s) with ` +
+          "provider_id = NULL) — see the banner above."
+      )
+    );
+  }
+
+  const multi = [...survey.configCount.entries()].filter(([, n]) => n > 1);
+  if (reportView.verbose && multi.length) {
+    console.log(
+      c.faint(
+        `\n  ${multi.length} provider(s) hold more than one account configuration; the ` +
+          "e-invoicing\n  country was used where they disagree."
+      )
+    );
+  }
+
+  return {
+    total: rows.length,
+    done: count("done"),
+    not_linked: count("not_linked"),
+    differ: count("differ"),
+    blocked: count("blocked"),
+    no_billing: count("no_billing"),
+    ready: count("ready"),
+    no_rules: count("no_rules"),
+    no_country: count("no_country"),
+    entity_type_unclear: count("entity_type_unclear"),
+  };
+}
+
+// The country line. E-invoicing countries are named because they're the ones with
+// rules to fail; the rest are counted, since a hundred single-provider countries
+// would bury the number that matters.
+function countryBreakdown(scopeOrRows) {
+  // Accepts either the scope object (before the condition filter, for the "in scope"
+  // line) or the row list being reported (after it, so the summary agrees with its own
+  // per-country blocks).
+  const byCountry = Array.isArray(scopeOrRows)
+    ? scopeOrRows.reduce((acc, r) => {
+        acc[r.country] = (acc[r.country] || 0) + 1;
+        return acc;
+      }, {})
+    : scopeOrRows.byCountry;
+
+  const rules = Object.entries(byCountry)
+    .filter(([country]) => requiredFieldsFor(country))
+    .sort((a, b) => b[1] - a[1]);
+  const other = Object.entries(byCountry).filter(
+    ([country]) => country && !requiredFieldsFor(country)
+  );
+  const otherTotal = other.reduce((n, [, v]) => n + v, 0);
+
+  const parts = [];
+  if (rules.length) {
+    parts.push(`e-invoicing: ${rules.map(([k, v]) => `${k} ${v}`).join("  ")}`);
+  } else {
+    parts.push("e-invoicing: none");
+  }
+  if (otherTotal) parts.push(`${otherTotal} in ${other.length} other countr${other.length === 1 ? "y" : "ies"}`);
+  if (byCountry[""]) parts.push(`${byCountry[""]} with no country`);
+  return parts.join("   ·   ");
+}
+
 // --- reset (STAGING ONLY) -----------------------------------------------------
 //
 // Undoes the legal-entities migration for a provider so the task can run again
@@ -1672,10 +2669,56 @@ function printPreflightVerdict(tally, missing) {
 // It clears exactly what the migration writes (RESET_SHEDUL_STEPS, plus the
 // plugin link in accounting_documents and a soft-delete of the legal entities),
 // leaving `provider_purchases` and friends alone.
+//
+// On top of that it can OPTIONALLY wipe the provider's e-invoicing domain
+// (einvoicingTargets) — a wider clear that the migration never wrote. Off by
+// default; you're asked, or you pass --clear-einvoicing. It rides inside the
+// same per-provider preview and confirmation, and runs last.
+
+// A single query returning one "table|count" line per e-invoicing target, in
+// delete order.
+function buildEinvoicingPreviewSql(providerId) {
+  const selects = einvoicingTargets(providerId, einvoicingAnchors(providerId, "preview")).map(
+    ([table, where]) => `SELECT '${table}' AS t, count(*) AS n FROM ${table} WHERE ${where}`
+  );
+  // Preserve order with an explicit ordinal; UNION ALL alone doesn't guarantee it.
+  const ordered = selects
+    .map((s, i) => `SELECT ${i} AS ord, t, n FROM (${s}) s${i}`)
+    .join("\nUNION ALL\n");
+  return `SELECT t, n FROM (\n${ordered}\n) all_counts ORDER BY ord;`;
+}
+
+// The transactional wipe: one WITH statement, cfg/plg/doc anchors + one DELETE
+// per table. The final target (account_configurations) is the statement's main
+// DELETE; every other table is a data-modifying CTE (d1..dN).
+function buildEinvoicingClearSql(providerId) {
+  const r = einvoicingAnchors(providerId, "cte");
+  const cfgInline = `SELECT id FROM account_configurations WHERE provider_id = ${providerId}`;
+  const ctes = [
+    `cfg AS (${cfgInline})`,
+    `plg AS (SELECT id FROM account_configuration_plugins WHERE account_configuration_id IN (SELECT id FROM cfg))`,
+    `doc AS (SELECT id FROM accounting_documents WHERE account_configuration_id IN (SELECT id FROM cfg) OR provider_id = ${providerId})`,
+  ];
+
+  const rows = einvoicingTargets(providerId, r);
+  const [finalTable, finalWhere] = rows[rows.length - 1];
+  rows.slice(0, -1).forEach(([table, where], i) => {
+    ctes.push(`d${i + 1} AS (DELETE FROM ${table} WHERE ${where})`);
+  });
+
+  return (
+    `-- clear e-invoicing data for provider_id=${providerId}\n` +
+    "BEGIN;\n" +
+    `WITH ${ctes.join(",\n     ")}\n` +
+    `DELETE FROM ${finalTable} WHERE ${finalWhere};\n` +
+    "COMMIT;\n"
+  );
+}
 
 // Read-only: how many rows each step would touch, and which legal entities the
-// provider currently references.
-function fetchResetPreview(env, providerId) {
+// provider currently references. `includeEinvoicing` adds the opt-in wipe's
+// counts; without it that query never runs.
+function fetchResetPreview(env, providerId, includeEinvoicing) {
   const counts = RESET_SHEDUL_STEPS.map(
     (step) =>
       `SELECT '${step.table}' AS t, count(*) AS n FROM ${step.table} ` +
@@ -1714,7 +2757,14 @@ function fetchResetPreview(env, providerId) {
     (parseRows(psqlRead(env, AD_DB, pluginSql), 1)[0] || ["0"])[0]
   );
 
-  return { shedul, legalEntityIds, linkedPlugins };
+  // Opt-in only: the e-invoicing domain, same predicates as the wipe.
+  const einvoicing = includeEinvoicing
+    ? parseRows(psqlRead(env, AD_DB, buildEinvoicingPreviewSql(providerId)), 2).map(
+        ([table, n]) => ({ table, count: Number(n) })
+      )
+    : [];
+
+  return { shedul, legalEntityIds, linkedPlugins, einvoicing };
 }
 
 function printResetPreview(providerId, preview, opts) {
@@ -1746,6 +2796,21 @@ function printResetPreview(providerId, preview, opts) {
     ]);
   }
 
+  // The opt-in wipe is a separate, wider thing than the migration state above,
+  // so it gets its own labelled block rather than blending into the list.
+  const einvoicingRows = preview.einvoicing.filter((e) => e.count);
+  if (einvoicingRows.length) {
+    rows.push(["", c.faint("── e-invoicing wipe ──"), "", ""]);
+    for (const { table, count } of einvoicingRows) {
+      rows.push([
+        c.bad("DELETE"),
+        `${AD_DB}.${table}`,
+        count,
+        c.faint("not created by this migration"),
+      ]);
+    }
+  }
+
   console.log(renderTable(["ACTION", "TABLE", "ROWS", "WHY"], rows));
 
   if (preview.legalEntityIds.length) {
@@ -1766,8 +2831,14 @@ function printResetPreview(providerId, preview, opts) {
     )
   );
 
+  // Counts the e-invoicing rows too, so a provider whose only leftovers are
+  // e-invoicing ones isn't written off as "nothing to reset". It double-counts
+  // account_configuration_plugins slightly (the unlink row and the wipe both hit
+  // it); harmless — this total only decides whether there is anything to do.
   const total =
-    preview.shedul.reduce((n, s) => n + s.count, 0) + preview.linkedPlugins;
+    preview.shedul.reduce((n, s) => n + s.count, 0) +
+    preview.linkedPlugins +
+    preview.einvoicing.reduce((n, e) => n + e.count, 0);
   return total;
 }
 
@@ -2160,11 +3231,24 @@ function fetchAdyenVerifications(env, adyenLegalEntityIds) {
 }
 
 // The gate's verdict, as far as the database can honestly establish it.
-function kycVerdict({ payments, adyenLegalEntityId, adyen }) {
+// `hasLegalEntity` defaults true so pre-flight and the plugin audit — which only ever
+// look at providers that have one — are unaffected. The report passes it explicitly,
+// because before the rollout most providers have no entity, and "not synced to a KYC
+// provider" would be the wrong thing to say about an entity that does not exist yet.
+function kycVerdict({ payments, adyenLegalEntityId, adyen, hasLegalEntity = true }) {
   if (payments !== "enabled") {
     return {
       state: "allowed",
       text: `payments ${payments} — KYC not required`,
+      exact: true,
+    };
+  }
+  if (!hasLegalEntity) {
+    // Exact: the database can prove there is no entity. What it cannot do is decide
+    // a gate that has nothing to read yet — that's sequencing, not a failure.
+    return {
+      state: "pending_migrate",
+      text: "payments enabled, but no legal entity exists yet — the KYC link lives on the entity, so the gate cannot be decided until migrate runs",
       exact: true,
     };
   }
@@ -2188,12 +3272,83 @@ function kycVerdict({ payments, adyenLegalEntityId, adyen }) {
   };
 }
 
-function printKycStatus(rows) {
+const KYC_MARKS = {
+  allowed: () => c.ok("✓ allowed"),
+  likely_approved: () => c.ok("✓ likely"),
+  not_approved: () => c.bad("✗ not approved"),
+  unknown: () => c.warn("? unknown"),
+  pending_migrate: () => c.warn("· pending migrate"),
+};
+
+// The bulk view: a 400-row gate table is unreadable in a terminal, and the report
+// needs the shape of the answer, not every row. The full table still goes to the
+// Markdown export.
+function printPaymentsKycSummary(rows) {
+  const byPayments = {};
+  const byGate = {};
+  for (const r of rows) {
+    byPayments[r.payments] = (byPayments[r.payments] || 0) + 1;
+    byGate[r.verdict.state] = (byGate[r.verdict.state] || 0) + 1;
+  }
+
+  console.log(c.head("\n── Payments / KYC gate ─────────────────────────────────"));
+  console.log(
+    `  ${"PAYMENTS".padEnd(10)}` +
+      Object.entries(byPayments)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${k} ${v}`)
+        .join("   ")
+  );
+  console.log(
+    `  ${"GATE".padEnd(10)}` +
+      Object.entries(byGate)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${KYC_MARKS[k] ? KYC_MARKS[k]() : k} ${v}`)
+        .join("   ")
+  );
+  // Where the two numbers come from. The counts above are the answer.
+  if (reportView.verbose) {
+    console.log(
+      c.faint(
+        "\n  Mirrors EInvoicing.Common.PaymentsKycGate. Payments is providers.fresha_pay,\n" +
+          "  which needs no legal entity — so it is reported for every provider here. The\n" +
+          "  KYC link is legal_entities.adyen_platform_legal_entity_id, which does: for a\n" +
+          "  provider with no entity yet the gate cannot be decided at all, and that is\n" +
+          "  reported as \"pending migrate\" rather than as a failure."
+      )
+    );
+  }
+
+  const pending = byGate.pending_migrate || 0;
+  if (reportView.verbose && pending) {
+    console.log(
+      c.warn(
+        `\n  · ${pending} provider(s) have payments ENABLED and no legal entity yet — their\n` +
+          "    KYC gate is undecidable until migrate runs. Re-check with pre-flight after."
+      )
+    );
+  }
+  const notApproved = byGate.not_approved || 0;
+  if (notApproved) {
+    console.log(
+      c.bad(
+        `\n  ✗ ${notApproved} provider(s) would FAIL the gate today — payments enabled and ` +
+          "not approved."
+      )
+    );
+  }
+}
+
+// `prose` defaults on because pre-flight also calls this and has no concise mode; the
+// report passes reportView.verbose. Deliberately a parameter rather than a read of
+// reportView, which would silently strip pre-flight's explainer too.
+function printKycStatus(rows, prose = true) {
   const mark = {
     allowed: c.ok("✓ allowed"),
     likely_approved: c.ok("✓ likely"),
     not_approved: c.bad("✗ not approved"),
     unknown: c.warn("? unknown"),
+    pending_migrate: c.warn("· pending migrate"),
   };
 
   console.log(c.head("\n── KYC / payments gate ─────────────────────────────────"));
@@ -2214,14 +3369,16 @@ function printKycStatus(rows) {
   const blocked = rows.filter((r) => r.verdict.state === "not_approved");
   const unknown = rows.filter((r) => r.verdict.state === "unknown");
 
-  console.log(
-    c.faint(
-      "\n  Mirrors EInvoicing.Common.PaymentsKycGate. Payments come from providers.fresha_pay\n" +
-        "  (enum not_set/enabled/disabled); the KYC-provider link is\n" +
-        "  legal_entities.adyen_platform_legal_entity_id. The gate treats NOT SYNCED as not\n" +
-        "  approved, so those two verdicts are exact."
-    )
-  );
+  if (prose) {
+    console.log(
+      c.faint(
+        "\n  Mirrors EInvoicing.Common.PaymentsKycGate. Payments come from providers.fresha_pay\n" +
+          "  (enum not_set/enabled/disabled); the KYC-provider link is\n" +
+          "  legal_entities.adyen_platform_legal_entity_id. The gate treats NOT SYNCED as not\n" +
+          "  approved, so those two verdicts are exact."
+      )
+    );
+  }
   if (unknown.length) {
     console.log(
       c.warn(
@@ -2552,7 +3709,7 @@ function buildPreflightMarkdown(
 
   if (detail) {
     for (const cmp of comparisons) {
-      const comparable = cmp.rows.filter((r) => !r.informational);
+      const comparable = comparableRows(cmp);
       // A row where BOTH sides are empty is "equal" but still blocking — agreement on
   // nothing is not agreement, so it must not inflate the count.
   const matched = comparable.filter((r) => r.same && !r.blocking).length;
@@ -2687,12 +3844,385 @@ function buildPreflightMarkdown(
 }
 
 // Resolve the export path: --md with a value uses it, --md alone defaults to a
-// dated name in the working directory.
-function preflightMarkdownPath(opts) {
+// dated name in the working directory. `stem` names the mode so a report and a
+// pre-flight taken the same day don't overwrite each other.
+function preflightMarkdownPath(opts, stem = "preflight") {
   // --md PATH wins; --md on its own gets the dated default.
   if (opts.mdPath) return path.resolve(opts.mdPath);
   const day = new Date().toISOString().slice(0, 10);
-  return path.resolve(`preflight-${opts.namespace}-${day}.md`);
+  return path.resolve(`${stem}-${opts.namespace}-${day}.md`);
+}
+
+// One provider's block: the same five columns whether or not a legal entity exists,
+// so every provider in the report reads the same way. For an un-migrated provider the
+// legal-entity column names the key migrate has to land the value in, and shows ∅ —
+// exactly how the comparison renders a missing field for a provider that does have an
+// entity.
+function providerDetail(r) {
+  const out = [""];
+  out.push(
+    `### provider=${r.providerId} — ${r.country || "no country"} — ` +
+      `${r.migrated ? "migrated" : "not migrated"}`
+  );
+  out.push("");
+  out.push(`**${r.state}** — ${r.note}`);
+  out.push("");
+
+  if (r.migrated) {
+    out.push(
+      mdTable(
+        ["Field", "Required?", "Provider billing (shedul)", "Legal entity (`fields` jsonb)", "Present?"],
+        r.cmp.rows.map((row) => [
+          row.label,
+          row.required ? "**yes**" : " ",
+          row.pbi,
+          row.le ? `\`${row.leKey}\` = ${row.le}` : row.leKey ? `\`${row.leKey}\` = ∅` : "—",
+          mdPresence(row),
+        ])
+      )
+    );
+    out.push("");
+    out.push(
+      `Primary legal entity \`${r.primary}\` · ${r.plugins.length} plugin(s), ` +
+        `${r.linkedToPrimary} linked to the primary, ${r.unlinked} unlinked` +
+        (r.linkedElsewhere ? `, ${r.linkedElsewhere} linked elsewhere` : "") +
+        "."
+    );
+    return out;
+  }
+
+  if (!r.assessment.hasBilling) {
+    out.push(
+      "No active `provider_billing_informations` row. `migrate` builds the legal " +
+        "entity from that row, so there is nothing for it to build from."
+    );
+    return out;
+  }
+
+  out.push(
+    mdTable(
+      ["Field", "Required?", "Provider billing (shedul)", "Legal entity (`fields` jsonb)", "Ready?"],
+      r.assessment.rows.map((row) => [
+        row.label,
+        row.required ? "**yes**" : " ",
+        row.value || "∅",
+        row.leKey ? `\`${row.leKey}\` = ∅` : "—",
+        {
+          present: "✅ present",
+          absent: "⛔ **absent** — migrate has nothing to copy",
+          bad_format: `⛔ **invalid format** — expected ${row.expected}`,
+          unverified: "⚠ in billing, propagation unverified",
+          entity_type:
+            "? **absent** — but a person's name is present; depends on the entity type",
+        }[row.state] || row.state,
+      ])
+    )
+  );
+  out.push("");
+  out.push(
+    "*No legal entity exists yet, so that column is empty throughout — the key shown " +
+      "is where `migrate` has to land the value. Keys with per-entity-type variants are " +
+      "shown in their `organization` form.*"
+  );
+  out.push("");
+  out.push(`${r.plugins.length} plugin(s) already exist for this provider.`);
+  return out;
+}
+
+// The rollout report as Markdown. This is where the full per-provider tables live:
+// a thousand of them is unreadable in a terminal and perfectly fine in a document
+// you can search. The terminal keeps the one-line roster and the rollup.
+function buildReportMarkdown(opts, rows, tally, survey, scope, kycRows) {
+  const out = [];
+  const order = (r) => REPORT_STATES.indexOf(r.state);
+
+  // "every provider" is a claim, and a single-country export is not making it.
+  const onlyCountry = reportView.crossCountry
+    ? null
+    : [...new Set(rows.map((r) => r.country || ""))][0];
+  out.push(
+    onlyCountry === undefined || onlyCountry === null
+      ? "# Rollout report — every provider with an account configuration"
+      : `# Rollout report — ${countryLabel(onlyCountry)}`
+  );
+  out.push("");
+  out.push(
+    mdTable(
+      ["", ""],
+      [
+        ["namespace", opts.namespace],
+        ["generated", new Date().toISOString()],
+        [
+          "providers in scope",
+          `${rows.length}` +
+            (opts.providerIds || opts.countries || opts.states
+              ? " — FILTERED, see below"
+              : " — every account_configuration with a provider_id"),
+        ],
+        // Names other countries, so it goes when the report is about one — the title of
+        // every section below already says which.
+        ...(reportView.crossCountry
+          ? [["countries", countryBreakdown(rows).replace(/ {3}·{3} /g, " · ")]]
+          : []),
+        [
+          "migrated",
+          `${rows.filter((r) => r.migrated).length} of ${rows.length}`,
+        ],
+        [
+          "ready to roll out",
+          `${tally.ready} not yet migrated with complete billing info, ` +
+            `${tally.done} already migrated, consistent and linked`,
+        ],
+        [
+          "needs attention",
+          `${tally.blocked} blocked, ${tally.differ} differ, ` +
+            `${tally.no_billing} with no billing row, ${tally.not_linked} not linked, ` +
+            `${tally.no_country} with no country`,
+        ],
+        [
+          "no e-invoicing rules",
+          `${tally.no_rules} — country has no required-field set, nothing to fall short of`,
+        ],
+      ]
+    )
+  );
+
+  // Any filter that narrowed this run, named in the document itself — a reader who
+  // was not at the terminal cannot otherwise tell a full sweep from a slice of one.
+  if (opts.providerIds || opts.countries || opts.states) {
+    out.push("");
+    out.push("> ### This report is filtered");
+    out.push(">");
+    if (opts.providerIds) out.push(`> * **providers:** an explicit list was given`);
+    if (opts.countries) {
+      out.push(
+        `> * **countries:** ${[...opts.countries].map((x) => x || "(no country)").join(", ")}`
+      );
+    }
+    if (opts.states) out.push(`> * **conditions:** ${[...opts.states].join(", ")}`);
+    out.push(">");
+    out.push("> Counts below describe the filtered set, not the whole namespace.");
+  }
+
+  // Banner, immediately under the summary table — before any of the data it
+  // qualifies, and formatted as a callout so it survives being skim-read. Dropped from a
+  // concise export and from any single-country one, exactly as on screen.
+  if (reportView.verbose && reportView.crossCountry && survey.noProviderId) {
+    out.push("");
+    out.push("> ### ⚠ Excluded from this report: the Fresha B2B account");
+    out.push(">");
+    out.push(
+      `> ${survey.noProviderId} \`account_configurations\` row(s) have ` +
+        "`provider_id = NULL`. That is the **Fresha B2B account** — the configuration " +
+        "that releases Fresha's own B2B invoices — not a provider."
+    );
+    out.push(">");
+    out.push(
+      "> Every query behind this report keys on `provider_id`, so **nothing below " +
+        "covers it**. It may need a legal entity of its own; that is **not confirmed** " +
+        "and has to be checked separately."
+    );
+  }
+
+  // The explainer. Concise exports drop it: it says what the report is, not what it
+  // found, and a reader who asked for the short version asked for the findings.
+  if (reportView.verbose) {
+  out.push("");
+  out.push("## What this report is");
+  out.push("");
+  out.push(
+    "A scout taken **before** the guided rollout, covering **every** provider with an " +
+      "`account_configurations` row — no country filter. Providers that have already " +
+      "been migrated are compared field by field against their primary legal entity, " +
+      "the same as `--preflight`. Providers that have **not** been migrated have no " +
+      "entity to compare against, so they are assessed on `provider_billing_" +
+      "informations` alone — the row `migrate` builds the entity from."
+  );
+  out.push("");
+  out.push(
+    "Only SA, ES and IT have an e-invoicing required-field set. A provider in any " +
+      "other country is reported as `no_rules` rather than `ready`: nothing was " +
+      "required of it, so calling it ready would mean something different from the " +
+      "same word applied to a provider that actually cleared SA's requirements. A " +
+      "provider whose configuration has **no** country is `no_country` — the country " +
+      "is what selects the validator, so nothing about it can be assessed."
+  );
+  out.push("");
+  out.push(
+    "`migrate` is not confirmed to copy **building number** or **district** onto the " +
+      "entity: provider 33 carries both in billing info and has neither on its legal " +
+      "entity. Where a country requires them, a present billing value is reported but " +
+      "**not** counted as ready. Confirm with `--preflight` after migrating."
+  );
+  }
+
+  // Countries are reported separately: each has its own required set, its own
+  // validator, and in practice its own failure mode. The cross-country roll-up is a
+  // single table so the per-country sections stay the thing you read.
+  const groups = groupByCountry(rows);
+  const countOf = (g, s) => g.filter((r) => r.state === s).length;
+
+  // One country makes this a one-row table restating the heading directly below it.
+  if (reportView.crossCountry) {
+    out.push("");
+    out.push("## By country");
+    out.push("");
+    out.push(
+      mdTable(
+        ["Country", "Providers", "Migrated", "Ready", "Entity type unclear", "Blocked", "No billing", "Other"],
+        groups.map(([country, g]) => [
+          `**${countryLabel(country)}**`,
+          g.length,
+          g.filter((r) => r.migrated).length,
+          countOf(g, "ready") + countOf(g, "done"),
+          countOf(g, "entity_type_unclear") || "—",
+          countOf(g, "blocked") || "—",
+          countOf(g, "no_billing") || "—",
+          [
+            countOf(g, "differ") ? `${countOf(g, "differ")} differ` : null,
+            countOf(g, "not_linked") ? `${countOf(g, "not_linked")} not linked` : null,
+            countOf(g, "no_rules") ? `${countOf(g, "no_rules")} no rules` : null,
+            countOf(g, "no_country") ? `${countOf(g, "no_country")} no country` : null,
+          ]
+            .filter(Boolean)
+            .join(", ") || "—",
+        ])
+      )
+    );
+  }
+
+  // Per country: its required set, then its problems, then its clean providers, then
+  // every one of its per-provider tables.
+  for (const [country, group] of groups) {
+    const required = requiredFieldsFor(country);
+    const attention = group
+      .filter((r) => ATTENTION_STATES.has(r.state))
+      .sort((a, b) => order(a) - order(b));
+    const ready = group.filter((r) => !ATTENTION_STATES.has(r.state));
+    const unverified = group.filter((r) => r.assessment && r.assessment.unverified.length);
+
+    out.push("");
+    out.push(`# ${countryLabel(country)} — ${group.length} provider(s)`);
+    // The required set and the propagation caveat explain the verdicts below rather
+    // than adding to them — same call as on screen.
+    if (reportView.verbose) {
+      out.push("");
+      out.push(
+        required
+          ? `Required by e-invoicing: ${required.map((f) => `\`${f}\``).join(", ")}.` +
+              (sendPathOnlyNote(country) ? ` \n\n*Note: ${sendPathOnlyNote(country)}.*` : "")
+          : "No e-invoicing required-field set applies to this group."
+      );
+      if (unverified.length) {
+        out.push("");
+        out.push(
+          `> ⚠ ${unverified.length} provider(s) here depend on **building number** / ` +
+            "**district**, which `migrate` is not confirmed to copy onto the entity. " +
+            "Their readiness is unproven — see the caveat above."
+        );
+      }
+    }
+
+    out.push("");
+    out.push(`## ${countryLabel(country)} — needs attention`);
+    out.push("");
+    if (attention.length) {
+      out.push(
+        mdTable(
+          ["Provider", "Migrated?", "State", "What's wrong"],
+          attention.map((r) => [r.providerId, r.migrated ? "yes" : "no", `**${r.state}**`, r.note])
+        )
+      );
+    } else {
+      out.push("None — every provider here is either ready to migrate or already done.");
+    }
+
+    out.push("");
+    out.push(`## ${countryLabel(country)} — ready, and nothing required`);
+    out.push("");
+    if (ready.length) {
+      out.push(
+        mdTable(
+          ["Provider", "Migrated?", "State", "Detail"],
+          ready.map((r) => [r.providerId, r.migrated ? "yes" : "no", `\`${r.state}\``, r.note])
+        )
+      );
+    } else {
+      out.push("None.");
+    }
+
+    out.push("");
+    out.push(`## ${countryLabel(country)} — per provider`);
+    for (const r of [...group].sort((a, b) => order(a) - order(b))) {
+      out.push(...providerDetail(r));
+    }
+  }
+
+  // The one genuine exclusion, stated rather than omitted — "every provider" has to
+  // mean every provider the survey could resolve. A single-country export never claims
+  // "every provider" in the first place, so it has nothing to qualify.
+  if (reportView.verbose && reportView.crossCountry) {
+  out.push("");
+  out.push("## Not covered");
+  out.push("");
+  out.push(
+    survey.noProviderId
+      ? `The **Fresha B2B account** — ${survey.noProviderId} \`account_configurations\` ` +
+          "row(s) with `provider_id = NULL`, the configuration that releases Fresha's own " +
+          "B2B invoices. It is not a provider and has no `provider_id`, which is what every " +
+          "query here keys on, so it cannot be assessed by this script at all.\n\n" +
+          "**Open question:** whether it needs a legal entity of its own. Unconfirmed as of " +
+          "this run — check it by hand.\n\n" +
+          "Everything else with an account configuration is in this report, whatever its " +
+          "country."
+      : "Nothing. Every `account_configurations` row resolved to a provider and is in this report."
+  );
+  }
+
+  if (kycRows && kycRows.length) {
+    out.push("");
+    out.push("## KYC / payments gate");
+    out.push("");
+    out.push(
+      mdTable(
+        ["Provider", "Payments", "Legal entity?", "KYC provider (adyen LE)", "Gate", "Basis"],
+        kycRows.map((r) => [
+          r.providerId,
+          r.payments,
+          r.hasLegalEntity ? "yes" : "no",
+          r.hasLegalEntity ? r.adyenLegalEntityId || "∅ not synced" : "— n/a until migrate",
+          `\`${r.verdict.state}\``,
+          r.verdict.exact ? r.verdict.text : `*${r.verdict.text}*`,
+        ])
+      )
+    );
+    // What the two columns mean. The Gate and Basis columns already carry the verdict.
+    if (reportView.verbose) {
+      out.push("");
+      out.push(
+        "`payments` is `providers.fresha_pay` and needs no legal entity, so it is reported " +
+          "for every provider. The KYC link is `legal_entities.adyen_platform_legal_entity_id`, " +
+          "which does — a provider with no entity yet gets `pending_migrate`, meaning the gate " +
+          "is undecidable rather than failed."
+      );
+      out.push("");
+      out.push(
+        "`exact: false` (*italic*) means the database cannot settle it — the " +
+          "adyen-platform RPC is authoritative."
+      );
+    }
+  }
+
+  // Provenance, so a file that dropped its explainers still says how to get them back.
+  out.push("");
+  out.push(
+    `<sub>Generated by \`plugin_legal_entity_updates.js --report` +
+      `${reportView.verbose ? " --full" : ""}\` — read-only.` +
+      `${reportView.verbose ? "" : " Re-run with `--full` for the caveats and footnotes."}</sub>`
+  );
+  out.push("");
+
+  return out.join("\n");
 }
 
 // --- audit (--verify) --------------------------------------------------------
@@ -3012,6 +4542,18 @@ async function askMode() {
     },
     {
       section: "REPORTING — look, don't touch",
+      label: "Report       — scout every provider before rolling out",
+      stage: "stage 0 · read-only",
+      detail:
+        "one pass over every provider in account_configurations: who is migrated, who " +
+        "is ready to be, who is blocked and why. Full tables in Markdown.",
+      // "full" is deliberately not an alias here: it now means the prose level, asked
+      // once report is chosen. Two meanings for one word at two consecutive prompts is
+      // how you end up picking a mode when you meant to pick a verbosity.
+      aliases: ["report", "scout", "survey", "readiness"],
+      value: "report",
+    },
+    {
       label: "Plugin audit — billing info vs each PLUGIN's legal entity",
       stage: "any stage · read-only",
       detail:
@@ -3088,6 +4630,30 @@ async function askDeleteLegalEntities() {
   ]);
 }
 
+// Whether to also wipe the provider's e-invoicing domain. Off by default: this
+// is wider than the migration's own footprint, and nothing it deletes was
+// created by the migration a reset is undoing.
+async function askClearEinvoicing() {
+  return askChoice("Also clear the provider's e-invoicing configuration?", [
+    {
+      label: "no — reset the migration state only",
+      detail: "the provider's e-invoicing setup and documents stay as they are.",
+      aliases: ["no", "n", "keep"],
+      value: false,
+      default: true,
+    },
+    {
+      label: "yes — also wipe the provider's e-invoicing data",
+      detail:
+        "deletes account_configurations and their tree, accounting_documents and " +
+        "their children, trackers and compliance records. The migration created " +
+        "none of it, and there is no undo.",
+      aliases: ["yes", "y"],
+      value: true,
+    },
+  ]);
+}
+
 // Reset takes an explicit list too — and, being destructive, no "all" option.
 async function askResetProviderIds() {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -3160,6 +4726,222 @@ async function askApply(namespace) {
 
 // Which providers to work on: everything with an account configuration, or a
 // list you type. Returns validated ID strings.
+// --- report filters, asked rather than remembered -----------------------------
+//
+// Three questions, each skipped when the matching flag already answered it or when
+// there's no terminal to ask. They're asked at the point the answer can be shown
+// back with real counts, which is why they aren't all up front: providers before any
+// query, countries once the survey knows which exist, conditions once every provider
+// has been classified.
+
+async function askReportProviders() {
+  const how = await askChoice("Which providers should the report cover?", [
+    {
+      label: `every provider with an account configuration (${AD_DB})`,
+      aliases: ["all", "every"],
+      value: "all",
+      default: true,
+    },
+    { label: "a list I'll type", aliases: ["list", "some", "specific"], value: "list" },
+    { label: "a list from a file", aliases: ["file", "path"], value: "file" },
+  ]);
+
+  if (how === "all") return null;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (how === "list") {
+      const raw = await ask("  provider IDs (comma- or space-separated): ");
+      try {
+        return parseProviderIds(raw);
+      } catch (err) {
+        console.error(`  ${err.message}`);
+      }
+    } else {
+      const raw = (await ask('  path to the file ("#" starts a comment): ')).trim();
+      try {
+        // parseProviderIds already strips comments and whitespace, so the file's
+        // contents go in as-is — same handling as -f/--file.
+        return parseProviderIds(fs.readFileSync(raw, "utf8"));
+      } catch (err) {
+        console.error(`  ${err.message}`);
+      }
+    }
+  }
+  throw new Error("No valid provider IDs given.");
+}
+
+// Asked before the survey, because "concise" includes the progress lines the survey
+// itself prints. Nothing here depends on the data, so there is no reason to wait.
+async function askReportVerbosity() {
+  const how = await askChoice("How much report?", [
+    {
+      label: "Concise — the numbers and the tables, nothing that explains them",
+      detail: "no exclusion banner, no footnotes, no progress lines",
+      aliases: ["concise", "short", "terse", "brief"],
+      value: "concise",
+      default: true,
+    },
+    {
+      label: "Full — every caveat, footnote and exclusion banner",
+      detail:
+        "what each state means, the building-number / district propagation caveat, the " +
+        "Fresha B2B exclusion, the required-field set per country",
+      aliases: ["full", "verbose", "everything", "long"],
+      value: "full",
+    },
+  ]);
+  return how === "full";
+}
+
+// Asked after the survey so the options can carry real counts, and so "exclude" can
+// name what's actually there instead of asking you to guess country codes.
+async function askReportCountries(entries) {
+  const counts = new Map();
+  for (const [, country] of entries) counts.set(country, (counts.get(country) || 0) + 1);
+
+  const present = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const label = (ctry) => `${ctry || "(no country)"} ${counts.get(ctry)}`;
+  const einvoicing = present.filter(([ctry]) => requiredFieldsFor(ctry));
+
+  // Nothing to choose between.
+  if (present.length < 2) return null;
+
+  const choices = [
+    {
+      label: `all ${present.length} countries`,
+      detail: present.map(([ctry]) => label(ctry)).join("   "),
+      aliases: ["all", "every"],
+      value: "all",
+      default: true,
+    },
+  ];
+  if (einvoicing.length && einvoicing.length < present.length) {
+    choices.push({
+      label: `only the e-invoicing countries — ${einvoicing.map(([ctry]) => ctry).join(", ")}`,
+      detail:
+        "the only countries with a required-field set, so the only ones that can be " +
+        "blocked by one",
+      aliases: ["einvoicing", "e-invoicing", "rules"],
+      value: "einvoicing",
+    });
+  }
+  choices.push(
+    { label: "only countries I name", aliases: ["include", "only", "pick"], value: "include" },
+    { label: "everything EXCEPT countries I name", aliases: ["exclude", "except"], value: "exclude" }
+  );
+
+  const how = await askChoice("Which countries?", choices);
+  if (how === "all") return null;
+  if (how === "einvoicing") return new Set(einvoicing.map(([ctry]) => ctry));
+
+  const codes = present.map(([ctry]) => ctry);
+  console.log(c.faint(`  present: ${present.map(([ctry]) => label(ctry)).join("   ")}`));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = (
+      await ask(`  country codes to ${how} (comma-separated, "none" = no country): `)
+    ).trim();
+    const named = new Set(
+      raw
+        .split(",")
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean)
+        .map((s) => (s === "NONE" ? "" : s))
+    );
+    if (!named.size) {
+      console.error("  Name at least one country code.");
+      continue;
+    }
+    // Typos here silently shrink or fail to shrink the report, so they're refused
+    // rather than accepted and warned about.
+    const unknown = [...named].filter((ctry) => !codes.includes(ctry));
+    if (unknown.length) {
+      console.error(`  Not present in this namespace: ${unknown.join(", ")}. Try again.`);
+      continue;
+    }
+    const chosen = how === "include" ? named : new Set(codes.filter((ctry) => !named.has(ctry)));
+    if (!chosen.size) {
+      console.error("  That excludes every country. Try again.");
+      continue;
+    }
+    return chosen;
+  }
+  throw new Error("No valid country filter given.");
+}
+
+// Asked last, because the useful options are the states that actually turned up and
+// how many providers are in each.
+async function askReportStates(rows) {
+  const counts = new Map();
+  for (const r of rows) counts.set(r.state, (counts.get(r.state) || 0) + 1);
+
+  const present = REPORT_STATES.filter((s) => counts.has(s));
+  if (present.length < 2) return null;
+
+  const attention = present.filter((s) => ATTENTION_STATES.has(s));
+  const attentionCount = attention.reduce((n, s) => n + counts.get(s), 0);
+  const hard = ["no_billing", "blocked"].filter((s) => counts.has(s));
+  const hardCount = hard.reduce((n, s) => n + counts.get(s), 0);
+
+  const choices = [
+    {
+      label: `every provider (${rows.length})`,
+      detail: present.map((s) => `${s} ${counts.get(s)}`).join("   "),
+      aliases: ["all", "every"],
+      value: "all",
+      default: true,
+    },
+  ];
+  if (attentionCount && attentionCount < rows.length) {
+    choices.push({
+      label: `only those needing attention (${attentionCount})`,
+      detail: attention.map((s) => `${s} ${counts.get(s)}`).join("   "),
+      aliases: ["attention", "problems", "bad"],
+      value: "attention",
+    });
+  }
+  if (hardCount && hardCount < attentionCount) {
+    choices.push({
+      label: `only hard blockers — missing required data (${hardCount})`,
+      detail: hard.map((s) => `${s} ${counts.get(s)}`).join("   "),
+      aliases: ["blocked", "hard"],
+      value: "hard",
+    });
+  }
+  choices.push({
+    label: "states I name",
+    detail: present.join(", "),
+    aliases: ["pick", "states", "some"],
+    value: "pick",
+  });
+
+  const how = await askChoice("Which conditions?", choices);
+  if (how === "all") return null;
+  if (how === "attention") return new Set(attention);
+  if (how === "hard") return new Set(hard);
+
+  console.log(c.faint(`  present: ${present.map((s) => `${s} ${counts.get(s)}`).join("   ")}`));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const raw = (await ask("  states (comma-separated): ")).trim();
+    const named = new Set(
+      raw
+        .split(",")
+        .map((s) => s.trim().toLowerCase().replace(/[\s-]+/g, "_"))
+        .filter(Boolean)
+    );
+    const unknown = [...named].filter((s) => !REPORT_STATES.includes(s));
+    if (unknown.length) {
+      console.error(`  Not a state: ${unknown.join(", ")}. Known: ${REPORT_STATES.join(", ")}`);
+      continue;
+    }
+    if (!named.size) {
+      console.error("  Name at least one state.");
+      continue;
+    }
+    return named;
+  }
+  throw new Error("No valid condition filter given.");
+}
+
 async function askProviderIds(env) {
   const chooseAll = await askChoice("Which providers?", [
     {
@@ -3207,7 +4989,7 @@ async function askProviderIds(env) {
 // The boundary is deliberately drawn at "can this mode write?", not at "is this
 // production?": a read-only mode is safe in prod, and a write is not safe in
 // staging just because it is staging.
-const READ_ONLY_MODES = new Set(["preflight", "postflight", "plugins"]);
+const READ_ONLY_MODES = new Set(["preflight", "postflight", "plugins", "report"]);
 
 function writesAnything(opts) {
   if (READ_ONLY_MODES.has(opts.mode)) return false;
@@ -3396,7 +5178,7 @@ const GUIDED_ASIDES = [
     role: "REMEDIAL — staging only, destructive",
     title: "RESET — undo the migration so it can be re-run",
     what:
-      "Clears the plugin link, primary pointer, location assignments and migration state, and soft-deletes the legal entities.",
+      "Clears the plugin link, primary pointer, location assignments and migration state, and soft-deletes the legal entities. It can also wipe the provider's e-invoicing data — account configurations and accounting documents — but only if you ask; that is wider than anything the migration wrote.",
     why:
       "The migration is resumable, so an already-migrated provider is never rebuilt. Clearing that state is the only way to force a genuine re-run.",
     watch:
@@ -3636,6 +5418,11 @@ async function main() {
       opts.deleteLegalEntities = await askDeleteLegalEntities();
     }
 
+    // --clear-einvoicing already answered this.
+    if (!opts.clearEinvoicingGiven) {
+      opts.clearEinvoicing = await askClearEinvoicing();
+    }
+
     let failures = 0;
     // Per-provider outcome, for --json. A reset is approved one provider at a time,
     // so "what actually happened" is a list, not a single verdict.
@@ -3645,7 +5432,7 @@ async function main() {
     // A reset is not something to approve in bulk.
     for (const providerId of providerIds) {
       console.log(c.faint(`\nReading reset targets for provider=${providerId} (read-only)…`));
-      const preview = fetchResetPreview(env, providerId);
+      const preview = fetchResetPreview(env, providerId, opts.clearEinvoicing);
       const total = printResetPreview(providerId, preview, opts);
 
       // The SQL is the plan — always shown, so you approve what will actually run.
@@ -3654,6 +5441,9 @@ async function main() {
       console.log(c.sql(buildResetShedulSql(providerId)));
       if (opts.deleteLegalEntities && preview.legalEntityIds.length) {
         console.log(c.sql(buildResetLegalEntitySql(preview.legalEntityIds)));
+      }
+      if (opts.clearEinvoicing) {
+        console.log(c.sql(buildEinvoicingClearSql(providerId)));
       }
 
       if (!total && !preview.legalEntityIds.length) {
@@ -3693,12 +5483,25 @@ async function main() {
           `le_${providerId}`
         );
       }
+      // Last: the wipe deletes the very account_configuration_plugins rows the
+      // unlink above nulls, so running it here keeps the earlier steps meaningful
+      // and leaves the default path exactly as it was.
+      if (opts.clearEinvoicing) {
+        psqlWrite(
+          opts.namespace,
+          AD_DB,
+          buildEinvoicingClearSql(providerId),
+          `einv_${providerId}`
+        );
+      }
 
       // Read back: everything should now be zero.
       console.log(c.faint(`\nVerifying provider=${providerId} (read-only)…`));
-      const after = fetchResetPreview(env, providerId);
+      const after = fetchResetPreview(env, providerId, opts.clearEinvoicing);
       const leftover =
-        after.shedul.reduce((n, s) => n + s.count, 0) + after.linkedPlugins;
+        after.shedul.reduce((n, s) => n + s.count, 0) +
+        after.linkedPlugins +
+        after.einvoicing.reduce((n, e) => n + e.count, 0);
 
       if (leftover) {
         console.log(
@@ -3708,6 +5511,9 @@ async function main() {
           console.log(`      ${s.table} = ${s.count}`);
         }
         if (after.linkedPlugins) console.log(`      linked plugins = ${after.linkedPlugins}`);
+        for (const e of after.einvoicing.filter((x) => x.count)) {
+          console.log(`      ${e.table} = ${e.count}`);
+        }
         failures++;
         outcomes.push({ provider_id: providerId, status: "incomplete", rows_left: leftover });
       } else {
@@ -3731,7 +5537,543 @@ async function main() {
     emitJson(opts, {
       verdict: verdictOf(failures),
       soft_deleted_legal_entities: opts.deleteLegalEntities,
+      cleared_einvoicing: opts.clearEinvoicing,
       providers: outcomes,
+    });
+    return;
+  }
+
+  // ROLLOUT REPORT — self-contained, and the widest read in the script: every
+  // provider in account_configurations, whatever its country, in one pass. Read-only.
+  //
+  // Deliberately NOT pass/fail. It is a survey taken before the rollout, so
+  // "289 providers aren't ready" is its expected finding, not an error — a
+  // non-zero exit there would make every run of it look like a failure. The
+  // verdict is REPORTED and the exit code stays 0.
+  if (opts.mode === "report") {
+    // Providers: flags win, otherwise ask. Asked before the survey so a named list
+    // narrows the very first query rather than being filtered out afterwards.
+    let named = opts.providerIds ? parseProviderIds(opts.providerIds) : null;
+    if (!named && !opts.all && input.isTTY) named = await askReportProviders();
+
+    // Asked before the survey, because concise also means no progress chatter — by the
+    // time the first query runs it is too late to decide. --full pre-answers it.
+    reportView.verbose = opts.verbose;
+    if (!opts.verboseGiven && input.isTTY) reportView.verbose = await askReportVerbosity();
+    const chatter = (line) => {
+      if (reportView.verbose) console.log(c.faint(line));
+    };
+
+    chatter(`\nSurveying ${AD_DB}.account_configurations…`);
+    const survey = fetchAccountConfigSurvey(env, named);
+
+    // A provider you NAMED that has no account_configurations row is reported anyway.
+    // Everything the tables below need keys on provider_id rather than on that table —
+    // the billing row and the primary legal entity — so the field comparison is exactly
+    // as answerable for it. The configuration only supplies the country_code, which is
+    // what selects the validator; without it there is no required set to score against,
+    // and that is the answer rather than a reason to drop the provider or, as this used
+    // to do, to throw as soon as every named provider was in that shape.
+    //
+    // Compared numerically: parseProviderIds accepts "007", psql answers "7", and a
+    // string comparison would report one provider twice — once from the survey, once as
+    // missing.
+    const surveyed = new Set([...survey.countries.keys()].map(Number));
+    const noConfig = named ? named.filter((id) => !surveyed.has(Number(id))) : [];
+    const noConfigIds = new Set(noConfig);
+
+    // Nothing at all left to report on. Still fatal, because the reads below build
+    // `IN (…)` from this list and an empty one is a SQL error, not an empty report.
+    if (!survey.countries.size && !noConfig.length) {
+      throw new Error("No account_configurations with a provider_id to report on.");
+    }
+
+    // Every provider the survey could resolve, EVERY country. Country is a display
+    // filter applied per iteration, not a narrowing of the reads — otherwise widening
+    // the filter in the refine loop would need data that was never fetched. The
+    // provider list above is the lever that actually narrows the queries.
+    //
+    // A provider whose country has no required-field set is still reported; it simply
+    // cannot be blocked by rules that don't exist, and classifyProvider says so with
+    // its own state rather than scoring it "ready" against an empty requirement list.
+    //
+    // The no-configuration providers join with "" for a country. That is only the starting
+    // point: resolveCountry fills it in from the legal entity or the billing row once those
+    // are read, and the row's resolved country is what every count, filter and group uses.
+    const inScope = [...survey.countries.entries()]
+      .concat(noConfig.map((id) => [id, ""]))
+      .sort((a, b) => Number(a[0]) - Number(b[0]));
+
+    // Filled from the rows once they exist, because the country a provider is counted under
+    // is the resolved one. See the loop after the row build.
+    const scope = { byCountry: {} };
+
+    const providerIds = inScope.map(([id]) => id);
+
+    // The scope line used to print here, which is before the country question is even
+    // asked — so it could only ever describe the whole namespace, and a report narrowed
+    // to one country still opened by counting the others. It now prints from render(),
+    // where the filters are known. See printScope below.
+
+    // Each table read exactly once, for the whole set.
+    chatter(`\nReading primary legal entities from ${SHEDUL_DB} (read-only)…`);
+    const primaryByProvider = fetchPrimaryLegalEntities(env, providerIds);
+
+    chatter(`Reading provider_billing_informations from ${SHEDUL_DB} (read-only)…`);
+    const billing = fetchBillingInformations(env, providerIds);
+
+    chatter(`Reading plugins from ${AD_DB} (read-only)…`);
+    const pluginsByProvider = fetchPlugins(env, providerIds);
+
+    const primaryIds = [...new Set(providerIds.map((id) => primaryByProvider.get(id)).filter(Boolean))];
+    let leFields = new Map();
+    if (primaryIds.length) {
+      chatter(`Reading legal entity fields from ${LE_DB} (read-only)…`);
+      leFields = fetchLegalEntityFields(env, primaryIds);
+    }
+
+    chatter(`Reading payments status from ${SHEDUL_DB} (read-only)…`);
+    const payments = fetchPaymentsEnabled(env, providerIds);
+
+    let kycSync = new Map();
+    let adyenById = new Map();
+    if (primaryIds.length) {
+      chatter(`Reading KYC-provider links from ${LE_DB} (read-only)…`);
+      kycSync = fetchKycSync(env, primaryIds);
+      const adyenIds = [...new Set([...kycSync.values()].filter(Boolean))];
+      if (adyenIds.length) {
+        chatter(`Reading verifications from ${ADYEN_DB} (read-only)…`);
+        adyenById = fetchAdyenVerifications(env, adyenIds);
+      }
+    }
+
+    // Two shapes per provider: the ordinary comparison where an entity exists, the
+    // billing-side readiness assessment where it doesn't.
+    const rows = inScope.map(([providerId, country]) => {
+      const primary = primaryByProvider.get(providerId);
+      const plugins = pluginsByProvider.get(providerId) || [];
+      const migrated = Boolean(primary);
+      const pbi = billing.get(providerId);
+
+      // The country the configuration could not supply, taken from the data instead. What a
+      // country requires is a fact about the country, so losing the configuration must not
+      // cost the required set — and showAll then keeps every field in the table whether or
+      // not either side holds a value, which is what makes it a checklist.
+      const { country: resolved, source } = resolveCountry(
+        country,
+        migrated ? leFields.get(primary) : null,
+        pbi
+      );
+      const fieldOpts = { showAll: true, countrySource: source };
+
+      const row = classifyProvider({
+        providerId,
+        country: resolved,
+        migrated,
+        primary,
+        plugins,
+        hasConfig: !noConfigIds.has(providerId),
+        cmp: migrated
+          ? compareFields(providerId, pbi, leFields.get(primary), resolved, fieldOpts)
+          : null,
+        assessment: migrated ? null : assessBilling(providerId, pbi, resolved, fieldOpts),
+      });
+
+      // With a resolved country the verdict is now about the required set, which is the
+      // useful answer — but the absent configuration still has to be said, because a plugin
+      // hangs off one and `link` will find nothing to work with. no_country already says it.
+      if (!row.hasConfig && row.state !== "no_country") {
+        row.note += "; no account configuration, so no plugin can exist to link";
+      }
+      return row;
+    });
+
+    // Built from the rows, not from inScope: inScope carries the country the CONFIGURATION
+    // gave, and the report is about the resolved one. Everything downstream — the breakdown,
+    // the country prompt, the JSON by_country — has to agree with the tables.
+    for (const r of rows) {
+      scope.byCountry[r.country] = (scope.byCountry[r.country] || 0) + 1;
+    }
+
+    const order = (r) => REPORT_STATES.indexOf(r.state);
+    rows.sort((a, b) => order(a) - order(b) || Number(a.providerId) - Number(b.providerId));
+
+    // What the country prompt offers. Same [providerId, country] shape askReportCountries
+    // already takes, read off the rows so it offers the countries the report actually shows
+    // rather than the ones the configurations named.
+    const countryEntries = () => rows.map((r) => [r.providerId, r.country]);
+
+    // ── render / refine ───────────────────────────────────────────────────────
+    //
+    // Every query is done. From here the filters only decide what gets drawn, so
+    // narrowing and widening are both instant and neither re-reads anything. The loop
+    // renders, asks what to change, and renders again until you're done.
+
+    // Per-provider tables are the report, so they print by default. --summary drops
+    // them for a quick rollup; they're always in the Markdown export either way, and
+    // the refine menu can toggle them mid-session.
+    let detail = opts.detail === null ? true : opts.detail;
+
+    let countryFilter = opts.countries;
+    let stateFilter = opts.states;
+    if (input.isTTY) {
+      if (!countryFilter) countryFilter = await askReportCountries(countryEntries());
+      if (!stateFilter) stateFilter = await askReportStates(rows);
+    }
+
+    const applyFilters = () => {
+      const byCountry = countryFilter
+        ? rows.filter((r) => countryFilter.has(r.country || ""))
+        : rows;
+      return stateFilter ? byCountry.filter((r) => stateFilter.has(r.state)) : byCountry;
+    };
+
+    // Whatever a filter removes has to be named — the rollup counts only what's shown,
+    // so an unstated exclusion makes the totals read as the whole namespace.
+    const printFilterNotes = (shown) => {
+      if (!countryFilter && !stateFilter) return;
+
+      if (countryFilter) {
+        const present = new Set(rows.map((r) => r.country || ""));
+        const unmatched = [...countryFilter].filter((ctry) => !present.has(ctry));
+        const kept = rows.filter((r) => countryFilter.has(r.country || "")).length;
+        // With one country shown the scope header already names it, and the count of
+        // what was excluded is a fact about the other countries. Skipped — but never
+        // when a code matched nothing, which is a mistake and gets said below.
+        if (reportView.crossCountry) {
+          console.log(
+            `\n${c.warn("Country filter:")} ` +
+              `${[...countryFilter].map((x) => x || "(no country)").join(", ")}` +
+              c.faint(`  — ${rows.length - kept} of ${rows.length} provider(s) excluded by it`)
+          );
+        }
+        if (unmatched.length) {
+          console.log(
+            c.bad(
+              `  ⛔ no account configuration has ${unmatched.join(", ")} — ` +
+                "check the code(s); nothing was reported for them."
+            )
+          );
+        }
+      }
+
+      if (stateFilter) {
+        // Counted against what the country filter left, not the whole namespace —
+        // the two filters compose, so "3 of 10" would double-count the first one's cut.
+        const afterCountry = countryFilter
+          ? rows.filter((r) => countryFilter.has(r.country || ""))
+          : rows;
+        console.log(
+          `${c.warn("Condition filter:")} ${[...stateFilter].join(", ")}` +
+            c.faint(
+              `  — showing ${shown.length} of ${afterCountry.length} provider(s)` +
+                (countryFilter ? " in those countries" : "")
+            )
+        );
+        // A tally of what you asked not to see.
+        const hidden = afterCountry.filter((r) => !stateFilter.has(r.state));
+        if (reportView.verbose && hidden.length) {
+          const byState = {};
+          for (const r of hidden) byState[r.state] = (byState[r.state] || 0) + 1;
+          console.log(
+            c.faint(
+              `  hidden by it: ${Object.entries(byState)
+                .map(([s, n]) => `${s} ${n}`)
+                .join("   ")}`
+            )
+          );
+        }
+      }
+
+      if (!shown.length) {
+        // Not an error: "nothing is blocked" is a legitimate and good answer.
+        console.log(c.ok("\n  ✓ No provider matches that combination — nothing to report."));
+      }
+    };
+
+    // EVERY provider, not just the migrated ones. providers.fresha_pay is keyed on
+    // provider_id and needs no legal entity, so payments status is knowable for all of
+    // them; only the KYC half depends on an entity existing. Reporting just the
+    // migrated ones meant a pre-rollout run — the whole point of this mode — showed no
+    // payments or KYC information at all.
+    const kycRowsFor = (shown) =>
+      shown.map((r) => {
+        const adyenLegalEntityId = r.migrated ? kycSync.get(r.primary) || null : null;
+        const row = {
+          providerId: r.providerId,
+          payments: payments.get(r.providerId) || "unknown",
+          adyenLegalEntityId,
+          adyen: adyenLegalEntityId ? adyenById.get(adyenLegalEntityId) || null : null,
+          hasLegalEntity: r.migrated,
+        };
+        return { ...row, verdict: kycVerdict(row) };
+      });
+
+    // One country in the shown set means the report is about that country, and nothing
+    // that speaks of another one gets printed. Recomputed per render because the refine
+    // loop can widen the filter again.
+    const setCrossCountry = (shown) => {
+      reportView.crossCountry = new Set(shown.map((r) => r.country || "")).size > 1;
+    };
+
+    // Moved out of the pre-read banner so it can describe the set actually reported.
+    const printScope = (shown) => {
+      const head = `\nTarget: namespace=${opts.namespace} psql_env=${env}`;
+      if (reportView.verbose) {
+        console.log(
+          `${head}\nIn scope: ${shown.length} provider(s) with an account configuration\n` +
+            `  ${countryBreakdown(shown.length ? shown : scope)}`
+        );
+        return;
+      }
+      // Concise: one line. It names the country when there is exactly one, which is
+      // what lets everything below drop its qualifiers.
+      const countries = [...new Set(shown.map((r) => r.country || ""))];
+      const only = countries.length === 1 ? `  ·  ${countryLabel(countries[0])}` : "";
+      console.log(`${head}${only}  ·  ${shown.length} provider(s)`);
+    };
+
+    const render = (shown) => {
+      setCrossCountry(shown);
+      printScope(shown);
+      // Still before the data it qualifies, but inside render now — it used to print
+      // above the filter prompts, which is before the scope it describes is even known,
+      // so a single-country report still opened with a namespace-wide exclusion.
+      printB2bBanner(survey.noProviderId);
+      printFilterNotes(shown);
+
+      if (detail) {
+        const stateOrder = (r) => REPORT_STATES.indexOf(r.state);
+        for (const [country, group] of groupByCountry(shown)) {
+          console.log(
+            c.head(
+              `\n══ ${countryLabel(country)} — ${group.length} provider(s) `.padEnd(58, "═")
+            )
+          );
+          // Explains the tables rather than adding to them — the tables name every
+          // field they checked, and each verdict line says what was missing.
+          if (reportView.verbose) {
+            const required = requiredFieldsFor(country);
+            console.log(
+              required
+                ? c.faint(`  requires: ${required.map((f) => f.replace(/_/g, " ")).join(", ")}`)
+                : c.faint("  no e-invoicing required-field set")
+            );
+            if (sendPathOnlyNote(country)) {
+              console.log(c.faint(`  note: ${sendPathOnlyNote(country)}`));
+            }
+          }
+          for (const r of [...group].sort(
+            (a, b) => stateOrder(a) - stateOrder(b) || Number(a.providerId) - Number(b.providerId)
+          )) {
+            if (r.migrated) printProviderFieldTable(r.cmp);
+            else printBillingReadinessTable(r.assessment);
+          }
+        }
+      }
+
+      if (shown.length) printReportRoster(shown);
+
+      const kycRows = kycRowsFor(shown);
+      if (kycRows.length) {
+        if (detail) printKycStatus(kycRows, reportView.verbose);
+        else printPaymentsKycSummary(kycRows);
+      }
+
+      const tally = printReportSummary(shown, survey, scope);
+
+      if (reportView.verbose && !detail && shown.length) {
+        console.log(
+          c.faint(
+            `\n  Per-field tables for all ${shown.length} provider(s) are in the Markdown ` +
+              "export — ask for it below, or turn them on from the menu."
+          )
+        );
+      }
+      return { tally, kycRows };
+    };
+
+    const writeExport = (shown, tally, kycRows) => {
+      // opts carries the live filters so the export can state how it was narrowed.
+      opts.countries = countryFilter;
+      opts.states = stateFilter;
+      // The export mirrors the screen, so it needs the same view — and the export can be
+      // written from the refine loop, where the last render may have had a wider set.
+      setCrossCountry(shown);
+      const target = preflightMarkdownPath(opts, "rollout-report");
+      fs.writeFileSync(target, buildReportMarkdown(opts, shown, tally, survey, scope, kycRows));
+      console.log(`  ${c.ok("✓")} written: ${target}`);
+      return target;
+    };
+
+    // A country filter that matches nothing is a bad invocation, not a finding: it can
+    // only come from --countries (the prompt validates against what's present), and it
+    // is almost always a typo. Exit 2 rather than printing an empty report and 0.
+    // A *condition* filter matching nothing is different — "nothing is blocked" is a
+    // real answer — so that stays a clean exit.
+    if (countryFilter && !rows.some((r) => countryFilter.has(r.country || ""))) {
+      const present = [...new Set(rows.map((r) => r.country || "(none)"))].sort();
+      throw new UsageError(
+        `No providers with an account configuration in ` +
+          `${[...countryFilter].map((x) => x || "(no country)").join(", ")}.\n` +
+          `  Countries present in ${opts.namespace}: ${present.join(", ")}`
+      );
+    }
+
+    let shown = applyFilters();
+    let result = render(shown);
+    let exported = false;
+
+    if (opts.md) {
+      writeExport(shown, result.tally, result.kycRows);
+      exported = true;
+    }
+
+    // The loop. Non-interactive runs render once and fall straight through.
+    while (input.isTTY) {
+      const next = await askChoice("Refine the report?", [
+        { label: "Done", aliases: ["done", "quit", "q", "exit"], value: "done", default: true },
+        {
+          label: "Change which countries are shown",
+          detail: countryFilter
+            ? `now: ${[...countryFilter].map((x) => x || "(no country)").join(", ")}`
+            : "now: all countries",
+          aliases: ["countries", "country", "c"],
+          value: "countries",
+        },
+        {
+          label: "Change which conditions are shown",
+          detail: stateFilter ? `now: ${[...stateFilter].join(", ")}` : "now: every condition",
+          aliases: ["conditions", "states", "s"],
+          value: "states",
+        },
+        {
+          label: "Clear both filters — show everything",
+          aliases: ["clear", "reset", "all"],
+          value: "clear",
+        },
+        {
+          label: detail ? "Hide the per-provider tables" : "Show the per-provider tables",
+          detail: "the five-column field table for each provider",
+          aliases: ["tables", "detail", "summary", "t"],
+          value: "detail",
+        },
+        {
+          label: reportView.verbose
+            ? "Hide the caveats and footnotes"
+            : "Show the caveats and footnotes",
+          detail: "what each state means, the propagation caveat, the B2B exclusion",
+          aliases: ["prose", "caveats", "verbose", "full", "v"],
+          value: "verbose",
+        },
+        {
+          label: "Write the Markdown export now",
+          detail: "the filtered set, as it currently stands",
+          aliases: ["export", "md", "write"],
+          value: "export",
+        },
+      ]);
+
+      if (next === "done") break;
+
+      if (next === "countries") countryFilter = await askReportCountries(countryEntries());
+      else if (next === "states") stateFilter = await askReportStates(rows);
+      else if (next === "clear") {
+        countryFilter = null;
+        stateFilter = null;
+      } else if (next === "detail") detail = !detail;
+      else if (next === "verbose") reportView.verbose = !reportView.verbose;
+
+      if (next === "export") {
+        writeExport(shown, result.tally, result.kycRows);
+        exported = true;
+        continue;
+      }
+
+      shown = applyFilters();
+      result = render(shown);
+    }
+
+    // Offered once at the end if it was never taken — the per-provider tables only
+    // exist in the export, so leaving without one throws away most of the run.
+    if (!exported && input.isTTY) {
+      const answer = (await ask("\n  Export the full report as Markdown? (Y/n): "))
+        .trim()
+        .toLowerCase();
+      if (answer === "" || answer === "y" || answer === "yes") {
+        writeExport(shown, result.tally, result.kycRows);
+        exported = true;
+      }
+    }
+
+    opts.countries = countryFilter;
+    opts.states = stateFilter;
+    const { tally, kycRows } = result;
+
+    if (reportView.verbose) {
+      console.log(c.faint("\n  Read-only: this mode issues SELECTs and nothing else."));
+    }
+
+    // Narrowed to what was reported, so a consumer reading scope alongside providers[]
+    // gets one story rather than two. The B2B count stays whatever the filter was — it
+    // is the one row the script cannot resolve at all, and dropping the key would break
+    // consumers that read it.
+    const shownByCountry = {};
+    for (const r of shown) {
+      const key = r.country || "";
+      shownByCountry[key] = (shownByCountry[key] || 0) + 1;
+    }
+
+    emitJson(opts, {
+      verdict: "REPORTED",
+      tally,
+      // How the report was shaped, so a consumer can tell a slice from a full sweep.
+      report: {
+        verbose: reportView.verbose,
+        detail,
+        countries: countryFilter ? [...countryFilter] : null,
+        states: stateFilter ? [...stateFilter] : null,
+      },
+      scope: {
+        in_scope: shown.length,
+        by_country: shownByCountry,
+        surveyed: providerIds.length,
+        // The only thing left out, and only because it cannot be resolved.
+        account_configurations_without_provider_id: survey.noProviderId,
+      },
+      providers: shown.map((r) => ({
+        provider_id: r.providerId,
+        country: r.country,
+        migrated: r.migrated,
+        state: r.state,
+        detail: r.note,
+        primary_legal_entity_id: r.primary,
+        plugins: r.plugins.length,
+        plugins_linked_to_primary: r.linkedToPrimary,
+        plugins_unlinked: r.unlinked,
+        plugins_linked_elsewhere: r.linkedElsewhere,
+        // Present only in the shape that applies, so a consumer can't mistake a
+        // billing-side assessment for a comparison against a real entity.
+        comparison: r.cmp ? jsonComparison(r.cmp) : null,
+        billing_readiness: r.assessment
+          ? {
+              has_billing_row: r.assessment.hasBilling,
+              required_absent: r.assessment.absent.map((f) => f.field),
+              required_invalid_format: r.assessment.badFormat.map((f) => f.field),
+              required_present_but_propagation_unverified: r.assessment.unverified.map((f) => f.field),
+            }
+          : null,
+      })),
+      kyc: kycRows.map((r) => ({
+        provider_id: r.providerId,
+        payments: r.payments,
+        has_legal_entity: r.hasLegalEntity,
+        synced_to_kyc_provider: Boolean(r.adyenLegalEntityId),
+        adyen_legal_entity_id: r.adyenLegalEntityId,
+        gate: r.verdict.state,
+        detail: r.verdict.text,
+        exact: r.verdict.exact,
+      })),
     });
     return;
   }

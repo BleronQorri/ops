@@ -131,8 +131,10 @@ the read-only ones — they query real databases, so they are not exempt.
    WHERE provider_id IS NOT NULL ORDER BY provider_id;
    ```
 
-   `NULL provider_id` rows — migrated configs that link only through
-   `invoice_entity_id` — can't be resolved here, so they're excluded.
+   `NULL provider_id` rows are the **Fresha B2B account** — the configuration that
+   releases Fresha's own B2B invoices, not a provider. Everything here keys on
+   `provider_id`, so it's excluded from every mode. Whether it needs a legal entity
+   of its own is an open question; `--report` prints a banner about it.
 
 2. **Primary legal entity** — `houston psql <env> shedul`:
 
@@ -164,6 +166,10 @@ the read-only ones — they query real databases, so they are not exempt.
 
 All are plain `SELECT`s. The only write in the whole script is the Houston task,
 behind the confirmation gate — and only in link mode.
+
+`--report` is the one mode that reads **all** of the above in a single pass, each
+table exactly once, plus `providers.fresha_pay` and the KYC link. That is why it
+exists as its own mode rather than a flag on pre-flight.
 
 ## Where the data lives
 
@@ -222,6 +228,7 @@ starts from scratch. **Refuses production outright** — same stance as
 ```sh
 ./plugin_legal_entity_updates.js --reset 33
 ./plugin_legal_entity_updates.js --reset --print-only 33   # show the SQL, write nothing
+./plugin_legal_entity_updates.js --reset --clear-einvoicing 33   # + wipe e-invoicing
 ./plugin_legal_entity_updates.js 33     # or pick Reset from the menu
 ```
 
@@ -250,6 +257,40 @@ Legal entities are **soft**-deleted, not deleted: `legal_entity_associations`,
 `where: [deleted_at: nil]`). `--keep-legal-entities` skips step 6; without it you
 are asked.
 
+### Also clearing the e-invoicing configuration (opt-in)
+
+A reset leaves the provider's **e-invoicing** data untouched, because the
+migration never created it. When that isn't a clean enough slate, reset offers to
+wipe it too — **the default is no**, and `--clear-einvoicing` pre-answers the
+prompt:
+
+```
+Also clear the provider's e-invoicing configuration?
+  1) no — reset the migration state only            [default]
+  2) yes — also wipe the provider's e-invoicing data
+```
+
+Answering yes deletes, children-first in one statement in
+`accounting_documents`: `einvoicing_accounting_document_line_items`,
+`accounting_document_error_logs`, `accounting_documents_logs`,
+`e_invoice_compliance_records`, `e_invoice_trackers`, `accounting_documents`,
+`einvoice_integration_issues`,
+`einvoice_integration_application_requests`, `e_invoicing_configuration_logs`,
+`account_configuration_addresses`,
+`e_invoice_it_smart_receipts_configuration`, `account_configuration_plugins`,
+and finally `account_configurations`.
+
+This is the **same SQL** as `clear_provider_einvoicing` — a single
+data-modifying-CTE statement, so every FK check fires at statement end and the
+CTE order can't cause a violation. The two copies are kept in step by hand;
+scripts here stay self-contained. Still **not** touched: the `invoicing/` domain
+(`invoice_parties` / `invoices` / `invoicing_periods`) and anything keyed only by
+`invoice_entity_id`.
+
+Note the blast radius is wider than the table above — `account_configurations`
+and every accounting document go with it, and there is no undo. Reach for it when
+you want the provider genuinely back to pre-onboarding, not just pre-migration.
+
 ### Gates
 
 - **Production refused** before anything runs.
@@ -260,6 +301,10 @@ are asked.
 - One transaction per database (`BEGIN`/`COMMIT` + `ON_ERROR_STOP`), so a failure
   rolls that database's changes back. The three databases are necessarily
   separate transactions.
+- The e-invoicing wipe, if you asked for it, is inside that **same** per-provider
+  confirmation — its rows are in the preview and its SQL in the echo before you
+  type anything — and it runs **last**, after the plugin unlink whose rows it
+  would otherwise delete out from under.
 - Read-back afterwards: every target count must be zero, else `RESET: FAIL` and
   exit 1.
 
@@ -269,6 +314,399 @@ A reset only helps if re-running the migration produces something better. It
 won't if the migrator itself is dropping fields — see the note on SA organization
 entities under [Required fields](#required-fields-per-e-invoicing-country). Run
 pre-flight after re-migrating to confirm you actually gained something.
+
+## Report — scout everything before rolling out
+
+```sh
+./plugin_legal_entity_updates.js --report          # every provider, every country
+./plugin_legal_entity_updates.js --report 33,52    # or a named handful
+./plugin_legal_entity_updates.js --report -C IT    # Italy, and nothing but Italy
+./plugin_legal_entity_updates.js --report --full   # with the caveats and footnotes
+```
+
+`--report` (alias `--scout`) is **stage 0**: the survey you take before the guided
+rollout. One pass over **every** provider in `account_configurations` — no country
+filter — answering *what have we got* rather than *does this one provider pass*.
+Read-only.
+
+**It is not pass/fail.** "289 providers aren't ready" is its expected finding, not
+an error, so the verdict is `REPORTED` and the exit code is always `0`. Use
+`--preflight` when you want a gate.
+
+### Two axes: what prints, and what explains it
+
+These are separate, and conflating them was a real defect — `detail` was the only
+axis, so the only way to shorten the report was to throw away its data.
+
+| Axis | Flag | Default in report | Controls |
+|---|---|---|---|
+| **tables** | `--detail` / `--summary` | on | the five-column per-provider field tables |
+| **prose** | `--full` / `--concise` | **off** | banners, caveats, footnotes, per-country required-field lines, the `Reading …` progress lines, the read-only footer |
+
+So `--full --summary` is a legitimate pair: every caveat, no tables. Both are asked
+interactively (`How much report?` comes before the survey, because concise also means
+no progress narration and by the first query it is too late to choose) and both can be
+flipped from the refine menu mid-session without re-querying.
+
+Concise is the default because the report is read far more often than it is read
+*closely*. What survives it: the scope line, the filter notes, the tables, the roster,
+the KYC block, the per-country readiness counts, and every genuine warning — a country
+code that matched nothing, a provider that would fail the KYC gate. What goes: anything
+that explains a finding rather than being one.
+
+Implemented through the module-level `reportView` object rather than threading two
+booleans through five printers. `printKycStatus` takes an explicit `prose` parameter
+instead, because pre-flight calls it too and has no concise mode — reading `reportView`
+there would have silently stripped pre-flight's explainer.
+
+### One country means one country
+
+A report whose shown set is a **single** country prints nothing about any other, and
+`--full` does **not** override this. Suppressed: the Fresha B2B exclusion banner, the
+`Country filter: IT — 6 of 8 excluded by it` count, the cross-country breakdown, the
+`ALL` roll-up (the one country block already *is* the total), and the `## By country` /
+`## Not covered` sections in the export. `scope.in_scope` and `scope.by_country` in the
+JSON narrow to what was reported; `scope.surveyed` keeps the namespace-wide count.
+
+```
+Target: namespace=eng-orion psql_env=eng-orion  ·  Italy (IT)  ·  2 provider(s)
+
+── Italy (IT) — 2 provider(s) ─────────────────────────
+  ⛔ provider=102  not migrated  1 required field(s) not usable in billing info…
+  ✓ provider=101  not migrated  billing info complete — ready to migrate
+```
+
+The country filter is still **display-only** (see the comment above `inScope`): the
+reads always cover every country, so the refine loop can widen again without issuing a
+single new query. Only the *description* of scope moved — it used to print before the
+country question was even asked, which is why a filtered report used to open by
+counting the countries you had just excluded.
+
+`printB2bBanner` is called from inside `render()` for the same reason. It still comes
+before the data it qualifies; it just now knows what that data is.
+
+### Two shapes, because most providers have no legal entity yet
+
+This is the thing that makes the report different from pre-flight. Before the
+rollout most providers have not been migrated, so there is no legal entity on the
+right-hand side of the comparison:
+
+| Provider | What it gets | Question answered |
+|---|---|---|
+| **migrated** (has an active primary) | the ordinary field-by-field comparison, same as pre-flight | is the entity consistent with billing info, and is it linked? |
+| **not migrated** | a billing-side **readiness** table — the same fields read from `provider_billing_informations` alone | will `migrate` have what it needs, or will it produce a blocked entity? |
+
+```
+── provider=52 (SA) — NOT MIGRATED ──────────────────
+  e-invoicing country SA — no legal entity yet, reporting on billing info alone
+FIELD             REQ?  PROVIDER BILLING (shedul)  READY?
+registration no.  yes   12345                      ⛔ INVALID FORMAT
+building number   yes   ∅                          ⛔ ABSENT — migrate has nothing to copy
+district          yes   ∅                          ⛔ ABSENT — migrate has nothing to copy
+
+  ⛔ 3 required field(s) not usable: building number (absent), district (absent),
+     registration no. (invalid format)
+     registration no.: "12345" — expected exactly 10 characters (valid_ksa_crn?)
+```
+
+Format rules are applied to the **billing** value here, not the entity's: `migrate`
+copies it forward, so a malformed value arrives malformed.
+
+### Sole traders: why `entity_type_unclear` is not `blocked`
+
+`EINVOICING_REQUIRED.ES` and `.IT` include `company_name`. But `FIELD_COMPARISON`
+marks that field `only: "organization"` — `compareFields` skips it entirely for an
+**individual** legal entity, whose name lives in `individual.name.*`. Before the
+rollout there is no entity, so `assessBilling` has no `_column.type` to branch on,
+which makes the un-migrated path stricter than the migrated one.
+
+A provider with no `company_name` but a populated `first_name` + `last_name` is
+therefore reported `entity_type_unclear`, not `blocked`:
+
+```
+  ? provider=92  [ES]  not migrated  company name absent but a person's name is
+                                     present — ES requires a legal name, and which
+                                     field satisfies it depends on whether migrate
+                                     creates an organization or an individual entity
+```
+
+**This mattered.** The first production run counted 64 blocked; 60 of those were ES
+sole traders in exactly this shape. Someone still has to decide per provider — which
+is why it stays in `ATTENTION_STATES` — but it is not the same finding as a genuinely
+missing required field.
+
+### Payments and KYC are reported for every provider
+
+`providers.fresha_pay` is keyed on `provider_id` and needs **no** legal entity, so
+payments status is knowable for every provider in the report. The KYC link
+(`legal_entities.adyen_platform_legal_entity_id`) lives on the entity and is not.
+
+So the gate splits:
+
+| Situation | Gate |
+|---|---|
+| payments not enabled | `allowed` — KYC irrelevant (exact) |
+| payments enabled, **no legal entity yet** | `pending_migrate` — undecidable, not failed (exact) |
+| payments enabled, entity exists, not synced | `not_approved` (exact) |
+| payments enabled, synced, adyen verification `success` | `likely_approved` (**not** exact) |
+| payments enabled, synced, no verification row | `unknown` — the adyen-platform RPC is authoritative |
+
+`pending_migrate` exists because the first version gated the whole block on
+`migrated`, so a pre-rollout run — the entire point of this mode — printed no
+payments or KYC information at all, having already queried it. `--summary` gets the
+rollup; the default and the Markdown export get the full per-provider table. The
+paragraph explaining where the two columns come from is prose, so `--full` only.
+
+### building number and district are not promised
+
+`migrate` is **not confirmed** to copy `building_number` or `district` onto the
+entity. Provider 33 carries both in `provider_billing_informations` (`1234`) and has
+neither on its legal entity — which is exactly why it is blocked. So for a country
+that requires them, a present billing value is reported as
+`⚠ in billing — propagation unverified` and is deliberately **not** counted as
+ready. Confirm with `--preflight` after migrating; this report cannot promise them.
+
+That list is `UNVERIFIED_PROPAGATION` in the script. If `migrate` is fixed to carry
+them across, remove the field from that set and the caveat disappears.
+
+### States, worst first
+
+The roster is sorted by these and so is the Markdown:
+
+| State | Mark | Meaning |
+|---|---|---|
+| `no_billing` | ⛔ | no active `provider_billing_informations` row — `migrate` has nothing to build from |
+| `blocked` | ⛔ | migrated: required fields unusable on the entity. Not migrated: required fields absent or malformed in billing info |
+| `differ` | ✗ | migrated, but fields disagree with billing info |
+| `entity_type_unclear` | ? | the country requires a legal name; billing info has no `company_name` but does have `first_name` + `last_name`. Whether that's a gap depends on the entity type `migrate` picks — **not** counted as blocked |
+| `no_country` | ⚠ | no country on the account configuration — nothing can be assessed |
+| `not_linked` | · | migrated and consistent, but plugins aren't pointing at the primary — work for `link`, not a data problem |
+| `ready` | ✓ | not migrated, billing info complete for its country's rules — `migrate` should produce a good entity |
+| `no_rules` | – | not migrated, billing row present, but the country has no e-invoicing required set |
+| `done` | ✓ | migrated, consistent, every plugin linked to the primary |
+
+`ATTENTION_STATES` in the script is the first five — `ready`, `no_rules` and `done`
+are the report working as intended, and only the others reach the "Needs attention"
+table in the export.
+
+### Why `no_rules` and `no_country` exist as separate states
+
+Only **SA, ES and IT** have an e-invoicing required-field set (`EINVOICING_REQUIRED`).
+The report still covers every other country, but a provider there cannot be scored
+`ready`: nothing was required of it, so the word would mean something different from
+the same word applied to a provider that actually cleared SA's eight fields. It gets
+`no_rules` instead, and its readiness table says so rather than claiming a clean
+sweep:
+
+```
+  – no required fields for GB — nothing here can fall short.
+```
+
+`no_country` is a different answer again, and a **warning** rather than a shrug:
+`BillingDetailsPolicy` dispatches on the account configuration's country, so with no
+country there is no way to know what *would* be required. "Nothing is required" and
+"we cannot tell what is required" must not collapse into one number.
+
+### The only thing not covered: the Fresha B2B account
+
+`account_configurations` rows with `provider_id IS NULL` are the **Fresha B2B
+account** — the configuration that releases Fresha's own B2B invoices. It is not a
+provider, so it has no `provider_id`, and *every* query in this script keys on
+`provider_id`. It cannot be folded in without a different lookup entirely.
+
+That gets a **banner**, printed before any of the data it qualifies, and repeated as
+one line at the tail where the totals are:
+
+```
+── EXCLUDED FROM THIS REPORT: the Fresha B2B account ───
+  1 account_configurations row(s) have provider_id = NULL.
+  That is the Fresha B2B account — the one that releases B2B invoices — not a
+  provider. Every query here keys on provider_id, so nothing below covers it.
+  It may need a legal entity of its own. NOT CONFIRMED — check separately.
+```
+
+**Open question (as of 2026-07-29): whether the B2B account needs a legal entity of
+its own.** Unconfirmed. The banner says so rather than implying the exclusion is
+harmless — if it turns out to need one, this script cannot tell you about it and
+nothing in the rollout covers it.
+
+> Earlier revisions of this file and the comment on `fetchAllProviderIds` claimed
+> these rows were "already-migrated configs linked only through `invoice_entity_id`".
+> That was never verified against the schema — no query in this repo reads
+> `invoice_entity_id` from `account_configurations`. Corrected to the above.
+
+A provider holding more than one configuration collapses to one row, and the
+e-invoicing country wins where they disagree; the count of such providers is printed.
+
+**No status or soft-delete filter is applied** to `account_configurations` — not
+here and not in `fetchAllProviderIds`, which pre-dates this mode. If that table
+carries a `deleted_at` or status column, dead configurations are being counted by
+both. Worth confirming against the schema before quoting production totals.
+
+### Refine it iteratively
+
+Every query runs **once**, before the first render. After that the filters only decide
+what gets drawn, so the report loops: render → change something → render again, with no
+re-reading and no restart.
+
+```
+Refine the report?
+  1) Done                                              [default]
+  2) Change which countries are shown
+       now: SA, ES, IT
+  3) Change which conditions are shown
+       now: no_billing, blocked
+  4) Clear both filters — show everything
+  5) Hide the per-provider tables
+       the five-column field table for each provider
+  6) Show the caveats and footnotes
+       what each state means, the propagation caveat, the B2B exclusion
+  7) Write the Markdown export now
+       the filtered set, as it currently stands
+```
+
+Options 5 and 6 are the two axes from above, and both re-render from data already in
+memory — expanding a concise report costs nothing.
+
+This is why the country choice is a **display** filter rather than a narrowing of the
+reads: widening it mid-session would otherwise need rows that were never fetched. The
+cost is that `-C SA` reads every country's providers anyway — the same volume as an
+unfiltered run, which is the default — and the provider list remains the lever that
+actually narrows the SQL. The test suite asserts no query is issued after the first
+render.
+
+The export can be written as many times as you like from option 6; if you never take
+it, it's offered once on the way out. Both filters are recorded in the export each time,
+so a file written from a narrowed view says so.
+
+A non-interactive run (`--yes`, or no terminal) renders once with whatever the flags
+said and exits — no menu.
+
+### Four questions, asked or flagged
+
+Run it bare and it asks all four, in the order the answers can be shown back with real
+counts. Every prompt is skipped when the matching flag already answered it, or when
+there's no terminal.
+
+| Question | Asked | Flag |
+|---|---|---|
+| **providers** | before any query, so a list narrows the very first one | positional IDs, or `-f/--file` |
+| **how much report** | before the survey — concise also means no progress lines | `--full` / `--concise` |
+| **countries** | after the survey, so options carry counts | `-C` / `--countries` / `--country` |
+| **conditions** | after classification, so options carry states and counts | `--states` |
+
+**Providers** — all, a list you type, or a list from a file.
+
+**How much report** — concise by default; see [Two axes](#two-axes-what-prints-and-what-explains-it).
+
+```
+How much report?
+  1) Concise — the numbers and the tables, nothing that explains them   [default]
+       no exclusion banner, no footnotes, no progress lines
+  2) Full — every caveat, footnote and exclusion banner
+```
+
+**Countries** — the options are built from the data, so you never guess a code:
+
+```
+Which countries?
+  1) all 6 countries                                        [default]
+       SA 4 ES 2 IT 1 GB 1 (no country) 1 US 1
+  2) only the e-invoicing countries — SA, ES, IT
+       the only countries with a required-field set, so the only ones that can be blocked by one
+  3) only countries I name
+  4) everything EXCEPT countries I name
+```
+
+Include *or* exclude — excluding is usually what you want when a couple of countries
+are noise. Non-interactively:
+
+```sh
+./plugin_legal_entity_updates.js --report -C SA        # KSA only
+./plugin_legal_entity_updates.js --report -C SA,ES     # KSA and Spain
+./plugin_legal_entity_updates.js --report -C none      # configurations with no country
+```
+
+Codes are case-insensitive and `none` means "no country on the configuration". A code
+that matches nothing is refused at the prompt and called out by the flag — a typo would
+otherwise silently shrink the report. A country filter that matches **nothing at all**
+exits `2` (a bad invocation, since the prompt validates) and lists the countries that
+*are* present. A **condition** filter matching nothing exits `0` — "nothing is blocked"
+is a real answer, not a mistake.
+
+Narrowing to **one** country also strips everything that would name another — see
+[One country means one country](#one-country-means-one-country). Two or more and the
+cross-country roll-up comes back, because then the totals genuinely need it.
+
+**Conditions** — the states that actually turned up, with counts:
+
+```
+Which conditions?
+  1) every provider (8)                                     [default]
+       no_billing 1 blocked 2 entity_type_unclear 1 no_country 1 not_linked 1 ready 2
+  2) only those needing attention (6)
+  3) only hard blockers — missing required data (3)
+  4) states I name
+```
+
+Or `--states blocked,no_billing`. Unknown states are rejected with the list of known
+ones.
+
+Whatever a filter removes is named, because the rollup counts only what's shown:
+
+```
+Country filter: SA, ES, IT, (no country)  — 2 of 10 provider(s) excluded by it
+Condition filter: no_billing, blocked  — showing 3 of 8 provider(s)
+  hidden by it: ready 2   entity_type_unclear 1   no_country 1   not_linked 1
+```
+
+The country breakdown in the rollup is derived from the rows being reported, not from
+the pre-filter scope, so it can never disagree with the per-country blocks under it.
+The Markdown export leads with a **This report is filtered** callout naming all three —
+a reader who wasn't at the terminal cannot otherwise tell a full sweep from a slice.
+
+### Separated by country
+
+**SA, ES and IT are reported on their own**, each with the required set that applies
+to it, because they run different validators and in practice fail differently — the
+first production run was 60 ES sole traders and 4 malformed KSA tax numbers, which
+pooled together said nothing useful. Grouping applies to the per-provider tables, the
+roster, the rollup and the Markdown sections:
+
+```
+══ KSA (SA) — 271 provider(s) ═══════════════════════════
+  requires: state province, city, postal code, address, tax number,
+            company registration number, building number, district
+```
+
+Order is the declaration order of `EINVOICING_REQUIRED` (SA, ES, IT), then any other
+country alphabetically, then the no-country group. The rollup prints a per-country
+block and then a single `ALL` line; the export leads with a **By country** table.
+`COUNTRY_NAMES` maps the three codes to names — anything else shows as its bare code.
+
+The KYC / payments gate stays a single cross-country table: it keys on the provider,
+not the validator, so splitting it would add sections without adding information.
+
+### Where the tables go
+
+**Every provider gets the full five-column field table, by default** — `FIELD`,
+`REQ?`, `PROVIDER BILLING`, `LEGAL ENTITY (fields jsonb)`, and the verdict. `--summary`
+drops them for a rollup only; they are in the Markdown export either way. The export
+prompt defaults to **yes** here (pre-flight's defaults to no).
+
+The shape is deliberately identical whether or not an entity exists. For an
+un-migrated provider the legal-entity column names the key `migrate` has to land the
+value in and shows `∅` — the same rendering the comparison uses for a field the entity
+is missing:
+
+```
+building number   yes   9876   organization.registeredAddress.buildingNumber = ∅   ⚠ in billing — propagation unverified
+```
+
+Keys that vary by entity type are shown in their `organization` form, since the type
+isn't decided until `migrate` runs. The table footnote says so.
+
+Default filename: `rollout-report-<namespace>-<YYYY-MM-DD>.md`.
 
 ## Plugin audit — billing info vs each plugin's legal entity
 
@@ -497,6 +935,69 @@ district          1234                       —                                
 inspecting them, so you get the checklists; choosing "all providers" is a bulk
 sweep, so you get one line each. `--detail` and `--summary` force either way.
 
+### The field mapping, verified end to end
+
+Traced against the checked-out repos on 2026-07-29, not inferred. The comparison never
+sees the RPC — it reads the `fields` jsonb directly — so the mapping it encodes has to
+match what the RPC would project out of those same rows.
+
+```
+legal_entities.fields (jsonb)
+  → LegalEntities.InvoicePartyDetailsMapper.extract/1        (app-legal-entities)
+      LegalName.extract/2  · Address.extract/2  · Identifiers.extract/2
+  → InvoicePartyDetails{legal_name, address, identifiers}
+  → LegalEntityBillingDetails.map_billing_details/1          (app-accounting-documents)
+  → the billing map @required_fields validates
+```
+
+For an `organization` root with no child:
+
+| billing field | ← `InvoicePartyDetails` | ← `fields` key |
+|---|---|---|
+| `company_name` | `legal_name` | `organization.legalName` |
+| `tax_number` | `identifiers[TAX_NUMBER]` | `organization.vatNumber` |
+| `company_registration_number` | `identifiers[COMPANY_REGISTRATION_NUMBER]` | `organization.registrationNumber` |
+| `address` | `address.street` | `organization.registeredAddress.street` |
+| `building_number` | `address.building_number` | `organization.registeredAddress.buildingNumber` |
+| `district` | `address.district` | `organization.registeredAddress.district` |
+| `state_province` | `address.region` | `organization.registeredAddress.stateOrProvince` |
+| `city` | `address.city` | `organization.registeredAddress.city` |
+| `postal_code` | `address.postal_code` | `organization.registeredAddress.postalCode` |
+| `country_code` | `address.country_code` | the `legal_entities.country_code` **column** |
+
+Note `state_province` ← `address.region` ← `stateOrProvince`: three names for one value.
+
+**Sole proprietorships read from the CHILD entity.** `Address.address_prefix/2` and
+`Identifiers.identifier_keys/2` dispatch on the `(root.type, child.type)` pair:
+
+| pair | address prefix | identifier prefix |
+|---|---|---|
+| `(organization, _)` | `organization.registeredAddress.*` (root) | `organization.*` (root) |
+| `(individual, sole_proprietorship)` | `soleProprietorship.registeredAddress.*` (**child**) | `soleProprietorship.*` (**child**) |
+| `(individual, unincorporated_partnership)` | `unincorporatedPartnership.registeredAddress.*` (child) | `unincorporatedPartnership.*` (child) |
+| `(individual, trust)` | `individual.residentialAddress.*` (root) | none — empty list |
+
+`individual.residentialAddress.*` therefore applies to **`individual_trust` only**, not
+to sole traders — `FIELD_COMPARISON` used to imply otherwise and now carries the
+`soleProprietorship.registeredAddress.*` keys as well.
+
+`LegalName` for a sole prop takes `soleProprietorship.name`, falling back to
+`individual.name.firstName + " " + lastName` — so a sole trader's `company_name` is
+satisfied by the person's name when there's no trading name.
+
+> **Known gap, not yet fixed.** `fetchLegalEntityFields` reads only the entity named by
+> the primary pointer — it never loads children. For a migrated sole proprietorship the
+> address and identifiers live on the child, so the comparison would report them all
+> missing. No effect on the current production report (0 providers migrated), but
+> pre-flight and the plugin audit share that query and would misreport a sole prop today.
+
+`tax_number` probes **only** `*.vatNumber`. `*.taxInformation.number` is emitted as
+`IDENTIFIER_KIND_TAX_IDENTIFICATION_NUMBER`, a different kind that
+`LegalEntityBillingDetails` does not read for `tax_number` — probing it would report a
+tax number the RPC would leave `nil`, masking the failure app-accounting-documents
+deliberately makes loud ("a TIN-slot country would fail validation loudly rather than
+silently emit its TIN as a VAT").
+
 ### Required fields per e-invoicing country
 
 Pre-flight knows what app-accounting-documents will actually demand, so it can
@@ -506,15 +1007,40 @@ with `{:error, :missing_required_fields}`:
 
 | Field | ES / IT | KSA (SA) |
 |---|---|---|
-| `company_name` | **required** | not checked — taken from the request |
+| `company_name` | **required** | **required by the SEND path** — Comarch onboarding takes it from the request, but `Common` validates it on every send |
 | `address` (street), `city`, `postal_code`, `state_province` | required | required |
-| `tax_number` | required — `TAX_IDENTIFICATION_NUMBER` | required — `TAX_NUMBER` (ZATCA TRN) |
+| `tax_number` | required — emitted from `vatNumber` as `TAX_NUMBER` | required — same slot, ZATCA TRN |
 | `company_registration_number` | — | **required** |
 | `building_number`, `district` | — | **required** |
 | `country_code` | not checked | not checked |
 
-- `SA` → `AccountingDocuments.EInvoicing.Comarch.LegalEntityBillingDetails` `@required_fields`
-- `ES` / `IT` → `AccountingDocuments.EInvoicing.Common.LegalEntityBillingDetails` `@required_fields`
+Two validators, and **which one applies depends on the path, not only the country**:
+
+| Path | Entry point | Validator |
+|---|---|---|
+| onboarding, SA | `Comarch.Actions.OnboardProviderToKsaAction` | `Comarch.LegalEntityBillingDetails` |
+| onboarding, ES/IT | `Common.Actions.RegisterProviderAction` | `Common.LegalEntityBillingDetails` |
+| **sending, every country** | `Common.BillingDetailsPolicy.resolve/2` → `fetch_billing_informations/2` | `Common.LegalEntityBillingDetails` |
+
+So `EINVOICING_REQUIRED.SA` is the **union** of both: Comarch's `building_number` +
+`district`, plus `Common`'s `company_name`. A provider that onboards and then cannot
+send is not usable, so the script asks for both and labels the extra:
+
+```
+  note: company name is required by the SEND path
+        (Common.LegalEntityBillingDetails), not by this country's onboarding validator
+```
+
+The one exception is the allow-listed legacy KSA per-location flow
+(`@legacy_ksa_multi_plugin_provider_ids`, currently `[1_135_636]`), which uses location
+billing and never touches a legal entity. `REQUIRED_BY_SEND_PATH_ONLY` in the script
+records the annotation.
+
+Earlier revisions of this table claimed KSA's `tax_number` was
+`TAX_NUMBER` while ES/IT was `TAX_IDENTIFICATION_NUMBER`. Both actually read
+`identifiers[TAX_NUMBER]`, which `Identifiers.keys_for/1` emits from `*.vatNumber`;
+`TAX_IDENTIFICATION_NUMBER` comes from `*.taxInformation.number` and neither validator
+reads it. The ZATCA-vs-NIF distinction is about the *value*, not the slot.
 
 The country comes from **`account_configurations.country_code`**, because that's
 what `BillingDetailsPolicy` dispatches on (`%{country_code: "SA"} =
@@ -749,6 +1275,8 @@ them and it asks you everything, in order.
 #         --postflight       READ-ONLY: is every plugin linked? (--verify is an alias)
 #         --link             run link_plugins_to_legal_entities_from_env
 #         --plugins          READ-ONLY: billing info vs each PLUGIN's legal entity
+#         --report           READ-ONLY: scout every provider in account_configurations
+#                            (--scout is an alias)
 #         --reset            STAGING ONLY, destructive: undo the migration
 #   Link
 #         --apply            DRY_RUN="false" — actually write
@@ -760,9 +1288,16 @@ them and it asks you everything, in order.
 #         --batch-size N         BATCH_SIZE=N
 #   Reset
 #         --keep-legal-entities  don't soft-delete the orphaned legal entities
+#         --clear-einvoicing     ALSO wipe the provider's e-invoicing data
+#                                (default: no — you're asked)
 #   Reporting
-#         --md [PATH]        export as Markdown (default preflight-<ns>-<date>.md)
+#     -C, --countries LIST   report only these countries (SA / SA,ES / none). --report
+#                            ONE country ⇒ nothing about any other is printed
+#         --md [PATH]        export as Markdown (preflight-<ns>-<date>.md, or
+#                            rollout-report-<ns>-<date>.md for --report)
 #         --detail/--summary force the per-provider checklist on/off
+#         --full/--concise   the prose axis: caveats, footnotes, banners, progress
+#                            lines. --report only; concise is the default
 #   Non-interactive
 #         --json             result document on stdout, report on stderr
 #         --yes              run without a terminal — READ-ONLY MODES ONLY
@@ -809,9 +1344,16 @@ also inspect `$?`.
 
 One object on stdout per run. Common envelope: `schema_version`, `mode`,
 `namespace`, `service`, `exit`, `verdict` (`PASS` / `FAIL` / `ABORTED` / `PRINTED`
-/ `ERROR`), plus `tally` and a per-subject array — `providers` for pre-flight,
-post-flight, migrate and reset, `plugins` for the audit (one entry per plugin, not
-per provider), `updates` for link. Pre-flight also carries `kyc`, where
+/ `REPORTED` / `ERROR`), plus `tally` and a per-subject array — `providers` for
+pre-flight, post-flight, migrate, reset and report, `plugins` for the audit (one
+entry per plugin, not per provider), `updates` for link.
+
+`--report` uses `verdict: "REPORTED"` — it is a survey, so there is no pass or fail
+to report. Its `providers[]` entries carry **either** `comparison` (migrated: the
+real field-by-field result) **or** `billing_readiness` (not migrated: what billing
+info holds), never both, so a consumer cannot mistake a billing-side assessment for
+a check against a real entity. `scope` records everything the country filter
+excluded. Pre-flight also carries `kyc`, where
 `exact: false` means the database cannot settle the answer and the
 adyen-platform RPC is authoritative — do not read it as decided.
 
