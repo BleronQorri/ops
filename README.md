@@ -14,6 +14,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 - **onboard_location_scripts** — ⚠️ _deprecated (Billing Profiles migration)._ Provider onboarding check across `shedul` + `accounting-documents`; prints the Houston tasks to run.
 
 **write**
+- **b2b_credit_notes** — maps B2B credit notes to the invoice each one credits. `provider_invoices` has no pointer between them, so it matches on amount: one of the provider's e-invoiced invoices whose total covers the credit note, in any billing period. Its only mode today is read-only; it lives under `write/` for a planned mutating mode.
 - **process_missing_sales** — backfills invoices/credit notes for sales that never produced one (export → S3 → Houston task). Step-gated.
 - **retry_invoices** — re-drives stuck KSA e-invoices: flips tracker statuses retry-eligible, then force-retries sending.
 - **plugin_legal_entity_updates** — eight modes, picked at the first prompt (**guided** walks the sequence with every step defined — start there): **report** (read-only; scouts every provider in `account_configurations` before you roll out — migrated vs not, ready vs blocked and why, with providers whose country has no e-invoicing rules reported as such rather than scored; full per-provider tables in Markdown; a survey, so it never fails), **migrate** (creates the legal entities via `legal_entities_migration:migrate` on `partners-app`; explicit provider list only, no dry run so it previews state first), **pre-flight** (read-only; cross-checks `provider_billing_informations` against the legal entity field by field, PASS/FAIL), **post-flight** (read-only; is each plugin linked to its provider's primary legal entity, PASS/FAIL), **link** (runs `link_plugins_to_legal_entities_from_env`, then reads the rows back to prove what landed), and **reset** (⚠️ _staging only, destructive_ — undoes the migration for a provider so it can be re-run). Fully interactive. Dry run by default; requires a terminal; production takes three confirmations.
@@ -66,6 +67,47 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 ```
 
 ### production/write
+
+**b2b_credit_notes** — which invoice does each B2B credit note belong to?
+```sh
+./production/write/b2b_credit_notes/b2b_credit_notes.js
+#   -n, --namespace <ns>   default production
+#       --ids <list>       accounting_documents.id values, comma or space separated
+#       --mode <mode>      matrix (the only one today)
+#       --csv / --no-csv   write the CSV or don't, either way no prompt
+#   -y, --yes              approve the READS without prompting (read-only modes only)
+#
+# Interactive with no flags: asks for the mode, the namespace, then the credit note
+# accounting_documents.id values (comma or newline separated, blank line to finish).
+# Non-interactive: --ids plus --yes needs no terminal.
+#   ./b2b_credit_notes.js --ids 4838124,4838004 --yes --csv
+#
+# Its only mode today, "matrix", is READ-ONLY — SELECTs in both databases, no
+# houston psql --write anywhere. It lives here because a mutating mode is planned;
+# READ_ONLY_MODES in the script gates any mode not on that list behind a TTY.
+#
+# A credit note has no pointer to its invoice — shedul's provider_invoices has no
+# original_invoice_id. The match is one of the provider's E-INVOICED invoices whose
+# total is >= the credit note's value, in ANY billing period. Among those, the credit
+# note's own period wins, then the most recent invoice created at or before it.
+# Statuses are reported, never matched on. Both billing periods are shown side by
+# side with a Period column flagging same vs DIFFERENT.
+#
+# The credit note's value is summed from provider_invoice_items — NOT
+# provider_invoices.total, which on 280 of 295 production credit notes carries the
+# invoice's total instead of its own. 37 of 295 credit notes legitimately exceed every
+# invoice in their own period, which is why the period is not a hard constraint.
+# Restricting candidates to einvoice_reference IS NOT NULL costs 2 of 295 matches and
+# keeps the answer to documents ZATCA has actually seen.
+#
+# Reads accounting_documents (validate the input + ZATCA status) and shedul
+# (provider, periods, amounts, the invoices themselves).
+#
+# Prints a matrix and writes b2b-credit-notes-<namespace>-<YYYY-MM-DD>.md, then
+# offers the same table as .csv. Piping answers in works; a trailing 'y' takes the
+# CSV, and running out of input at that prompt skips it rather than failing.
+# Exit 1 if anything is UNMATCHED / ORPHAN or wasn't a B2B credit note.
+```
 
 **process_missing_sales** — backfill invoices/credit notes for sales missing them.
 ```sh

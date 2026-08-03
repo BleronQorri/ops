@@ -1,6 +1,8 @@
 # Generated reports / exports
 invopop_report_*.md
 invopop_entries_*.csv
+b2b-credit-notes-*.md
+b2b-credit-notes-*.csv
 
 # Elixir crash dumps
 erl_crash.dump
