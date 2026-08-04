@@ -97,35 +97,130 @@ const SHEDUL_DB = "shedul";
 const AD_DB = "accounting_documents";
 const LE_DB = "legal_entities";
 
-// What provider_billing_informations (shedul) says vs what the legal entity
-// (legal_entities) says. `le` lists candidate field keys in priority order —
-// legal_entities stores its data as a jsonb array of {key, value}, and which key
-// carries a value varies by entity type and country. tax_number, for instance,
-// lands in organization.vatNumber for IT but taxInformation.number elsewhere, so
-// both are checked and the first non-empty one wins.
-// `only` restricts a field to one kind of legal entity. Without it we'd report
-// every organization as "first name missing": provider_billing_informations
-// carries a contact person's name regardless of account type, while an
-// organization legal entity has no individual.* fields at all. That's a shape
-// difference, not a data discrepancy, and flagging it would bury the real ones.
-const FIELD_COMPARISON = [
-  {
-    label: "legal name",
-    pbi: "company_name",
-    le: ["organization.legalName", "trust.name"],
-    only: "organization",
+// --- entity shapes -----------------------------------------------------------
+//
+// A synthetic key, not a real one: LegalName.extract/2 falls back to joining the
+// root's individual.name.firstName + " " + lastName when a sole proprietorship has no
+// trading name. There is no single jsonb key holding that, so it gets a sentinel and
+// resolveLeValue builds the value.
+const LEGAL_NAME_FROM_PERSON = "individual.name.firstName + lastName";
+//
+// A legal entity is TWO rows, not one. The root carries `business_type` (8 values);
+// its child, when it has one, carries `type` and a NULL business_type. A check
+// constraint keeps them complementary — app-legal-entities migration
+// 20260511130000_require_business_type_on_root_legal_entities:
+//
+//   root  → type IN (individual, organization) AND business_type IS NOT NULL
+//   child → type IN (sole_proprietorship, trust, unincorporated_partnership)
+//           AND business_type IS NULL
+//
+// They are linked by the join table `legal_entity_associations`; there is NO
+// parent_id column. At most one child per root.
+//
+// `business_type` is what decides where a field lives. The invoice projection
+// dispatches on the (root.type, child.type) PAIR, and the two halves of it do not
+// agree with each other, so both are recorded here:
+//
+//   addr  — LegalEntities.InvoiceParty.Address.address_prefix/2
+//   ident — LegalEntities.InvoiceParty.Identifiers.identifier_keys/2
+//   name  — LegalEntities.InvoiceParty.LegalName.extract/2, in fallback order
+//
+// The two traps this table exists to avoid:
+//
+//   * a sole trader keeps its address AND identifiers on the CHILD, under
+//     `soleProprietorship.*`. Its root holds only the person's name. Reading the
+//     root alone reports a complete provider as missing everything.
+//   * `individual.residentialAddress.*` belongs to individual_trust ONLY — never
+//     to a sole trader, which is what this table used to imply.
+//
+// Source of truth: fields_configuration/business_types.ex entity_type_for/2.
+const ENTITY_SHAPES = {
+  organization: {
+    root: "organization", child: null,
+    addr: "organization.registeredAddress", addrFrom: "root",
+    ident: "organization", name: ["organization.legalName"],
   },
+  partnership_incorporated: {
+    root: "organization", child: null,
+    addr: "organization.registeredAddress", addrFrom: "root",
+    ident: "organization", name: ["organization.legalName"],
+  },
+  association_incorporated: {
+    root: "organization", child: null,
+    addr: "organization.registeredAddress", addrFrom: "root",
+    ident: "organization", name: ["organization.legalName"],
+  },
+  non_profit: {
+    root: "organization", child: null,
+    addr: "organization.registeredAddress", addrFrom: "root",
+    ident: "organization", name: ["organization.legalName"],
+  },
+  // A corporate trustee is the invoicing party, so address + identifiers come from
+  // the organization root; only the NAME comes from the trust child.
+  organization_trust: {
+    root: "organization", child: "trust",
+    addr: "organization.registeredAddress", addrFrom: "root",
+    ident: "organization", name: ["trust.name"],
+  },
+  // LegalName takes soleProprietorship.name, falling back to the person's name —
+  // SA and AE never declare soleProprietorship.name at all, so their sole traders
+  // always invoice as the individual.
+  sole_proprietorship: {
+    root: "individual", child: "sole_proprietorship",
+    addr: "soleProprietorship.registeredAddress", addrFrom: "child",
+    ident: "soleProprietorship",
+    name: ["soleProprietorship.name", LEGAL_NAME_FROM_PERSON],
+  },
+  unincorporated_partnership: {
+    root: "individual", child: "unincorporated_partnership",
+    addr: "unincorporatedPartnership.registeredAddress", addrFrom: "child",
+    ident: "unincorporatedPartnership", name: ["unincorporatedPartnership.name"],
+  },
+  // identifier_keys/2 returns an EMPTY list for (individual, trust): an individual
+  // trust emits no identifiers at all, so tax_number can never be satisfied — a
+  // different finding from "the merchant hasn't filled it in".
+  individual_trust: {
+    root: "individual", child: "trust",
+    addr: "individual.residentialAddress", addrFrom: "root",
+    ident: null, name: ["trust.name"],
+  },
+};
+
+// Pre-hierarchy rows have a NULL business_type. Fall back to the old binary guess so
+// legacy data still reports rather than crashing.
+function shapeFor(businessType, entityType) {
+  if (businessType && ENTITY_SHAPES[businessType]) {
+    return { key: businessType, ...ENTITY_SHAPES[businessType] };
+  }
+  const legacy = entityType === "individual" ? "sole_proprietorship" : "organization";
+  return { key: businessType || `${entityType || "unknown"} (no business_type)`, legacy: true, ...ENTITY_SHAPES[legacy] };
+}
+
+// What provider_billing_informations (shedul) says vs what the legal entity
+// (legal_entities) says.
+//
+// `slot` names WHICH part of the invoice projection carries the field; the actual
+// jsonb key is derived from the entity's shape at comparison time (leKeysFor). That
+// indirection is the point: a static key list cannot be right for both an
+// organization root and a sole trader's child.
+//
+//   address        → `<shape.addr>.<sub>`
+//   identifier     → `<shape.ident>.<sub>`, or NO KEY when shape.ident is null
+//   legalName      → shape.name, in fallback order
+//   individualName → individual.name.<sub>, individual roots only
+//   column         → a legal_entities column, surfaced as a pseudo-key
+//   null           → a billing column with no legal-entity counterpart at all
+const FIELD_COMPARISON = [
+  { label: "legal name", pbi: "company_name", slot: { kind: "legalName" } },
   {
     label: "first name",
     pbi: "first_name",
-    le: ["individual.name.firstName"],
-    only: "individual",
+    slot: { kind: "individualName", sub: "firstName" },
   },
   {
     label: "last name",
     pbi: "last_name",
-    le: ["individual.name.lastName"],
-    only: "individual",
+    slot: { kind: "individualName", sub: "lastName" },
   },
   // ONLY `*.vatNumber`. LegalEntities.InvoiceParty.Identifiers emits that slot as
   // IDENTIFIER_KIND_TAX_NUMBER and `*.taxInformation.number` as
@@ -137,156 +232,314 @@ const FIELD_COMPARISON = [
   {
     label: "tax / VAT no.",
     pbi: "tax_number",
-    le: ["organization.vatNumber", "soleProprietorship.vatNumber"],
+    slot: { kind: "identifier", sub: "vatNumber" },
   },
   {
     label: "registration no.",
     pbi: "company_registration_number",
-    le: [
-      "organization.registrationNumber",
-      "soleProprietorship.registrationNumber",
-      "trust.registrationNumber",
-    ],
-    only: "organization",
+    slot: { kind: "identifier", sub: "registrationNumber" },
   },
   {
     label: "activity code",
     pbi: "activity_code",
-    le: ["organization.activityCode", "soleProprietorship.activityCode"],
-    only: "organization",
+    slot: { kind: "identifier", sub: "activityCode" },
   },
-  {
-    label: "street",
-    pbi: "address",
-    le: [
-      "organization.registeredAddress.street",
-      "soleProprietorship.registeredAddress.street",
-      "individual.residentialAddress.street",
-    ],
-  },
-  {
-    label: "city",
-    pbi: "city",
-    le: [
-      "organization.registeredAddress.city",
-      "soleProprietorship.registeredAddress.city",
-      "individual.residentialAddress.city",
-    ],
-  },
-  {
-    label: "postal code",
-    pbi: "postal_code",
-    le: [
-      "organization.registeredAddress.postalCode",
-      "soleProprietorship.registeredAddress.postalCode",
-      "individual.residentialAddress.postalCode",
-    ],
-  },
+  { label: "street", pbi: "address", slot: { kind: "address", sub: "street" } },
+  { label: "city", pbi: "city", slot: { kind: "address", sub: "city" } },
+  { label: "postal code", pbi: "postal_code", slot: { kind: "address", sub: "postalCode" } },
   {
     label: "state/province",
     pbi: "state_province",
-    le: [
-      "organization.registeredAddress.stateOrProvince",
-      "soleProprietorship.registeredAddress.stateOrProvince",
-      "individual.residentialAddress.stateOrProvince",
-    ],
+    slot: { kind: "address", sub: "stateOrProvince" },
   },
   {
     label: "country",
     pbi: "country_code",
-    // Falls back to the legal_entities.country_code column, surfaced as a
-    // pseudo-key by the query below.
-    le: [
-      "organization.registeredAddress.country",
-      "soleProprietorship.registeredAddress.country",
-      "individual.residentialAddress.country",
-      "_column.country_code",
-    ],
+    // Address.extract/2 always takes country_code from the ROOT's column, never a
+    // field — so the column is the authoritative answer and the address key is only
+    // a nicety when it happens to be populated.
+    slot: { kind: "address", sub: "country", also: ["_column.country_code"] },
   },
-  // buildingNumber / district exist as legal-entity keys ONLY where a country
-  // config defines them — today just SA, whose registered_address_fields marks
-  // both is_required: true because "ZATCA e-invoicing needs a complete seller
-  // address" (app-legal-entities .../fields_configuration/country/sa.ex). The
-  // default config has neither and uses registeredAddress.street2 instead.
+  // buildingNumber / district exist as legal-entity keys ONLY where a country config
+  // declares them. That is just SA (`country/sa.ex` registered_address_fields marks
+  // both is_required: true — "ZATCA e-invoicing needs a complete seller address");
+  // `default.ex`, which every country without a module uses, declares NEITHER and
+  // carries the building number inside registeredAddress.street2 instead.
   //
-  // So they're `informational` — "provider only" is the designed state — EXCEPT
-  // where the country's required set names them, which un-marks it. See
-  // requiredFieldsFor() and compareFields().
+  // So they stay `informational` — "provider only" is the designed state — EXCEPT
+  // where the integration's required set names them, which un-marks it. Note that
+  // ticket_bai and smart_receipts DO require building_number while their config
+  // (default.ex) declares no key for it: that combination is reported as
+  // UNSATISFIABLE rather than as a missing value. See satisfiability().
   {
     label: "building number",
     pbi: "building_number",
-    le: [
-      "organization.registeredAddress.buildingNumber",
-      "soleProprietorship.registeredAddress.buildingNumber",
-      "individual.residentialAddress.buildingNumber",
-    ],
+    slot: { kind: "address", sub: "buildingNumber" },
     informational: true,
   },
   {
     label: "district",
     pbi: "district",
-    le: [
-      "organization.registeredAddress.district",
-      "soleProprietorship.registeredAddress.district",
-      "individual.residentialAddress.district",
-    ],
+    slot: { kind: "address", sub: "district" },
     informational: true,
   },
-  { label: "company number", pbi: "company_number", le: [], informational: true },
+  { label: "company number", pbi: "company_number", slot: null, informational: true },
 ];
 
+// Resolve a spec's candidate legal-entity keys against a shape, in priority order.
+// An empty array means this shape has NO slot for the field — which is a fact about
+// the entity type, not a missing value.
+function leKeysFor(shape, spec) {
+  const s = spec.slot;
+  if (!s) return [];
+  switch (s.kind) {
+    case "address":
+      return [`${shape.addr}.${s.sub}`, ...(s.also || [])];
+    case "identifier":
+      return shape.ident ? [`${shape.ident}.${s.sub}`] : [];
+    case "legalName":
+      return shape.name;
+    case "individualName":
+      return shape.root === "individual" ? [`individual.name.${s.sub}`] : [];
+    case "column":
+      return [s.key];
+    default:
+      throw new Error(`unknown slot kind: ${s.kind}`);
+  }
+}
+
 // What app-accounting-documents demands of the legal entity before it will
-// onboard/send. Both modules fetch via GetLegalEntityInvoiceDetails and hard-fail
-// with {:error, :missing_required_fields}, so a field missing here is not a
-// cosmetic difference — it blocks e-invoicing.
+// onboard/send. Every module fetches via GetLegalEntityInvoiceDetails and hard-fails
+// with {:error, :missing_required_fields}, so a field missing here is not a cosmetic
+// difference — it blocks e-invoicing.
 //
-//   SA      → EInvoicing.Comarch.LegalEntityBillingDetails  @required_fields
-//   ES / IT → EInvoicing.Common.LegalEntityBillingDetails   @required_fields
+// KEYED BY INTEGRATION, NOT COUNTRY. There is no shared
+// `EInvoicing.Common.LegalEntityBillingDetails` — earlier revisions of this file said
+// there was. There are FOUR per-integration modules, and
+// `Common.LegalEntityBillingResolver.for_integration/1` dispatches on the plugin's
+// `integration` enum (account_configuration_plugins.integration), explicitly not on
+// country: "callers route to it by the plugin/request integration rather than
+// branching inside a shared module."
 //
-// KSA notably does NOT check company_name (it comes from the request) but DOES
-// require company_registration_number, building_number and district. Its
-// tax_number is also a different identifier kind — the ZATCA TRN
-// (IDENTIFIER_KIND_TAX_NUMBER) rather than the ES/IT NIF/PIVA
-// (IDENTIFIER_KIND_TAX_IDENTIFICATION_NUMBER) — so a present-and-equal
-// tax number here is necessary but not sufficient.
-// Each country's set is the UNION of the two paths, because a provider that onboards
-// and then cannot send is not usable:
+// That distinction is load-bearing because ES has TWO integrations whose required sets
+// differ — verifactu wants neither state_province nor building_number, ticket_bai wants
+// both. A country-keyed set cannot be correct for both, and the old ES entry
+// (which included state_province) false-blocked every verifactu provider.
 //
-//   onboarding  SA     → Comarch.LegalEntityBillingDetails @required_fields
-//               ES/IT  → Common.LegalEntityBillingDetails  @required_fields
-//   sending     ALL    → Common.LegalEntityBillingDetails, via
-//                        BillingDetailsPolicy.resolve/2 → fetch_billing_informations/2
-//                        (the only exception is the allow-listed legacy KSA
-//                        per-location flow, @legacy_ksa_multi_plugin_provider_ids)
-//
-// So SA needs Comarch's building_number + district AND Common's company_name. Comarch's
-// own @required_fields does NOT list company_name — KSA onboarding takes it from the
-// request — but the send path validates it, so it is required in practice.
-const EINVOICING_REQUIRED = {
-  SA: [
-    "company_name",
-    "state_province",
-    "city",
-    "postal_code",
-    "address",
-    "tax_number",
-    "company_registration_number",
-    "building_number",
-    "district",
-  ],
-  ES: ["company_name", "state_province", "city", "postal_code", "address", "tax_number"],
-  IT: ["company_name", "state_province", "city", "postal_code", "address", "tax_number"],
+// `send` is null where fetch_billing_informations/2 just delegates to fetch/1, i.e.
+// where both paths validate the same set.
+const EINVOICING_INTEGRATIONS = {
+  // comarch/legal_entity_billing_details.ex:29-42. Onboarding takes company_name from
+  // the request; the send path (KSA XML builders) reads it from the billing struct.
+  zatca: {
+    country: "SA",
+    module: "EInvoicing.Comarch.LegalEntityBillingDetails",
+    onboarding: [
+      "state_province", "city", "postal_code", "address", "tax_number",
+      "company_registration_number", "building_number", "district",
+    ],
+    send: [
+      "company_name", "state_province", "city", "postal_code", "address", "tax_number",
+      "company_registration_number", "building_number", "district",
+    ],
+  },
+  // invopop/es/verifactu/legal_entity_billing_details.ex — "Only what GOBL's ES party
+  // actually needs. `province`/`num` are optional in the party builder (nil flows through)
+  // and ES legal entities do not carry `stateOrProvince`/`buildingNumber` — the Spanish
+  // street line already includes the building number."
+  //
+  // `state_province` and `building_number` were dropped in app-accounting-documents
+  // 01db37e0 (#1388), which also made PartyGoblBuilder.build_address/2 reject nil/empty
+  // values instead of emitting them as nulls. All 5 remaining fields are declarable in
+  // default.ex, so ES is fully satisfiable. Both paths enforce the same set —
+  // fetch_billing_informations/2 delegates to fetch/1.
+  verifactu: {
+    country: "ES",
+    module: "EInvoicing.Invopop.ES.Verifactu.LegalEntityBillingDetails",
+    onboarding: ["company_name", "tax_number", "address", "city", "postal_code"],
+    send: null,
+  },
+  // invopop/es/ticket_bai/legal_entity_billing_details.ex:26-34. state_province is
+  // mandatory because the party builder derives the foral region (VI/BI/SS) from it,
+  // which selects the registering authority.
+  ticket_bai: {
+    country: "ES",
+    module: "EInvoicing.Invopop.ES.TicketBai.LegalEntityBillingDetails",
+    onboarding: [
+      "company_name", "tax_number", "address", "city", "postal_code", "state_province",
+      "building_number",
+    ],
+    send: null,
+  },
+  // invopop/it/smartreceipts/legal_entity_billing_details.ex — "only what GOBL's IT party
+  // and FatturaPA's `Sede` actually need. `region`/`num` are optional in the party builder
+  // (absent entries are dropped) and optional in FatturaPA (`Provincia`/`NumeroCivico`); IT
+  // legal entities carry no `buildingNumber` at all and `stateOrProvince` only sometimes."
+  //
+  // `state_province` and `building_number` dropped to match verifactu, and the party builder
+  // gained the same nil/empty reject. Note FatturaPA — the Italian format authority — treats
+  // both as optional, so this is not merely "our builder tolerates nil".
+  //
+  // The two paths still differ sharply: send reads only the name and tax number, because the
+  // invoice builder hardcodes the "IT" tax country and emits no address at all. It therefore
+  // also tolerates a legal entity with no address (map_billing_details defaults to an empty
+  // InvoicePartyAddress), which onboarding does not.
+  smart_receipts: {
+    country: "IT",
+    module: "EInvoicing.Invopop.IT.SmartReceipts.LegalEntityBillingDetails",
+    onboarding: ["company_name", "tax_number", "address", "city", "postal_code"],
+    send: ["company_name", "tax_number"],
+  },
 };
 
-// Which path demands a field, where it isn't the country's onboarding validator. Shown
-// so a reader who checks Comarch's @required_fields and finds no company_name can see
-// why the script asks for it anyway.
-const REQUIRED_BY_SEND_PATH_ONLY = { SA: ["company_name"] };
+// Which integration to assume for a provider that has no plugin row yet — the report's
+// un-migrated path has no `integration` to read. ES is genuinely ambiguous, so it takes
+// verifactu: that is the one live in staging, and assuming ticket_bai would manufacture
+// a building_number block for every ES provider. Always labelled as an assumption in
+// the output; see integrationNote().
+const DEFAULT_INTEGRATION = { SA: "zatca", ES: "verifactu", IT: "smart_receipts" };
 
-// Country decides the required set. Non-e-invoicing countries have none, so the
-// comparison stays informational for them.
+function integrationFor(countryCode, integration) {
+  const named = integration && EINVOICING_INTEGRATIONS[integration] ? integration : null;
+  return named || DEFAULT_INTEGRATION[String(countryCode || "").toUpperCase()] || null;
+}
+
+// The union of both paths, because a provider that onboards and then cannot send is not
+// usable. The split survives in the annotation (requiredPathNote) so a reader who checks
+// one module's @required_fields and finds fewer fields can see why we ask for more.
+function requiredFieldsForIntegration(integration) {
+  const spec = EINVOICING_INTEGRATIONS[integration];
+  if (!spec) return null;
+  return [...new Set([...spec.onboarding, ...(spec.send || [])])];
+}
+
+// Country-level view, kept for the callers that only ask "does this country do
+// e-invoicing at all" — grouping, per-country summaries, the country prompt. It resolves
+// through the country's DEFAULT integration, so it must not be used to judge an
+// individual provider whose plugin names a different one; those go through
+// requiredFieldsForIntegration.
 function requiredFieldsFor(countryCode) {
-  return EINVOICING_REQUIRED[String(countryCode || "").toUpperCase()] || null;
+  const integration = integrationFor(countryCode, null);
+  return integration ? requiredFieldsForIntegration(integration) : null;
+}
+
+// Fields this integration needs for ONE path only — shown so the union above is
+// explicable rather than looking like an overreach.
+function requiredPathNote(integration) {
+  const spec = EINVOICING_INTEGRATIONS[integration];
+  if (!spec || !spec.send) return null;
+  const sendOnly = spec.send.filter((f) => !spec.onboarding.includes(f));
+  const onboardOnly = spec.onboarding.filter((f) => !spec.send.includes(f));
+  const parts = [];
+  if (sendOnly.length) {
+    parts.push(`${sendOnly.join(", ")} required by the SEND path only`);
+  }
+  if (onboardOnly.length) {
+    parts.push(`${onboardOnly.join(", ")} required by ONBOARDING only`);
+  }
+  return parts.length ? `${parts.join("; ")} (${spec.module})` : null;
+}
+
+// --- can this shape hold the field at all? -----------------------------------
+//
+// Two independent bars, and a required field must clear BOTH:
+//
+//   1. is there a SLOT — does the invoice projection probe any key for it on this
+//      shape? (individual_trust emits no identifiers, so tax_number has none.)
+//   2. is the key DECLARED by the country's fields_configuration? Undeclared keys are
+//      silently DROPPED on write — create_legal_entities.ex filters submitted fields
+//      against `Lookup.available_legal_entity_fields_for_validation(country, business
+//      _type, role)` at the persist boundary. So undeclared means permanently empty.
+//
+// A field failing either bar is a PLATFORM gap, not a merchant one: no amount of data
+// entry fixes it. Reporting it as "missing" alongside genuinely-unfilled fields is
+// un-actionable, so it gets its own verdict.
+//
+// Transcribed from app-legal-entities .../fields_configuration/. Keys are the union
+// across roles, since satisfiability only asks whether a key exists anywhere for the
+// shape that would use it.
+const DECLARED_ADDRESS_SA = [
+  "street", "buildingNumber", "district", "city", "postalCode", "stateOrProvince", "country",
+];
+const DECLARED_ADDRESS_DEFAULT = [
+  "street", "street2", "city", "postalCode", "stateOrProvince", "country",
+];
+const withPrefix = (prefix, subs) => subs.map((s) => `${prefix}.${s}`);
+
+const DECLARED_KEYS = {
+  // country/sa.ex — implements ONLY individual_root, organization_root and
+  // sole_proprietorship_child. Note there is no soleProprietorship.name and no
+  // soleProprietorship.registrationNumber.
+  SA: new Set([
+    "individual.name.firstName", "individual.name.lastName",
+    "organization.legalName", "organization.registrationNumber", "organization.vatNumber",
+    ...withPrefix("organization.registeredAddress", DECLARED_ADDRESS_SA),
+    "soleProprietorship.vatNumber",
+    ...withPrefix("soleProprietorship.registeredAddress", DECLARED_ADDRESS_SA),
+    "individual.residentialAddress.country", // country_field_injection.ex
+  ]),
+  // default.ex — used by every country with no country/<cc>.ex module, which includes
+  // BOTH ES and IT. No buildingNumber and no district anywhere in it.
+  DEFAULT: new Set([
+    "individual.name.firstName", "individual.name.lastName",
+    "organization.legalName", "organization.doingBusinessAs",
+    "organization.registrationNumber", "organization.vatNumber",
+    ...withPrefix("organization.registeredAddress", DECLARED_ADDRESS_DEFAULT),
+    "soleProprietorship.name", "soleProprietorship.registrationNumber",
+    "soleProprietorship.vatNumber",
+    ...withPrefix("soleProprietorship.registeredAddress", DECLARED_ADDRESS_DEFAULT),
+    "unincorporatedPartnership.name", "unincorporatedPartnership.vatNumber",
+    ...withPrefix("unincorporatedPartnership.registeredAddress", DECLARED_ADDRESS_DEFAULT),
+    "trust.name",
+    "individual.residentialAddress.country", "trust.registeredAddress.country", // injected
+  ]),
+};
+
+// Countries whose module omits an OPTIONAL Country behaviour callback. Country.get_for/2
+// returns [] for those pairs, so the whole child namespace is undeclared. sa.ex defines
+// neither unincorporated_partnership_child/0 nor trust_child/0.
+const UNSUPPORTED_CHILD = { SA: new Set(["unincorporated_partnership", "trust"]) };
+
+function declaredKeysFor(countryCode) {
+  const cc = String(countryCode || "").toUpperCase();
+  return DECLARED_KEYS[cc] || DECLARED_KEYS.DEFAULT;
+}
+
+// Which config a country resolves to — printed so a reader knows ES answers come from
+// default.ex, and would change the day a country/es.ex lands.
+function declaredSourceFor(countryCode) {
+  const cc = String(countryCode || "").toUpperCase();
+  return DECLARED_KEYS[cc] ? `country/${cc.toLowerCase()}.ex` : "default.ex (no country module)";
+}
+
+const CHILD_NAMESPACE = {
+  sole_proprietorship: "soleProprietorship.",
+  unincorporated_partnership: "unincorporatedPartnership.",
+  trust: "trust.",
+};
+
+// "ok" | "no_slot" | "undeclared", plus the keys examined so the caller can say which.
+function satisfiability(countryCode, shape, keys) {
+  if (!keys.length) return { state: "no_slot" };
+
+  const declared = declaredKeysFor(countryCode);
+  const childGone =
+    shape.child && UNSUPPORTED_CHILD[String(countryCode || "").toUpperCase()]?.has(shape.child);
+  const childNs = shape.child ? CHILD_NAMESPACE[shape.child] : null;
+
+  const usable = keys.filter((key) => {
+    if (key === LEGAL_NAME_FROM_PERSON) {
+      return (
+        declared.has("individual.name.firstName") && declared.has("individual.name.lastName")
+      );
+    }
+    // A pseudo-key is a column, always present.
+    if (key.startsWith("_column.")) return true;
+    if (childGone && childNs && key.startsWith(childNs)) return false;
+    return declared.has(key);
+  });
+
+  return usable.length ? { state: "ok" } : { state: "undeclared" };
 }
 
 // Presence is not the only bar. AccountingDocuments.Helpers.ValidationHelpers
@@ -317,9 +570,12 @@ function formatRuleFor(countryCode, field) {
 }
 
 // The provider_billing_informations columns the comparison needs, in the order
-// the query selects them.
+// the query selects them. `account_type` is not compared against anything — it is read
+// because it names the SHAPE migrate will build (see ACCOUNT_TYPE_SHAPE), which the
+// un-migrated readiness path otherwise had to infer.
 const PBI_COLUMNS = [
   "provider_id",
+  "account_type",
   "company_name",
   "first_name",
   "last_name",
@@ -1024,9 +1280,15 @@ function jsonFieldRows(rows) {
     billing_info: r.pbi || null,
     legal_entity: r.le || null,
     legal_entity_key: r.leKey || null,
+    // Every key this shape would accept, so a consumer can see WHY the field resolved
+    // where it did — the single key alone hides the root-vs-child distinction.
+    legal_entity_keys: r.leKeys || [],
     same: Boolean(r.same),
     required: Boolean(r.required),
     blocking: Boolean(r.blocking),
+    // "no_slot" | "undeclared" | null — a platform gap, deliberately not `blocking`.
+    // Without this the distinction was invisible to every JSON consumer.
+    unsatisfiable: r.unsatisfiable || null,
     informational: Boolean(r.informational),
     invalid_format: r.leBadFormat ? "legal_entity" : r.pbiBadFormat ? "billing_info" : null,
     expected_format: r.rule ? r.rule.expected : null,
@@ -1040,11 +1302,35 @@ function jsonComparison(cmp) {
   return {
     provider_id: cmp.providerId,
     country_code: cmp.countryCode || null,
+    // The integration is what decides `required_fields`; `integration_assumed` says
+    // whether it was read from the plugin or inferred from the country.
+    integration: cmp.integration || null,
+    integration_assumed: !cmp.integrationKnown,
+    // The shape, spelled out: business_type is the key, and the child is where a sole
+    // trader's address and identifiers actually live.
     entity_type: cmp.entityType || null,
+    business_type: cmp.businessType || null,
+    child_type: cmp.childType || null,
+    child_legal_entity_id: cmp.childLegalEntityId || null,
     required_fields: cmp.required || [],
     blocking: cmp.blocking.map((r) => r.label),
+    unsatisfiable: (cmp.unsatisfiable || []).map((r) => ({
+      field: r.label,
+      reason: r.unsatisfiable,
+      keys: r.leKeys || [],
+    })),
     differs: cmp.diffs.map((r) => r.label),
-    status: cmp.blocking.length ? "blocked" : cmp.diffs.length ? "differs" : "clean",
+    // "differs" requires something to differ FROM. With no billing row every populated
+    // field reads as a difference, which would contradict the provider-level state.
+    status: cmp.blocking.length
+      ? "blocked"
+      : (cmp.unsatisfiable || []).length
+        ? "unsatisfiable"
+        : !cmp.billing
+          ? "no_billing_to_compare"
+          : cmp.diffs.length
+            ? "differs"
+            : "clean",
     fields: jsonFieldRows(cmp.rows),
   };
 }
@@ -1248,19 +1534,24 @@ function fetchAppliedLegalEntities(env, pluginIds) {
   return map;
 }
 
-// provider_id -> [{ id, pluginType, integrator, pluginStatus, legalEntityId }]
+// provider_id -> [{ id, pluginType, integrator, pluginStatus, legalEntityId, integration }]
+//
+// `integration` is what LegalEntityBillingResolver.for_integration/1 dispatches on, so it
+// — not the country — decides which required set applies. Selected here rather than in a
+// new query because this table was already being read.
 function fetchPlugins(env, providerIds) {
   const sql =
     "SELECT ac.provider_id, p.id, p.plugin_type, p.integrator, p.plugin_status,\n" +
-    "       coalesce(p.legal_entity_id::text, '')\n" +
+    "       coalesce(p.legal_entity_id::text, ''), coalesce(p.integration::text, '')\n" +
     "FROM account_configuration_plugins p\n" +
     "JOIN account_configurations ac ON ac.id = p.account_configuration_id\n" +
     `WHERE ac.provider_id IN (${providerIds.join(",")})\n` +
     "ORDER BY ac.provider_id, p.id;";
 
   const map = new Map();
-  for (const fields of parseRows(psqlRead(env, AD_DB, sql), 6)) {
-    const [providerId, id, pluginType, integrator, pluginStatus, legalEntityId] = fields;
+  for (const fields of parseRowsLoose(psqlRead(env, AD_DB, sql), 7)) {
+    const [providerId, id, pluginType, integrator, pluginStatus, legalEntityId, integration] =
+      fields;
     if (!map.has(providerId)) map.set(providerId, []);
     map.get(providerId).push({
       id,
@@ -1268,9 +1559,21 @@ function fetchPlugins(env, providerIds) {
       integrator,
       pluginStatus,
       legalEntityId: legalEntityId || null,
+      integration: integration || null,
     });
   }
   return map;
+}
+
+// The integration to judge a provider by. A provider can in principle hold more than one
+// plugin; they share a country and in practice an integration, so the first non-empty one
+// is the answer. Null means "no plugin row yet" — the caller then falls back to the
+// country default and labels it as assumed.
+function integrationOfProvider(plugins) {
+  for (const plugin of plugins || []) {
+    if (plugin.integration) return plugin.integration;
+  }
+  return null;
 }
 
 // --- resolution ------------------------------------------------------------
@@ -1460,6 +1763,14 @@ function fetchLegalEntityFields(env, legalEntityIds) {
   if (!legalEntityIds.length) return new Map();
   const quoted = legalEntityIds.map((id) => `'${id}'`).join(",");
 
+  // The CHILD's fields are unioned in under the ROOT's id, because a sole trader keeps
+  // its address and identifiers there and the invoice projection reads them from there.
+  // Reading the root alone reports a complete provider as missing everything.
+  //
+  // Ordering matters and is not incidental: the child arm comes LAST so that on a
+  // key collision the child wins. A pre-hierarchy `individual` root can carry a legacy
+  // `soleProprietorship.vatNumber` (default.ex individual_legacy_fields), and the mapper
+  // reads the child's value, not the root's.
   const sql =
     "SELECT le.id::text, f->>'key', coalesce(f->>'value', '')\n" +
     "FROM legal_entities le, jsonb_array_elements(le.fields) f\n" +
@@ -1471,11 +1782,41 @@ function fetchLegalEntityFields(env, legalEntityIds) {
     "UNION ALL\n" +
     "SELECT le.id::text, '_column.type', coalesce(le.type::text, '')\n" +
     "FROM legal_entities le\n" +
-    `WHERE le.id IN (${quoted});`;
+    `WHERE le.id IN (${quoted})\n` +
+    "UNION ALL\n" +
+    "SELECT le.id::text, '_column.business_type', coalesce(le.business_type::text, '')\n" +
+    "FROM legal_entities le\n" +
+    `WHERE le.id IN (${quoted})\n` +
+    "UNION ALL\n" +
+    "SELECT root.id::text, '_column.child_id', child.id::text\n" +
+    "FROM legal_entities root\n" +
+    "JOIN legal_entity_associations a ON a.root_legal_entity_id = root.id\n" +
+    "  AND a.deleted_at IS NULL\n" +
+    "JOIN legal_entities child ON child.id = a.associated_legal_entity_id\n" +
+    "  AND child.deleted_at IS NULL\n" +
+    `WHERE root.id IN (${quoted})\n` +
+    "UNION ALL\n" +
+    "SELECT root.id::text, '_column.child_type', child.type::text\n" +
+    "FROM legal_entities root\n" +
+    "JOIN legal_entity_associations a ON a.root_legal_entity_id = root.id\n" +
+    "  AND a.deleted_at IS NULL\n" +
+    "JOIN legal_entities child ON child.id = a.associated_legal_entity_id\n" +
+    "  AND child.deleted_at IS NULL\n" +
+    `WHERE root.id IN (${quoted})\n` +
+    "UNION ALL\n" +
+    "SELECT root.id::text, f->>'key', coalesce(f->>'value', '')\n" +
+    "FROM legal_entities root\n" +
+    "JOIN legal_entity_associations a ON a.root_legal_entity_id = root.id\n" +
+    "  AND a.deleted_at IS NULL\n" +
+    "JOIN legal_entities child ON child.id = a.associated_legal_entity_id\n" +
+    "  AND child.deleted_at IS NULL,\n" +
+    "     jsonb_array_elements(child.fields) f\n" +
+    `WHERE root.id IN (${quoted});`;
 
   const map = new Map();
   for (const [id, key, value] of parseRowsLoose(psqlRead(env, LE_DB, sql), 3)) {
     if (!map.has(id)) map.set(id, new Map());
+    // Last writer wins — see the child-arm-last note above.
     map.get(id).set(key, value);
   }
   // The map is keyed by id, but callers hand compareFields only the inner map — so the
@@ -1486,14 +1827,11 @@ function fetchLegalEntityFields(env, legalEntityIds) {
   return map;
 }
 
-// When nothing matched there is still a key worth naming — the one this entity
-// *would* use. Picking spec.le[0] blindly would show an organization key against
-// an individual entity, which reads as a wrong lookup rather than a missing value.
-function fallbackLeKey(keys, kind) {
-  if (!keys.length) return "";
-  const individual = (k) => k.startsWith("individual.");
-  const wanted = keys.filter((k) => (kind === "individual" ? individual(k) : !individual(k)));
-  return (wanted[0] || keys[0]);
+// When nothing matched there is still a key worth naming — the one this shape *would*
+// use. leKeysFor already returns only keys valid for the shape, so the first is right;
+// an empty list means the shape has no slot and there is nothing honest to name.
+function fallbackLeKey(keys) {
+  return keys[0] || "";
 }
 
 // Compare on meaning, not bytes: trim, collapse runs of whitespace, casefold.
@@ -1506,12 +1844,23 @@ function normalizeValue(v) {
     .toLowerCase();
 }
 
-// First non-empty value among the candidate keys, and which key supplied it —
-// the key matters for the per-provider checklist, where showing
-// `organization.vatNumber` vs `organization.taxInformation.number` is the point.
+// First non-empty value among the candidate keys, and which key supplied it — the key
+// matters for the per-provider checklist, where showing which side of the hierarchy
+// answered (`soleProprietorship.registeredAddress.city` on the child, not
+// `individual.residentialAddress.city` on the root) is the whole point.
+//
+// LEGAL_NAME_FROM_PERSON is synthetic: LegalName.extract/2 joins the root's first and
+// last name when a sole proprietorship has no trading name, and no single key holds it.
 function leValue(fields, keys) {
   if (!fields) return { value: "", key: "" };
   for (const key of keys) {
+    if (key === LEGAL_NAME_FROM_PERSON) {
+      const first = fields.get("individual.name.firstName") || "";
+      const last = fields.get("individual.name.lastName") || "";
+      const joined = [first, last].filter(Boolean).join(" ");
+      if (joined) return { value: joined, key };
+      continue;
+    }
     const v = fields.get(key);
     if (v) return { value: v, key };
   }
@@ -1524,30 +1873,41 @@ function leValue(fields, keys) {
 // today's behaviour exactly. showAll keeps every comparable field in the table; source is
 // carried through so the printer can say where the country came from.
 function compareFields(providerId, billing, fields, countryCode, opts = {}) {
-  const { showAll = false, countrySource = "configuration" } = opts;
+  const { showAll = false, countrySource = "configuration", integration = null } = opts;
   const rows = [];
-  // "individual" vs everything else (organization, trust, sole_proprietorship,
-  // unincorporated_partnership) — see `only` on FIELD_COMPARISON.
   const entityType = (fields && fields.get("_column.type")) || "";
-  const kind = entityType === "individual" ? "individual" : "organization";
+  const businessType = (fields && fields.get("_column.business_type")) || "";
+  // The shape — root/child pair — is what decides where every field lives. Derived from
+  // business_type, falling back to the old binary guess for pre-hierarchy rows.
+  const shape = shapeFor(businessType, entityType);
 
-  const required = requiredFieldsFor(countryCode);
+  const resolvedIntegration = integrationFor(countryCode, integration);
+  const required = resolvedIntegration
+    ? requiredFieldsForIntegration(resolvedIntegration)
+    : null;
 
   for (const spec of FIELD_COMPARISON) {
     const isRequired = Boolean(required && required.includes(spec.pbi));
 
-    // `only` says this entity type has no key for the field — an individual has no
-    // organization.legalName. That is a reason not to compare it, never a reason to hide a
-    // field the country REQUIRES: ES and IT both require company_name, and an individual
-    // entity satisfies it through legal-entities' own legal_name, derived from the person's
-    // name (Common.LegalEntityBillingDetails maps company_name from invoice_details
-    // .legal_name). So the row stays, marked entity-type-dependent — neither dropped, which
-    // hides a required field, nor called missing, which this side cannot establish.
-    const wrongKind = Boolean(spec.only && spec.only !== kind);
-    if (wrongKind && !isRequired) continue;
+    // The keys THIS shape would use. An empty list means the shape has no slot for the
+    // field at all — an organization root has no individual.name.*, and an individual
+    // trust emits no identifiers whatsoever.
+    const keys = leKeysFor(shape, spec);
+    const sat = satisfiability(countryCode, shape, keys);
+
+    // No slot and nothing required: a shape difference, not a discrepancy. Dropping it
+    // keeps every organization from reporting "first name missing" against a billing row
+    // that carries a contact person's name regardless of account type.
+    if (sat.state !== "ok" && !isRequired) continue;
+
+    // Required, but the field can never hold a value on this shape — either no slot, or
+    // the country's fields_configuration declares no key so writes are dropped at the
+    // persist boundary. That is a PLATFORM gap: reporting it as "missing" invites data
+    // entry that cannot possibly help.
+    const unsatisfiable = isRequired && sat.state !== "ok" ? sat.state : null;
 
     const pbiValue = billing ? billing[spec.pbi] || "" : "";
-    const { value: leVal, key: leKey } = leValue(fields, spec.le);
+    const { value: leVal, key: leKey } = leValue(fields, keys);
 
     // A required field is reported even when BOTH sides are empty — that's the
     // worst case for onboarding, not something to quietly skip.
@@ -1569,17 +1929,18 @@ function compareFields(providerId, billing, fields, countryCode, opts = {}) {
       label: spec.label,
       pbi: pbiValue,
       le: leVal,
-      // No key for a wrongKind row: naming organization.legalName on an individual entity
-      // asserts a slot that entity type does not have. The note says where it comes from.
-      leKey: wrongKind ? "" : leKey || fallbackLeKey(spec.le, kind),
+      // Always the key this shape would actually use — never an organization key against
+      // an individual entity, which reads as a wrong lookup rather than a missing value.
+      leKey: leKey || fallbackLeKey(keys),
+      leKeys: keys,
       required: isRequired,
       // Informational means "no legal-entity counterpart by design" — but if the
-      // country's required set names the field, a counterpart is expected and the
-      // exemption no longer applies (SA's buildingNumber/district).
+      // integration's required set names the field, a counterpart is expected and the
+      // exemption no longer applies (zatca's buildingNumber/district).
       informational: Boolean(spec.informational) && !isRequired,
-      // Required, but the entity type has no key to hold it. Not blocking: whether it is
-      // satisfied is decided inside legal-entities, not by any key this script can read.
-      entityTypeDependent: wrongKind,
+      // "no_slot" | "undeclared" | null. A platform gap, kept out of `blocking` so it
+      // cannot be mistaken for something the merchant can fix.
+      unsatisfiable,
       same,
       presence,
       rule,
@@ -1587,24 +1948,29 @@ function compareFields(providerId, billing, fields, countryCode, opts = {}) {
       pbiBadFormat,
       // What actually breaks e-invoicing: a REQUIRED field missing from the legal
       // entity ({:error, :missing_required_fields}), or one present but in a shape
-      // ValidationHelpers rejects.
-      blocking: !wrongKind && ((isRequired && !leVal) || leBadFormat),
-      note: wrongKind
-        ? `REQUIRED by e-invoicing — a ${kind} entity has no ${spec.only} key for it; ` +
-          "legal-entities derives it from the entity's own legal name"
-        : leBadFormat
-          ? `INVALID FORMAT in legal entity — ${rule.expected}`
-          : same
-            ? pbiBadFormat
-              ? `both sides invalid — ${rule.expected}`
-              : ""
-            : isRequired && !leVal
-              ? "REQUIRED by e-invoicing — missing in legal entity"
-              : !pbiValue
-                ? "missing in billing info"
-                : !leVal
-                  ? "missing in legal entity"
-                  : "differs",
+      // ValidationHelpers rejects. An unsatisfiable field is excluded — it is broken,
+      // but not by this provider's data.
+      blocking: !unsatisfiable && ((isRequired && !leVal) || leBadFormat),
+      note: unsatisfiable === "no_slot"
+        ? `REQUIRED by ${resolvedIntegration}, but a ${shape.key} entity has no slot for ` +
+          "it — the invoice projection emits nothing here"
+        : unsatisfiable === "undeclared"
+          ? `REQUIRED by ${resolvedIntegration}, but ${declaredSourceFor(countryCode)} ` +
+            `declares no key for it (${keys.join(" | ")}) — a value written here is ` +
+            "dropped at the persist boundary"
+          : leBadFormat
+            ? `INVALID FORMAT in legal entity — ${rule.expected}`
+            : same
+              ? pbiBadFormat
+                ? `both sides invalid — ${rule.expected}`
+                : ""
+              : isRequired && !leVal
+                ? "REQUIRED by e-invoicing — missing in legal entity"
+                : !pbiValue
+                  ? "missing in billing info"
+                  : !leVal
+                    ? "missing in legal entity"
+                    : "differs",
     });
   }
 
@@ -1612,25 +1978,31 @@ function compareFields(providerId, billing, fields, countryCode, opts = {}) {
     providerId,
     billing,
     entityType,
+    businessType,
+    shape,
+    childType: (fields && fields.get("_column.child_type")) || "",
+    childLegalEntityId: (fields && fields.get("_column.child_id")) || "",
+    integration: resolvedIntegration,
+    integrationKnown: Boolean(integration && EINVOICING_INTEGRATIONS[integration]),
     legalEntityId: (fields && fields.get("_column.id")) || "",
     countryCode: countryCode || "",
     countrySource,
     required,
     rows,
-    // entityTypeDependent is not a difference to reconcile — nothing here can settle it —
-    // so it stays out of both buckets and out of the pre-flight verdict it would otherwise
-    // move.
-    diffs: rows.filter((r) => !r.same && !r.informational && !r.entityTypeDependent),
+    // Unsatisfiable rows are not differences to reconcile — nothing on either side can
+    // settle them — so they stay out of both buckets and out of the pre-flight verdict.
+    diffs: rows.filter((r) => !r.same && !r.informational && !r.unsatisfiable),
     blocking: rows.filter((r) => r.blocking),
+    unsatisfiable: rows.filter((r) => r.unsatisfiable),
   };
 }
 
 // The rows the "N/M comparable fields" counts are about. Informational rows have no
-// legal-entity counterpart by design; entityTypeDependent rows have none on THIS entity
-// type, which is equally not a comparison. In a helper because three places count them and
-// they must not drift.
+// legal-entity counterpart by design; unsatisfiable rows have none on THIS shape, which is
+// equally not a comparison. In a helper because three places count them and they must not
+// drift.
 function comparableRows(cmp) {
-  return cmp.rows.filter((r) => !r.informational && !r.entityTypeDependent);
+  return cmp.rows.filter((r) => !r.informational && !r.unsatisfiable);
 }
 
 // The per-provider checklist: every comparable field, matching or not, with the
@@ -1640,8 +2012,10 @@ function printProviderFieldTable(cmp, heading) {
   const mark = (row) => {
     if (row.leBadFormat) return `${c.bad("⛔ INVALID FORMAT")}`;
     if (row.blocking) return `${c.bad("⛔ BLOCKS e-invoicing")}`;
-    // Required, and settled inside legal-entities rather than by a key here.
-    if (row.entityTypeDependent) return `${c.warn("?")} REQUIRED — entity type decides`;
+    // Required, but this shape has nowhere to put it. Not the provider's fault, and not
+    // fixable by filling anything in — so it must not read like the line above.
+    if (row.unsatisfiable === "no_slot") return `${c.bad("⛔ NO SLOT")} on this entity type`;
+    if (row.unsatisfiable === "undeclared") return `${c.bad("⛔ UNSATISFIABLE")} — no key in config`;
     if (row.informational) return `${c.faint("provider only")}`;
     if (row.same) return `${c.ok("✅")} both`;
     if (row.presence === "both") return `${c.bad("❌")} differs`;
@@ -1662,15 +2036,21 @@ function printProviderFieldTable(cmp, heading) {
 
   console.log(
     c.head(
-      `\n── ${heading || `provider=${cmp.providerId} (${cmp.entityType || "unknown type"}, ${country})`} ` +
+      `\n── ${heading || `provider=${cmp.providerId} (${cmp.shape ? cmp.shape.key : cmp.entityType || "unknown type"}, ${country})`} ` +
         "──────────────────"
     )
   );
   // Its own line, not folded into the heading: callers pass their own heading (the plugin
   // audit does), and a uuid there would push the rule past a terminal width anyway.
   if (cmp.legalEntityId) console.log(`  ${c.faint("legal entity")} ${cmp.legalEntityId}`);
+  // The hierarchy, spelled out. Which row a field was read from is the single most
+  // confusing thing about a sole trader, so name both rows and the prefixes in play.
+  if (cmp.shape) console.log(`  ${shapeNote(cmp)}`);
   console.log(`  ${scope}`);
-  printRequiredRule(cmp.countryCode);
+  printRequiredRule(cmp.countryCode, "  ", {
+    integration: cmp.integrationKnown ? cmp.integration : null,
+    shape: cmp.shape,
+  });
 
   console.log(
     renderTable(
@@ -1693,10 +2073,10 @@ function printProviderFieldTable(cmp, heading) {
   // required field this entity type has no key for. One number for both named the second
   // one wrongly.
   const informationalCount = cmp.rows.filter((r) => r.informational).length;
-  const entityTypeCount = cmp.rows.filter((r) => r.entityTypeDependent).length;
+  const unsatisfiableCount = cmp.unsatisfiable ? cmp.unsatisfiable.length : 0;
   const asides = [
     informationalCount ? `${informationalCount} provider-only column(s)` : null,
-    entityTypeCount ? `${entityTypeCount} settled by entity type` : null,
+    unsatisfiableCount ? `${unsatisfiableCount} unsatisfiable on this entity type` : null,
   ].filter(Boolean);
 
   console.log(
@@ -1714,11 +2094,49 @@ function printProviderFieldTable(cmp, heading) {
     );
     console.log(
       c.faint(
-        `     ${country} e-invoicing onboarding/send will fail with ` +
+        `     ${cmp.integration} onboarding/send will fail with ` +
           "{:error, :missing_required_fields}."
       )
     );
   }
+
+  // Printed apart from `blocking`, and worded so nobody goes looking for a merchant to
+  // chase: these cannot be filled in, only fixed in fields_configuration.
+  if (unsatisfiableCount) {
+    console.log(
+      c.bad(
+        `  ⛔ ${unsatisfiableCount} required field(s) UNSATISFIABLE on a ${cmp.shape.key} ` +
+          `entity in ${country}: ${cmp.unsatisfiable.map((r) => r.label).join(", ")}`
+      )
+    );
+    console.log(
+      c.faint(
+        "     A PLATFORM gap, not this provider's data — see the rule above for which " +
+          "key is missing."
+      )
+    );
+  }
+}
+
+// The root/child pair and which prefix each side of the comparison reads from. Without
+// this the table's keys look arbitrary: a sole trader's city comes from
+// soleProprietorship.registeredAddress.city on a DIFFERENT ROW than its first name.
+function shapeNote(cmp) {
+  const s = cmp.shape;
+  const parts = [`${c.faint("business type")} ${s.key}`];
+  parts.push(
+    c.faint("· root ") + s.root + (s.child ? c.faint(" + child ") + s.child : c.faint(" (no child)"))
+  );
+  if (cmp.childLegalEntityId) parts.push(c.faint("· child ") + cmp.childLegalEntityId);
+  const from = s.addrFrom === "child" ? "child" : "root";
+  parts.push(c.faint(`· address ${s.addr}.* (${from})`));
+  parts.push(
+    c.faint(`· identifiers ${s.ident ? `${s.ident}.*` : "NONE — this shape emits none"}`)
+  );
+  if (s.legacy) {
+    parts.push(c.warn("· business_type is NULL — shape inferred from type, pre-hierarchy row"));
+  }
+  return parts.join(" ");
 }
 
 // One banner, two states. In a helper so the dead-end block in pre-flight and
@@ -1838,16 +2256,18 @@ function printFieldComparison(comparisons, missing = []) {
     );
     for (const cmp of blocked) {
       console.log(
-        `      provider=${cmp.providerId} [${cmp.countryCode}] — ` +
+        `      provider=${cmp.providerId} [${cmp.countryCode}/${cmp.integration}] — ` +
           c.bad(cmp.blocking.map(blockingLabel).join(", ")) +
           (cmp.billing ? "" : c.faint("   (also has no billing row)"))
       );
     }
     console.log(
       c.faint(
-        "      Required sets come from app-accounting-documents:\n" +
-          "        SA      → EInvoicing.Comarch.LegalEntityBillingDetails @required_fields\n" +
-          "        ES / IT → EInvoicing.Common.LegalEntityBillingDetails  @required_fields"
+        "      Required sets come from app-accounting-documents, one module per\n" +
+          "      INTEGRATION (LegalEntityBillingResolver.for_integration/1):\n" +
+          Object.entries(EINVOICING_INTEGRATIONS)
+            .map(([name, spec]) => `        ${name.padEnd(15)} ${spec.country}  → ${spec.module}`)
+            .join("\n")
       )
     );
   }
@@ -1996,19 +2416,54 @@ function printB2bBanner(noProviderId) {
   );
 }
 
-// The two fields observed present in provider_billing_informations and empty on the
-// legal entity built from it (provider 33: building_number and district both 1234 in
-// billing, ∅ in the entity). A value in billing therefore does NOT predict a value
-// on the entity, so the report shows them and refuses to count them as ready.
-const UNVERIFIED_PROPAGATION = new Set(["building_number", "district"]);
+// Which shape `migrate` will build, read straight off the billing row instead of guessed.
+// provider_billing_informations.account_type is a BINARY Rails enum —
+// `enum :account_type, %i[business individual]` (app-shedul provider_billing_information.rb)
+// — not the six-way account-type dropdown, which writes legal_entities.business_type
+// directly. BillingOnlyMigration::BUSINESS_TYPE_MAP turns it into the business type:
+//
+//   0 "business"   → BUSINESS_TYPE_ORGANIZATION         (organization root, no child)
+//   1 "individual" → BUSINESS_TYPE_SOLE_PROPRIETORSHIP  (individual root + sole-prop child)
+//
+// The map's other six keys are unreachable until shedul's enum widens, so those are the
+// only two shapes migrate can produce today.
+const ACCOUNT_TYPE_SHAPE = { 0: "organization", 1: "sole_proprietorship" };
 
-// The billing-side readiness view, for a provider with no legal entity yet. Same
-// field spec and same required set as compareFields — read from one side, because
-// that is the only side that exists.
+// Where migrate actually lands building_number and district — confirmed, no longer a hedge.
+// BillingOnlyMigration's generic maps put building_number in `*.registeredAddress.street2`
+// and drop district entirely; for SA, KsaFieldMapper.localize swaps in the dedicated
+// `*.registeredAddress.buildingNumber` and `*.registeredAddress.district` keys. Since only
+// zatca requires either, the generic behaviour costs nothing.
+//
+// Caveat, deliberately not modelled here: only BillingOnlyMigration and
+// CheckoutFreshaPayProviderMigrator consult these maps. AdyenFreshaPayProviderMigrator
+// builds the entity from app-adyen-platform KYC data instead and never reads billing info.
+const PROPAGATION_TARGET = {
+  building_number: (cc) =>
+    String(cc || "").toUpperCase() === "SA"
+      ? "registeredAddress.buildingNumber (KsaFieldMapper)"
+      : "registeredAddress.street2 (generic map — no buildingNumber key outside SA)",
+  district: (cc) =>
+    String(cc || "").toUpperCase() === "SA"
+      ? "registeredAddress.district (KsaFieldMapper)"
+      : null, // dropped by the generic map
+};
+
+// The billing-side readiness view, for a provider with no legal entity yet. Same field
+// spec, same required set and — now that account_type names the shape — the same key
+// resolution as compareFields, read from one side because that is the only side there is.
 function assessBilling(providerId, billing, countryCode, opts = {}) {
-  const { showAll = false, countrySource = "configuration" } = opts;
-  const required = requiredFieldsFor(countryCode) || [];
+  const { showAll = false, countrySource = "configuration", integration = null } = opts;
+  const resolvedIntegration = integrationFor(countryCode, integration);
+  const required = (resolvedIntegration && requiredFieldsForIntegration(resolvedIntegration)) || [];
   const rows = [];
+
+  // The shape migrate will build. Absent an account_type there is nothing to go on, so
+  // fall back to the organization form and say so rather than inventing a person.
+  const accountType = billing ? billing.account_type : "";
+  const shapeKey = ACCOUNT_TYPE_SHAPE[String(accountType).trim()] || null;
+  const shape = shapeFor(shapeKey || "organization", null);
+  const shapeKnown = Boolean(shapeKey);
 
   for (const spec of FIELD_COMPARISON) {
     const isRequired = required.includes(spec.pbi);
@@ -2018,23 +2473,32 @@ function assessBilling(providerId, billing, countryCode, opts = {}) {
     // table is the checklist, and it can only say a field is missing if the field is in it.
     if (!isRequired && !value && !showAll) continue;
 
+    const keys = leKeysFor(shape, spec);
+    const sat = satisfiability(countryCode, shape, keys);
+
     // The format rules apply to the billing value here, not the entity's: migrate
     // copies this value forward, so a malformed one arrives malformed.
     const rule = formatRuleFor(countryCode, spec.pbi);
     const badFormat = Boolean(rule && value && !rule.test(value));
 
-    let state = "present";
-    if (isRequired && !value) state = "absent";
-    else if (badFormat) state = "bad_format";
-    else if (isRequired && UNVERIFIED_PROPAGATION.has(spec.pbi)) state = "unverified";
+    // Where migrate would land it — and for building_number/district that is NOT the key
+    // the required set names, outside SA.
+    const target = PROPAGATION_TARGET[spec.pbi];
+    const propagatesTo = target ? target(countryCode) : undefined;
 
-    // ES and IT require company_name, but FIELD_COMPARISON marks that field
-    // only: "organization" — compareFields skips it entirely for an individual legal
-    // entity, whose name lives in individual.name.*. Here there is no entity yet, so
-    // there is no type to branch on. When the person-name columns are filled and the
-    // company column is not, calling it "absent" asserts something we cannot know:
-    // migrate may create an individual entity, for which the required name field is
-    // the person's and this row is not a gap at all.
+    let state = "present";
+    // A required field the entity can never hold: not the merchant's problem, and no
+    // amount of filling in billing info changes it.
+    if (isRequired && sat.state !== "ok") state = "unsatisfiable";
+    else if (isRequired && !value) state = "absent";
+    else if (badFormat) state = "bad_format";
+    // Required, present in billing, but the generic map drops it or routes it to a key
+    // the required set does not name. Reported rather than counted as ready.
+    else if (isRequired && target && propagatesTo === null) state = "not_propagated";
+
+    // A sole trader satisfies company_name through LegalName's fallback to the person's
+    // name, so with account_type in hand this is no longer a guess: if migrate is going to
+    // build a sole proprietorship and the person's name is present, the field is answered.
     if (
       state === "absent" &&
       spec.pbi === "company_name" &&
@@ -2042,7 +2506,7 @@ function assessBilling(providerId, billing, countryCode, opts = {}) {
       billing.first_name &&
       billing.last_name
     ) {
-      state = "entity_type";
+      state = shapeKnown && shapeKey === "sole_proprietorship" ? "present_via_person" : "entity_type";
     }
 
     rows.push({
@@ -2052,10 +2516,10 @@ function assessBilling(providerId, billing, countryCode, opts = {}) {
       value,
       state,
       expected: rule ? rule.expected : null,
-      // Where migrate has to land this value. Shown so the readiness table has the
-      // same shape as the comparison; the organization variant, since entity type
-      // isn't decided yet.
-      leKey: spec.le[0] || "",
+      unsatisfiable: state === "unsatisfiable" ? sat.state : null,
+      // Where migrate has to land this value, for the shape account_type implies.
+      leKey: keys[0] || "",
+      propagatesTo,
     });
   }
 
@@ -2063,11 +2527,16 @@ function assessBilling(providerId, billing, countryCode, opts = {}) {
     providerId,
     countryCode,
     countrySource,
+    integration: resolvedIntegration,
+    integrationKnown: Boolean(integration && EINVOICING_INTEGRATIONS[integration]),
+    shape,
+    shapeKnown,
     hasBilling: Boolean(billing),
     rows,
     absent: rows.filter((r) => r.state === "absent"),
     badFormat: rows.filter((r) => r.state === "bad_format"),
-    unverified: rows.filter((r) => r.state === "unverified"),
+    unverified: rows.filter((r) => r.state === "not_propagated"),
+    unsatisfiable: rows.filter((r) => r.state === "unsatisfiable"),
     entityType: rows.filter((r) => r.state === "entity_type"),
     personName: Boolean(billing && billing.first_name && billing.last_name),
   };
@@ -2076,9 +2545,11 @@ function assessBilling(providerId, billing, countryCode, opts = {}) {
 function printBillingReadinessTable(a) {
   const mark = {
     present: `${c.ok("✅")} present`,
+    present_via_person: `${c.ok("✅")} via the person's name (LegalName fallback)`,
     absent: `${c.bad("⛔ ABSENT")} — migrate has nothing to copy`,
     bad_format: `${c.bad("⛔ INVALID FORMAT")}`,
-    unverified: `${c.warn("⚠")} in billing — propagation unverified`,
+    unsatisfiable: `${c.bad("⛔ UNSATISFIABLE")} — no key in config`,
+    not_propagated: `${c.warn("⚠")} in billing — migrate drops it`,
     entity_type: `${c.warn("?")} absent — but a person's name is present`,
   };
 
@@ -2088,7 +2559,7 @@ function printBillingReadinessTable(a) {
         "──────────────────"
     )
   );
-  const rules = requiredFieldsFor(a.countryCode);
+  const rules = a.integration && requiredFieldsForIntegration(a.integration);
   console.log(
     `  ${
       rules
@@ -2099,7 +2570,23 @@ function printBillingReadinessTable(a) {
     }${c.faint(countrySourceNote(a.countrySource))}` +
       c.faint(" · no legal entity yet, reporting on billing info alone")
   );
-  printRequiredRule(a.countryCode);
+  // Which shape migrate will build, and on what evidence. account_type is a fact; its
+  // absence is not, so the two read differently.
+  console.log(
+    "  " +
+      (a.shapeKnown
+        ? c.faint("migrate will build ") +
+          a.shape.key +
+          c.faint(
+            ` (root ${a.shape.root}${a.shape.child ? ` + child ${a.shape.child}` : ", no child"})` +
+              " — from provider_billing_informations.account_type"
+          )
+        : c.warn("account_type absent — assuming the organization shape; migrate may differ"))
+  );
+  printRequiredRule(a.countryCode, "  ", {
+    integration: a.integrationKnown ? a.integration : null,
+    shape: a.shape,
+  });
 
   if (!a.hasBilling) {
     console.log(
@@ -2147,19 +2634,34 @@ function printBillingReadinessTable(a) {
   for (const r of a.badFormat) {
     console.log(c.faint(`     ${r.label}: "${r.value}" — expected ${r.expected}`));
   }
+  if (a.unsatisfiable.length) {
+    console.log(
+      c.bad(
+        `  ⛔ ${a.unsatisfiable.length} required field(s) UNSATISFIABLE on a ${a.shape.key} ` +
+          `entity in ${a.countryCode}: ${a.unsatisfiable.map((r) => r.label).join(", ")}`
+      )
+    );
+    console.log(
+      c.faint(
+        `     ${declaredSourceFor(a.countryCode)} declares no key for these, so migrate's\n` +
+          "     value is dropped at the persist boundary. A PLATFORM gap — filling in\n" +
+          "     billing info cannot fix it."
+      )
+    );
+  }
   if (a.unverified.length) {
     console.log(
       c.warn(
-        `  ⚠ ${a.unverified.length} required field(s) present in billing but not ` +
-          "confirmed to reach the entity: " +
+        `  ⚠ ${a.unverified.length} required field(s) present in billing but dropped by ` +
+          "migrate: " +
           a.unverified.map((r) => r.label).join(", ")
       )
     );
     console.log(
       c.faint(
-        "     Provider 33 carries both in billing info and has neither on its legal\n" +
-          "     entity, so migrate is not known to copy them. Re-check with pre-flight\n" +
-          "     after migrating — this report cannot promise them."
+        "     BillingOnlyMigration's generic field map has no target for these outside\n" +
+          "     SA (where KsaFieldMapper supplies dedicated buildingNumber/district keys),\n" +
+          "     so the billing value does not reach the entity."
       )
     );
   }
@@ -2175,6 +2677,9 @@ function printBillingReadinessTable(a) {
 const REPORT_STATES = [
   "no_billing",
   "blocked",
+  // Right after blocked: equally fatal to e-invoicing, but fixable only in
+  // fields_configuration, so it must never be pooled with the merchant-data states.
+  "unsatisfiable",
   "differ",
   "entity_type_unclear",
   "no_country",
@@ -2206,6 +2711,7 @@ const reportView = { verbose: false, crossCountry: true };
 const ATTENTION_STATES = new Set([
   "no_billing",
   "blocked",
+  "unsatisfiable",
   "differ",
   "entity_type_unclear",
   "no_country",
@@ -2259,6 +2765,18 @@ function classifyProvider({
         note: `${problems} required field(s) not usable in billing info — migrate would produce a blocked entity`,
       };
     }
+    // Same platform-vs-merchant split as the migrated path: the entity migrate is about
+    // to build has no key for these, so a complete billing row still cannot satisfy them.
+    if (assessment.unsatisfiable.length) {
+      return {
+        ...base,
+        state: "unsatisfiable",
+        note:
+          `${assessment.unsatisfiable.length} required field(s) have no key on the ` +
+          `${assessment.shape.key} entity migrate will build in ${country} ` +
+          `(${assessment.unsatisfiable.map((r) => r.label).join(", ")}) — a platform gap`,
+      };
+    }
     // Not scored as blocked: whether this is a gap depends on the entity type migrate
     // chooses, which does not exist yet. Someone has to decide, so it stays an
     // attention state — but conflating it with a hard blocker overstated the problem
@@ -2301,8 +2819,9 @@ function classifyProvider({
     };
   }
 
-  // Migrated: the ordinary comparison decides, and only then does the link state
-  // matter — a correctly linked plugin holding a blocked entity is not progress.
+  // Migrated: the legal entity is the side e-invoicing actually reads, so its own
+  // required set decides first, and only then does the link state matter — a correctly
+  // linked plugin holding a blocked entity is not progress.
   if (cmp.blocking.length) {
     return {
       ...base,
@@ -2310,38 +2829,67 @@ function classifyProvider({
       note: `${cmp.blocking.length} required field(s) unusable on the legal entity`,
     };
   }
-  if (!cmp.billing) {
-    return { ...base, state: "no_billing", note: "migrated, but no active billing row to check against" };
+  // Separate from blocked on purpose: nobody can fix this by entering data. It is a
+  // fields_configuration gap, and pooling it with real data gaps sends someone chasing
+  // a merchant who has nothing to give.
+  if (cmp.unsatisfiable.length) {
+    return {
+      ...base,
+      state: "unsatisfiable",
+      note:
+        `${cmp.unsatisfiable.length} required field(s) have no key on a ${cmp.shape.key} ` +
+        `entity in ${country} (${cmp.unsatisfiable.map((r) => r.label).join(", ")}) — ` +
+        "a platform gap, not this provider's data",
+    };
   }
-  if (cmp.diffs.length) {
+
+  // No billing row is NOT a failure for a migrated provider. The entity has already been
+  // judged against its required set above and passed; an entity created through the
+  // self-serve flow never had a billing row and never will, so calling that ⛔ marked
+  // every such provider as broken. All that is lost is the cross-check.
+  const noCrossCheck = cmp.billing ? "" : "; no billing row to cross-check against";
+
+  if (cmp.billing && cmp.diffs.length) {
     return { ...base, state: "differ", note: `${cmp.diffs.length} field(s) differ from billing info` };
   }
+  const consistent = cmp.billing ? "consistent" : "entity complete";
   if (!plugins.length) {
-    return { ...base, state: "not_linked", note: "consistent, but no e-invoicing plugin exists yet" };
+    return {
+      ...base,
+      state: "not_linked",
+      note: `${consistent}, but no e-invoicing plugin exists yet${noCrossCheck}`,
+    };
   }
   if (!linkedToPrimary.length) {
     return {
       ...base,
       state: "not_linked",
       note:
-        `consistent, but ${unlinked.length} plugin(s) unlinked` +
+        `${consistent}, but ${unlinked.length} plugin(s) unlinked` +
         (linkedElsewhere.length ? ` and ${linkedElsewhere.length} linked elsewhere` : "") +
-        " — link has work to do",
+        ` — link has work to do${noCrossCheck}`,
     };
   }
   if (linkedElsewhere.length || unlinked.length) {
     return {
       ...base,
       state: "not_linked",
-      note: `${linkedToPrimary.length} plugin(s) linked, ${unlinked.length + linkedElsewhere.length} not`,
+      note:
+        `${linkedToPrimary.length} plugin(s) linked, ` +
+        `${unlinked.length + linkedElsewhere.length} not${noCrossCheck}`,
     };
   }
-  return { ...base, state: "done", note: `consistent, ${linkedToPrimary.length} plugin(s) linked` };
+  return {
+    ...base,
+    state: "done",
+    note: `${consistent}, ${linkedToPrimary.length} plugin(s) linked${noCrossCheck}`,
+  };
 }
 
 const REPORT_MARKS = {
   no_billing: () => c.bad("⛔"),
   blocked: () => c.bad("⛔"),
+  unsatisfiable: () => c.bad("⛔"),
   differ: () => c.bad("✗"),
   entity_type_unclear: () => c.warn("?"),
   no_country: () => c.warn("⚠"),
@@ -2356,14 +2904,16 @@ const REPORT_MARKS = {
 // distinct failure mode. So they're reported separately rather than pooled.
 const COUNTRY_NAMES = { SA: "KSA", ES: "Spain", IT: "Italy" };
 
-// Fields the country's own onboarding validator does not list but the send path does.
-// Without this, a reader who checks Comarch's @required_fields and finds no
-// company_name would think the script invented the requirement.
-function sendPathOnlyNote(country) {
-  const extra = REQUIRED_BY_SEND_PATH_ONLY[country];
-  if (!extra) return "";
-  return `${extra.map((f) => f.replace(/_/g, " ")).join(", ")} is required by the SEND path ` +
-    "(Common.LegalEntityBillingDetails), not by this country's onboarding validator";
+// Fields only ONE of the integration's two paths lists. Without this, a reader who checks
+// Comarch's @required_fields and finds no company_name — or SmartReceipts' send set and
+// finds no address — would think the script invented the requirement.
+// Takes an integration; the country form resolves through DEFAULT_INTEGRATION for the
+// per-country summaries that have no single provider in hand.
+function sendPathOnlyNote(countryOrIntegration) {
+  const integration = EINVOICING_INTEGRATIONS[countryOrIntegration]
+    ? countryOrIntegration
+    : integrationFor(countryOrIntegration, null);
+  return (integration && requiredPathNote(integration)) || "";
 }
 
 function countryLabel(country) {
@@ -2371,35 +2921,62 @@ function countryLabel(country) {
   return COUNTRY_NAMES[country] ? `${COUNTRY_NAMES[country]} (${country})` : country;
 }
 
-// Which module in app-accounting-documents declares the country's @required_fields. Printed
-// with the rule so a reader can check the list against the source instead of trusting it.
-// See the EINVOICING_REQUIRED comment for why SA differs and why company_name is in both.
-const REQUIRED_SOURCE = {
-  SA: "Comarch.LegalEntityBillingDetails @required_fields (onboarding)",
-  ES: "Common.LegalEntityBillingDetails @required_fields (onboarding + send)",
-  IT: "Common.LegalEntityBillingDetails @required_fields (onboarding + send)",
-};
-
 // The rule the PRESENT?/READY? column is judging against, printed above every table in that
 // format. Without it the marks are a verdict with no stated standard — a reader can see that
-// state/province blocks but not that ES is what demands it, or where that is written down.
+// state/province blocks but not what demands it, or where that is written down.
 // Both printers call this so the two cannot drift.
-function printRequiredRule(country, indent = "  ") {
-  const required = requiredFieldsFor(country);
+//
+// `opts.integration` is the plugin's actual integration where one is known; `opts.shape`
+// adds the per-shape expected keys and flags anything the shape cannot hold at all.
+function printRequiredRule(country, indent = "  ", opts = {}) {
+  const integration = integrationFor(country, opts.integration);
+  const required = integration && requiredFieldsForIntegration(integration);
   if (!required) return;
 
   const pad = `${indent}      `;
   const human = (f) => f.replace(/_/g, " ");
+  const spec = EINVOICING_INTEGRATIONS[integration];
+  const assumed = !opts.integration || !EINVOICING_INTEGRATIONS[opts.integration];
 
-  console.log(`${indent}${c.faint("rule:")} ${country} requires ${required.map(human).join(", ")}`);
-  if (REQUIRED_SOURCE[country]) console.log(pad + c.faint(REQUIRED_SOURCE[country]));
+  console.log(
+    `${indent}${c.faint("rule:")} ${integration}${assumed ? c.faint(" (assumed)") : ""}` +
+      ` requires ${required.map(human).join(", ")}`
+  );
+  console.log(pad + c.faint(`${spec.module} @required_fields`));
+  if (assumed) {
+    console.log(
+      pad + c.faint(`assumed from country ${country} — the plugin's integration was not known`)
+    );
+  }
 
-  const sendOnly = sendPathOnlyNote(country);
+  const sendOnly = sendPathOnlyNote(integration);
   if (sendOnly) console.log(pad + c.faint(sendOnly));
 
   // Presence is not the whole rule where ValidationHelpers also constrains the shape.
   for (const [field, rule] of Object.entries(EINVOICING_FORMATS[country] || {})) {
     console.log(pad + c.faint(`${human(field)} — ${rule.expected}`));
+  }
+
+  // Where a required field has nowhere to live on THIS shape, say so once, up front —
+  // the per-row marks then read as consequences rather than as separate mysteries.
+  if (!opts.shape) return;
+  const gaps = [];
+  for (const spec2 of FIELD_COMPARISON) {
+    if (!required.includes(spec2.pbi)) continue;
+    const keys = leKeysFor(opts.shape, spec2);
+    const { state } = satisfiability(country, opts.shape, keys);
+    if (state === "ok") continue;
+    gaps.push(
+      state === "no_slot"
+        ? `${spec2.label} (no slot on a ${opts.shape.key} entity)`
+        : `${spec2.label} (${declaredSourceFor(country)} declares no key: ${keys.join(" | ")})`
+    );
+  }
+  if (gaps.length) {
+    console.log(
+      pad + c.bad(`UNSATISFIABLE on a ${opts.shape.key} entity: ${gaps.join("; ")}`)
+    );
+    console.log(pad + c.faint("a platform/config gap — no data entry can fill these"));
   }
 }
 
@@ -2429,10 +3006,12 @@ function countrySourceNote(source) {
   return `  (from the ${source} — no country on the account configuration)`;
 }
 
-// E-invoicing countries first, in the order their required sets are declared, then
+// E-invoicing countries first, in the order their integrations are declared, then
 // everything else alphabetically, then the no-country group last.
 function groupByCountry(rows) {
-  const order = Object.keys(EINVOICING_REQUIRED);
+  const order = [
+    ...new Set(Object.values(EINVOICING_INTEGRATIONS).map((s) => s.country)),
+  ];
   const groups = new Map();
   for (const r of rows) {
     if (!groups.has(r.country)) groups.set(r.country, []);
@@ -2506,7 +3085,11 @@ function printReportSummary(rows, survey, scope) {
           `${c.ok(`✓ ${of(gm, "done")} consistent & linked`)}   ` +
           `${c.warn(`· ${of(gm, "not_linked")} not linked`)}   ` +
           `${c.bad(`✗ ${of(gm, "differ")} differ`)}   ` +
-          `${c.bad(`⛔ ${of(gm, "blocked") + of(gm, "no_billing")} blocked`)}`
+          `${c.bad(`⛔ ${of(gm, "blocked") + of(gm, "no_billing")} blocked`)}` +
+          // Counted apart from blocked: same effect on e-invoicing, different owner.
+          (of(gm, "unsatisfiable")
+            ? `   ${c.bad(`⛔ ${of(gm, "unsatisfiable")} unsatisfiable (platform)`)}`
+            : "")
       );
     }
     if (gf.length) {
@@ -2518,6 +3101,9 @@ function printReportSummary(rows, survey, scope) {
           : null,
         of(gf, "no_country") ? c.warn(`⚠ ${of(gf, "no_country")} no country`) : null,
         of(gf, "blocked") ? c.bad(`⛔ ${of(gf, "blocked")} incomplete billing`) : null,
+        of(gf, "unsatisfiable")
+          ? c.bad(`⛔ ${of(gf, "unsatisfiable")} unsatisfiable (platform)`)
+          : null,
         of(gf, "no_billing") ? c.bad(`⛔ ${of(gf, "no_billing")} no billing row`) : null,
       ].filter(Boolean);
       console.log(`    ${"not migrated".padEnd(14)}${String(gf.length).padStart(6)}   ${bits.join("   ")}`);
@@ -2544,6 +3130,7 @@ function printReportSummary(rows, survey, scope) {
         `${c.ok(`✓ ${count("ready") + count("done")} ready or done`)}   ` +
         `${c.warn(`? ${count("entity_type_unclear")} entity type unclear`)}   ` +
         `${c.bad(`⛔ ${count("blocked") + count("no_billing")} blocked`)}   ` +
+        `${c.bad(`⛔ ${count("unsatisfiable")} unsatisfiable`)}   ` +
         `${c.bad(`✗ ${count("differ")} differ`)}   ` +
         `${c.warn(`· ${count("not_linked")} not linked`)}   ` +
         `${c.faint(`– ${count("no_rules")} no rules`)}   ` +
@@ -2619,6 +3206,7 @@ function printReportSummary(rows, survey, scope) {
     not_linked: count("not_linked"),
     differ: count("differ"),
     blocked: count("blocked"),
+    unsatisfiable: count("unsatisfiable"),
     no_billing: count("no_billing"),
     ready: count("ready"),
     no_rules: count("no_rules"),
@@ -3458,7 +4046,10 @@ function comparePlugins(pluginsByProvider, billing, leFields, countries, primary
         providerId,
         billing.get(providerId),
         leFields.get(plugin.legalEntityId),
-        countries.get(providerId)
+        countries.get(providerId),
+        // This plugin's own integration, not the provider's — the audit is per plugin,
+        // and the required set is a property of the integration.
+        { integration: plugin.integration }
       );
 
       out.push({
@@ -3615,6 +4206,10 @@ function blockingLabel(row) {
 function mdPresence(row) {
   if (row.leBadFormat) return "⛔ **invalid format**";
   if (row.blocking) return "⛔ **blocks e-invoicing**";
+  // Must come before the presence branches: an unsatisfiable field is empty, so without
+  // this it rendered as a plain "⚠ provider only" and the platform gap vanished.
+  if (row.unsatisfiable === "no_slot") return "⛔ **no slot on this entity type**";
+  if (row.unsatisfiable === "undeclared") return "⛔ **unsatisfiable** *(no key in config)*";
   if (row.informational) return "provider only *(no LE counterpart)*";
   if (row.same) return "✅ both";
   if (row.presence === "both") return "❌ differs";
@@ -3783,33 +4378,54 @@ function buildPreflightMarkdown(
   out.push('## Where "required" comes from');
   out.push("");
   out.push(
-    "Both validators fetch the legal entity via `GetLegalEntityInvoiceDetails` and " +
-      "hard-fail with `{:error, :missing_required_fields}`:"
+    "Required fields are keyed by **integration**, not country — " +
+      "`Common.LegalEntityBillingResolver.for_integration/1` dispatches on " +
+      "`account_configuration_plugins.integration`. ES maps to **two** integrations whose " +
+      "sets differ. Every module fetches the legal entity via " +
+      "`GetLegalEntityInvoiceDetails` and hard-fails with " +
+      "`{:error, :missing_required_fields}`:"
   );
   out.push("");
-  out.push(
-    mdTable(
-      ["Field", "ES / IT", "KSA (SA)"],
-      [
-        ["`company_name`", "required", "not checked — taken from the request"],
-        ["`address` (street), `city`, `postal_code`, `state_province`", "required", "required"],
-        ["`tax_number`", "required — `TAX_IDENTIFICATION_NUMBER`", "required — `TAX_NUMBER` (ZATCA TRN)"],
-        ["`company_registration_number`", "—", "**required**"],
-        ["`building_number`, `district`", "—", "**required**"],
-        ["`country_code`", "not checked", "not checked"],
-      ]
-    )
-  );
+  {
+    const all = [...new Set(Object.values(EINVOICING_INTEGRATIONS).flatMap((s) => [
+      ...s.onboarding, ...(s.send || []),
+    ]))];
+    const names = Object.keys(EINVOICING_INTEGRATIONS);
+    out.push(
+      mdTable(
+        ["Field", ...names.map((n) => `\`${n}\` (${EINVOICING_INTEGRATIONS[n].country})`)],
+        all.map((field) => [
+          `\`${field}\``,
+          ...names.map((n) => {
+            const s = EINVOICING_INTEGRATIONS[n];
+            const onb = s.onboarding.includes(field);
+            const snd = s.send ? s.send.includes(field) : onb;
+            if (onb && snd) return "**required**";
+            if (onb) return "onboarding only";
+            if (snd) return "send only";
+            return "—";
+          }),
+        ])
+      )
+    );
+    out.push("");
+    out.push(
+      names
+        .map((n) => `- \`${n}\` → \`AccountingDocuments.${EINVOICING_INTEGRATIONS[n].module}\``)
+        .join("\n")
+    );
+  }
   out.push("");
   out.push(
-    "- `SA` → `AccountingDocuments.EInvoicing.Comarch.LegalEntityBillingDetails` `@required_fields`\n" +
-      "- `ES` / `IT` → `AccountingDocuments.EInvoicing.Common.LegalEntityBillingDetails` `@required_fields`\n" +
+    "`country_code` is never checked by any of them. The country still selects the " +
+      "`fields_configuration` that decides which keys a value can even be *stored* in — " +
+      "which is why `building_number`, required by `ticket_bai` and `smart_receipts`, is " +
+      "reported **unsatisfiable** rather than missing: only `country/sa.ex` declares a " +
+      "`buildingNumber` key, and writes to an undeclared key are dropped at the persist " +
+      "boundary.\n" +
       "\n" +
-      "The country comes from `account_configurations.country_code` — that's what " +
-      "`BillingDetailsPolicy` dispatches on. Countries with no entry have no required set.\n" +
-      "\n" +
-      "The KSA `tax_number` is a *different identifier kind*, so present-and-equal here " +
-      "is necessary but not sufficient."
+      "The KSA `tax_number` is the ZATCA TRN, so present-and-equal here is necessary but " +
+      "not sufficient — see the format rules below."
   );
 
   out.push("");
@@ -5664,7 +6280,12 @@ async function main() {
         migrated ? leFields.get(primary) : null,
         pbi
       );
-      const fieldOpts = { showAll: true, countrySource: source };
+      // The plugin's integration decides which required set applies — ES maps to two
+      // integrations with different sets, so the country alone cannot answer it. Null
+      // where no plugin exists yet; the comparison then assumes the country default and
+      // labels it.
+      const integration = integrationOfProvider(plugins);
+      const fieldOpts = { showAll: true, countrySource: source, integration };
 
       const row = classifyProvider({
         providerId,
@@ -6362,17 +6983,22 @@ async function main() {
       ...new Set(withLegalEntity.map((id) => primaryByProvider.get(id))),
     ]);
 
-    // Which validator applies is decided by the account configuration's country,
-    // so the required-field set has to come from there.
+    // Which validator applies is decided by the plugin's INTEGRATION, not by the country:
+    // LegalEntityBillingResolver.for_integration/1 dispatches on it, and ES maps to two
+    // integrations whose required sets differ. The country is still read — it selects the
+    // fields_configuration, and it is the grouping key for the output.
     console.log(c.faint(`Reading account configuration countries from ${AD_DB} (read-only)…`));
     const countries = fetchAccountConfigCountries(env, withLegalEntity);
+    console.log(c.faint(`Reading plugin integrations from ${AD_DB} (read-only)…`));
+    const preflightPlugins = fetchPlugins(env, withLegalEntity);
 
     const comparisons = withLegalEntity.map((id) =>
       compareFields(
         id,
         billing.get(id),
         leFields.get(primaryByProvider.get(id)),
-        countries.get(id)
+        countries.get(id),
+        { integration: integrationOfProvider(preflightPlugins.get(id)) }
       )
     );
 

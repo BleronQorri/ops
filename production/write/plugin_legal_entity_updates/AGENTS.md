@@ -412,28 +412,35 @@ district          yes   ∅                          ⛔ ABSENT — migrate has 
 Format rules are applied to the **billing** value here, not the entity's: `migrate`
 copies it forward, so a malformed value arrives malformed.
 
-### Sole traders: why `entity_type_unclear` is not `blocked`
+### Sole traders: `account_type` replaces the guess
 
-`EINVOICING_REQUIRED.ES` and `.IT` include `company_name`. But `FIELD_COMPARISON`
-marks that field `only: "organization"` — `compareFields` skips it entirely for an
-**individual** legal entity, whose name lives in `individual.name.*`. Before the
-rollout there is no entity, so `assessBilling` has no `_column.type` to branch on,
-which makes the un-migrated path stricter than the migrated one.
+The un-migrated path used to infer the entity type. It no longer has to:
+`provider_billing_informations.account_type` is read (it is in `PBI_COLUMNS`) and names the
+shape `migrate` will build. It is a **binary** Rails enum —
+`enum :account_type, %i[business individual]` — **not** the six-way account-type dropdown,
+which writes `legal_entities.business_type` directly through the self-serve flow.
+`BillingOnlyMigration::BUSINESS_TYPE_MAP` converts it:
 
-A provider with no `company_name` but a populated `first_name` + `last_name` is
-therefore reported `entity_type_unclear`, not `blocked`:
+| `account_type` | `business_type` | root | child |
+|---|---|---|---|
+| `0` `business` | `BUSINESS_TYPE_ORGANIZATION` | `organization` | none |
+| `1` `individual` | `BUSINESS_TYPE_SOLE_PROPRIETORSHIP` | `individual` | `sole_proprietorship` |
 
-```
-  ? provider=92  [ES]  not migrated  company name absent but a person's name is
-                                     present — ES requires a legal name, and which
-                                     field satisfies it depends on whether migrate
-                                     creates an organization or an individual entity
-```
+`ACCOUNT_TYPE_SHAPE` mirrors that. The map's other six keys are unreachable until shedul's
+enum widens, so those are the only two shapes `migrate` can produce today.
 
-**This mattered.** The first production run counted 64 blocked; 60 of those were ES
-sole traders in exactly this shape. Someone still has to decide per provider — which
-is why it stays in `ATTENTION_STATES` — but it is not the same finding as a genuinely
-missing required field.
+So a provider with no `company_name` but a populated `first_name` + `last_name` and
+`account_type = individual` is now reported **`✅ via the person's name (LegalName
+fallback)`** — a fact, not a question, because `LegalName` really does fall back to the
+person's name for a sole proprietorship.
+
+`entity_type_unclear` survives only for the case it is actually true of: `account_type` is
+absent, so the shape genuinely cannot be known. It stays in `ATTENTION_STATES`.
+
+**Why this mattered.** The first production run counted 64 blocked; 60 of those were ES
+sole traders in exactly this shape. Conflating them with genuinely missing fields overstated
+the problem by 60 providers, which is why the distinction is load-bearing and must not
+regress even as the population approaches zero.
 
 ### Payments and KYC are reported for every provider
 
@@ -457,17 +464,31 @@ payments or KYC information at all, having already queried it. `--summary` gets 
 rollup; the default and the Markdown export get the full per-provider table. The
 paragraph explaining where the two columns come from is prose, so `--full` only.
 
-### building number and district are not promised
+### building number and district — where migrate actually puts them
 
-`migrate` is **not confirmed** to copy `building_number` or `district` onto the
-entity. Provider 33 carries both in `provider_billing_informations` (`1234`) and has
-neither on its legal entity — which is exactly why it is blocked. So for a country
-that requires them, a present billing value is reported as
-`⚠ in billing — propagation unverified` and is deliberately **not** counted as
-ready. Confirm with `--preflight` after migrating; this report cannot promise them.
+This used to be an "unverified propagation" hedge. It is now known, and the answer is
+country-conditional. `PROPAGATION_TARGET` in the script records it:
 
-That list is `UNVERIFIED_PROPAGATION` in the script. If `migrate` is fixed to carry
-them across, remove the field from that set and the caveat disappears.
+| country | `building_number` → | `district` → |
+|---|---|---|
+| **SA** | `*.registeredAddress.buildingNumber` | `*.registeredAddress.district` |
+| everywhere else | `*.registeredAddress.street2` | **dropped entirely** |
+
+For SA, `KsaFieldMapper.localize/1` swaps the generic map for one with dedicated keys
+("Shedul carries the Saudi national address as dedicated values … street2 is not sent").
+Everywhere else `BillingOnlyMigration`'s generic map routes `building_number` into `street2`
+and has no target for `district` at all. Since only `zatca` requires either, the generic
+behaviour costs nothing — and the readiness table says `⚠ in billing — migrate drops it`
+rather than pretending the value will arrive.
+
+Two caveats worth keeping in view:
+
+* Only `BillingOnlyMigration` and `CheckoutFreshaPayProviderMigrator` consult these maps.
+  `AdyenFreshaPayProviderMigrator` builds the entity from app-adyen-platform KYC data and
+  never reads billing info, so nothing here predicts its output.
+* `ticket_bai` and `smart_receipts` **require** `building_number` while `default.ex` declares
+  no key for it. That is not a propagation problem — it is unsatisfiable, and reported as
+  such.
 
 ### States, worst first
 
@@ -475,23 +496,32 @@ The roster is sorted by these and so is the Markdown:
 
 | State | Mark | Meaning |
 |---|---|---|
-| `no_billing` | ⛔ | no active `provider_billing_informations` row — `migrate` has nothing to build from |
-| `blocked` | ⛔ | migrated: required fields unusable on the entity. Not migrated: required fields absent or malformed in billing info |
-| `differ` | ✗ | migrated, but fields disagree with billing info |
-| `entity_type_unclear` | ? | the country requires a legal name; billing info has no `company_name` but does have `first_name` + `last_name`. Whether that's a gap depends on the entity type `migrate` picks — **not** counted as blocked |
+| `no_billing` | ⛔ | **not migrated** and no active `provider_billing_informations` row — `migrate` has nothing to build from |
+| `blocked` | ⛔ | migrated: required fields empty on the entity. Not migrated: required fields absent or malformed in billing info |
+| `unsatisfiable` | ⛔ | a required field has **no slot or no declared key** for this shape and country. Equally fatal, but a **platform** gap — no data entry fixes it, so it is never pooled with `blocked` |
+| `differ` | ✗ | migrated, and fields disagree with billing info |
+| `entity_type_unclear` | ? | not migrated, `account_type` is absent, so the shape `migrate` will build cannot be known |
 | `no_country` | ⚠ | no country on the account configuration — nothing can be assessed |
-| `not_linked` | · | migrated and consistent, but plugins aren't pointing at the primary — work for `link`, not a data problem |
-| `ready` | ✓ | not migrated, billing info complete for its country's rules — `migrate` should produce a good entity |
-| `no_rules` | – | not migrated, billing row present, but the country has no e-invoicing required set |
-| `done` | ✓ | migrated, consistent, every plugin linked to the primary |
+| `not_linked` | · | migrated and complete, but plugins aren't pointing at the primary — work for `link`, not a data problem |
+| `ready` | ✓ | not migrated, billing info complete for its integration's rules — `migrate` should produce a good entity |
+| `no_rules` | – | not migrated, billing row present, but the country has no e-invoicing integration |
+| `done` | ✓ | migrated, complete, every plugin linked to the primary |
 
-`ATTENTION_STATES` in the script is the first five — `ready`, `no_rules` and `done`
-are the report working as intended, and only the others reach the "Needs attention"
-table in the export.
+`ATTENTION_STATES` is everything except `ready`, `no_rules` and `done` — those are the
+report working as intended, and only the others reach the "Needs attention" table in the
+export.
+
+**`no_billing` applies only to un-migrated providers.** A *migrated* provider with no
+billing row is not a failure: the legal entity has already been judged against its
+integration's required set, and an entity created through the self-serve flow never had a
+billing row and never will. All that is lost is the cross-check, so it falls through to the
+link state with `; no billing row to cross-check against` appended, and its
+`comparison.status` in JSON is `no_billing_to_compare` rather than `differs`. Treating it as
+⛔ marked every self-serve provider broken.
 
 ### Why `no_rules` and `no_country` exist as separate states
 
-Only **SA, ES and IT** have an e-invoicing required-field set (`EINVOICING_REQUIRED`).
+Only **SA, ES and IT** have an e-invoicing integration (`EINVOICING_INTEGRATIONS`).
 The report still covers every other country, but a provider there cannot be scored
 `ready`: nothing was required of it, so the word would mean something different from
 the same word applied to a provider that actually cleared SA's eight fields. It gets
@@ -967,29 +997,62 @@ For an `organization` root with no child:
 
 Note `state_province` ← `address.region` ← `stateOrProvince`: three names for one value.
 
-**Sole proprietorships read from the CHILD entity.** `Address.address_prefix/2` and
-`Identifiers.identifier_keys/2` dispatch on the `(root.type, child.type)` pair:
+### A legal entity is TWO rows, and `business_type` decides which one answers
 
-| pair | address prefix | identifier prefix |
-|---|---|---|
-| `(organization, _)` | `organization.registeredAddress.*` (root) | `organization.*` (root) |
-| `(individual, sole_proprietorship)` | `soleProprietorship.registeredAddress.*` (**child**) | `soleProprietorship.*` (**child**) |
-| `(individual, unincorporated_partnership)` | `unincorporatedPartnership.registeredAddress.*` (child) | `unincorporatedPartnership.*` (child) |
-| `(individual, trust)` | `individual.residentialAddress.*` (root) | none — empty list |
+The root carries `business_type` (8 values); its child, where it has one, carries `type`
+and a NULL `business_type`. A check constraint
+(`legal_entities_business_type_required_for_root`) keeps them complementary:
 
-`individual.residentialAddress.*` therefore applies to **`individual_trust` only**, not
-to sole traders — `FIELD_COMPARISON` used to imply otherwise and now carries the
-`soleProprietorship.registeredAddress.*` keys as well.
+```
+root  → type IN (individual, organization)                                AND business_type IS NOT NULL
+child → type IN (sole_proprietorship, trust, unincorporated_partnership)  AND business_type IS NULL
+```
+
+They are joined through `legal_entity_associations` — there is **no `parent_id`** — and a
+root has at most one child. Every active primary pointer targets a root.
+
+`ENTITY_SHAPES` in the script is the whole mapping, transcribed from
+`fields_configuration/business_types.ex` `entity_type_for/2` plus the two dispatch tables.
+Eight business types, five distinct `(root, child)` pairs:
+
+| `business_type` | root | child | address prefix | identifiers | legal name |
+|---|---|---|---|---|---|
+| `organization` | `organization` | — | `organization.registeredAddress.*` (root) | `organization.*` | `organization.legalName` |
+| `partnership_incorporated` | `organization` | — | same | same | same |
+| `association_incorporated` | `organization` | — | same | same | same |
+| `non_profit` | `organization` | — | same | same | same |
+| `organization_trust` | `organization` | `trust` | `organization.registeredAddress.*` (root) | `organization.*` (root) | `trust.name` (child) |
+| `sole_proprietorship` | `individual` | `sole_proprietorship` | `soleProprietorship.registeredAddress.*` (**child**) | `soleProprietorship.*` (**child**) | `soleProprietorship.name`, else the person's name |
+| `unincorporated_partnership` | `individual` | `unincorporated_partnership` | `unincorporatedPartnership.registeredAddress.*` (**child**) | `unincorporatedPartnership.*` (**child**) | `unincorporatedPartnership.name` |
+| `individual_trust` | `individual` | `trust` | `individual.residentialAddress.*` (root) | **none — `[]`** | `trust.name` (child) |
+
+Two traps this table exists to avoid:
+
+* **A sole trader keeps its address AND identifiers on the child.** Its root holds only
+  `individual.name.*`. This is the majority shape — ~75% of primary pointers, and 12 of 15
+  in the e-invoicing countries.
+* **`individual.residentialAddress.*` belongs to `individual_trust` only**, never to a sole
+  trader. `FIELD_COMPARISON` used to imply otherwise.
 
 `LegalName` for a sole prop takes `soleProprietorship.name`, falling back to
 `individual.name.firstName + " " + lastName` — so a sole trader's `company_name` is
-satisfied by the person's name when there's no trading name.
+satisfied by the person's name when there is no trading name. SA and AE never declare
+`soleProprietorship.name` at all, so theirs always invoice as the individual. The script
+models that fallback as the synthetic key `LEGAL_NAME_FROM_PERSON`.
 
-> **Known gap, not yet fixed.** `fetchLegalEntityFields` reads only the entity named by
-> the primary pointer — it never loads children. For a migrated sole proprietorship the
-> address and identifiers live on the child, so the comparison would report them all
-> missing. No effect on the current production report (0 providers migrated), but
-> pre-flight and the plugin audit share that query and would misreport a sole prop today.
+`FIELD_COMPARISON` therefore no longer holds static key lists. Each spec names a **slot**
+(`address` / `identifier` / `legalName` / `individualName` / `column`) and `leKeysFor(shape,
+spec)` derives the real key. An empty result means the shape has no slot for that field —
+a fact about the entity type, not a missing value.
+
+**`fetchLegalEntityFields` loads the child.** Its SQL unions the child's `fields` in under
+the **root's** id, so every existing caller is unchanged, plus pseudo-keys
+`_column.business_type`, `_column.child_type`, `_column.child_id`. The child arm comes
+**last on purpose**: on a key collision the child wins, because a pre-hierarchy `individual`
+root can carry a legacy `soleProprietorship.vatNumber` (`default.ex`
+`individual_legacy_fields`) and the mapper reads the child's value. Rows with a NULL
+`business_type` fall back to the old binary guess via `shapeFor/2` and are labelled as
+inferred.
 
 `tax_number` probes **only** `*.vatNumber`. `*.taxInformation.number` is emitted as
 `IDENTIFIER_KIND_TAX_IDENTIFICATION_NUMBER`, a different kind that
@@ -1005,30 +1068,113 @@ tell a cosmetic difference from something that **blocks e-invoicing**. Both
 validators fetch the legal entity via `GetLegalEntityInvoiceDetails` and hard-fail
 with `{:error, :missing_required_fields}`:
 
-| Field | ES / IT | KSA (SA) |
+> **Corrected 2026-07-31.** This section used to describe "two validators", ES and IT
+> sharing a `Common.LegalEntityBillingDetails`. **That module does not exist.** There are
+> **four** per-integration validators, and the required set is keyed by **integration**, not
+> country — ES has *two* integrations whose sets differ. The script's country-keyed
+> `EINVOICING_REQUIRED` is wrong for ES and IT; see the defect table below.
+
+Four validators, each owning its own mapper and required set, dispatched by
+`Common.LegalEntityBillingResolver.for_integration/1` on the plugin's `integration` enum
+(`account_configuration_plugins.integration`; `Enums.e_invoice_integration` =
+`:zatca | :verifactu | :ticket_bai | :smart_receipts`) — **not** on country:
+
+| integration | country | module | onboarding entry point |
+|---|---|---|---|
+| `:zatca` | SA | `Comarch.LegalEntityBillingDetails` | `Comarch.Actions.OnboardProviderToKsaAction` |
+| `:verifactu` | ES | `Invopop.ES.Verifactu.LegalEntityBillingDetails` | Invopop register |
+| `:ticket_bai` | ES | `Invopop.ES.TicketBai.LegalEntityBillingDetails` | Invopop register |
+| `:smart_receipts` | IT | `Invopop.IT.SmartReceipts.LegalEntityBillingDetails` | Invopop register |
+
+Required fields per integration — onboarding vs send, since only `zatca` and
+`smart_receipts` differ between the two (`verifactu` and `ticket_bai` both have
+`fetch_billing_informations/2` delegate straight to `fetch/1`):
+
+| Field | `zatca` | `verifactu` | `ticket_bai` | `smart_receipts` |
+|---|---|---|---|---|
+| `company_name` | send only (onboarding takes it from the request) | **required** | **required** | **required** (both paths) |
+| `tax_number` | **required** | **required** | **required** | **required** (both paths) |
+| `address` (street), `city`, `postal_code` | **required** | **required** | **required** | onboarding only |
+| `state_province` | **required** | — *(not required)* | **required** (derives the foral region `VI`/`BI`/`SS`) | onboarding only |
+| `building_number` | **required** | — | **required** | onboarding only |
+| `district` | **required** | — | — | — |
+| `company_registration_number` | **required** | — | — | — |
+| `country_code` | not checked | not checked | not checked | not checked |
+
+All four read `identifiers[TAX_NUMBER]` for `tax_number` and hard-fail with
+`{:error, :missing_required_fields}`.
+
+The constant is now `EINVOICING_INTEGRATIONS`, keyed by integration and carrying
+`{country, module, onboarding, send}`; `send: null` means `fetch_billing_informations/2`
+delegates to `fetch/1`. `requiredFieldsForIntegration/1` returns the union of both paths,
+and `requiredPathNote/1` annotates which path demands the extras. The old country-keyed
+`requiredFieldsFor(country)` survives only for grouping and the "is this an e-invoicing
+country" checks; it resolves through `DEFAULT_INTEGRATION` and must not be used to judge an
+individual provider.
+
+**Three defects this fixed.** The old country-keyed set was:
+
+| | script said | reality | effect |
+|---|---|---|---|
+| `SA` | the 9 fields | exactly `zatca`'s onboarding ∪ send | was correct |
+| `ES` | included `state_province` | `verifactu` does not require it, and **no ES entity carries `stateOrProvince`** | false block on every ES provider |
+| `ES` | omitted `building_number` | `ticket_bai` requires it | missed block |
+| `IT` | omitted `building_number` | `smart_receipts` onboarding requires it | missed block |
+
+**And a platform gap:** `ticket_bai` and `smart_receipts` both require `building_number`, but
+their field config is `Default`, whose address keys are
+`street, street2, city, postalCode, stateOrProvince, country` — there is **no `buildingNumber`
+key to store a value in** (only `sa.ex` defines one). So onboarding an ES TicketBAI or IT
+SmartReceipts provider *from a legal entity* cannot succeed for any business type. Confirmed
+live in eng-pierogi: 0 of 9 ES and 0 of 11 IT entities carry `buildingNumber`. IT **sending**
+still works — it needs only `company_name` + `tax_number`.
+
+That is reported as the `unsatisfiable` state, never as `blocked` — see
+"Satisfiability" below.
+
+### Satisfiability — a third outcome, and why it is not `blocked`
+
+A required field has to clear **two** independent bars, and the second one is easy to miss:
+
+1. **is there a slot** — does the invoice projection probe any key for it on this shape?
+   `identifier_keys/2` returns `[]` for `(individual, trust)`, so an `individual_trust` can
+   never carry a `tax_number`.
+2. **is the key declared** — `create_legal_entities.ex` filters submitted fields against
+   `Lookup.available_legal_entity_fields_for_validation(country, business_type, role)` at the
+   persist boundary ("Filters submitted fields to the LE allowlist"). A write to an
+   undeclared key is **silently dropped**, so undeclared means permanently empty.
+
+Either failure is a **platform gap, not a merchant one** — no data entry can fix it. Pooling
+it with genuinely-unfilled fields sends someone chasing a merchant who has nothing to give,
+so it gets its own row mark, its own provider state, and its own count:
+
+| mark | meaning | owner |
 |---|---|---|
-| `company_name` | **required** | **required by the SEND path** — Comarch onboarding takes it from the request, but `Common` validates it on every send |
-| `address` (street), `city`, `postal_code`, `state_province` | required | required |
-| `tax_number` | required — emitted from `vatNumber` as `TAX_NUMBER` | required — same slot, ZATCA TRN |
-| `company_registration_number` | — | **required** |
-| `building_number`, `district` | — | **required** |
-| `country_code` | not checked | not checked |
+| `⛔ BLOCKS e-invoicing` | slot exists, key declared, **value empty** | merchant / `migrate` |
+| `⛔ NO SLOT on this entity type` | the projection emits nothing here | platform |
+| `⛔ UNSATISFIABLE — no key in config` | undeclared; dropped at persist | platform |
 
-Two validators, and **which one applies depends on the path, not only the country**:
+`DECLARED_KEYS` holds two sets — `SA` from `country/sa.ex`, and `DEFAULT` from `default.ex`
+for every country with no module, **which includes ES and IT**. `declaredSourceFor(country)`
+names which one answered, so the output says `default.ex (no country module)` rather than
+implying a Spain-specific rule. The day a `country/es.ex` lands, these answers change and
+that set has to be added. `UNSUPPORTED_CHILD` records that `sa.ex` implements neither
+`unincorporated_partnership_child/0` nor `trust_child/0`, so `Country.get_for/2` returns `[]`
+and the whole child namespace is undeclared for those pairs.
 
-| Path | Entry point | Validator |
-|---|---|---|
-| onboarding, SA | `Comarch.Actions.OnboardProviderToKsaAction` | `Comarch.LegalEntityBillingDetails` |
-| onboarding, ES/IT | `Common.Actions.RegisterProviderAction` | `Common.LegalEntityBillingDetails` |
-| **sending, every country** | `Common.BillingDetailsPolicy.resolve/2` → `fetch_billing_informations/2` | `Common.LegalEntityBillingDetails` |
+Coverage across 4 integrations × 8 business types: **11 of 32 complete**. The two universal
+gaps are `ticket_bai` and `smart_receipts`, neither satisfiable by *any* business type.
+`scratchpad/coverage.js`-style verification: the script's own tables reproduce that matrix
+row for row.
 
-So `EINVOICING_REQUIRED.SA` is the **union** of both: Comarch's `building_number` +
-`district`, plus `Common`'s `company_name`. A provider that onboards and then cannot
+`EINVOICING_REQUIRED.SA` is the union of `zatca`'s two paths: Comarch's `building_number` +
+`district`, plus the send path's `company_name`. A provider that onboards and then cannot
 send is not usable, so the script asks for both and labels the extra:
 
 ```
   note: company name is required by the SEND path
-        (Common.LegalEntityBillingDetails), not by this country's onboarding validator
+        (Comarch.LegalEntityBillingDetails @send_required_fields), not by this
+        integration's onboarding validator
 ```
 
 The one exception is the allow-listed legacy KSA per-location flow
@@ -1037,16 +1183,21 @@ billing and never touches a legal entity. `REQUIRED_BY_SEND_PATH_ONLY` in the sc
 records the annotation.
 
 Earlier revisions of this table claimed KSA's `tax_number` was
-`TAX_NUMBER` while ES/IT was `TAX_IDENTIFICATION_NUMBER`. Both actually read
+`TAX_NUMBER` while ES/IT was `TAX_IDENTIFICATION_NUMBER`. All four actually read
 `identifiers[TAX_NUMBER]`, which `Identifiers.keys_for/1` emits from `*.vatNumber`;
-`TAX_IDENTIFICATION_NUMBER` comes from `*.taxInformation.number` and neither validator
+`TAX_IDENTIFICATION_NUMBER` comes from `*.taxInformation.number` and no validator
 reads it. The ZATCA-vs-NIF distinction is about the *value*, not the slot.
 
-The country comes from **`account_configurations.country_code`**, because that's
-what `BillingDetailsPolicy` dispatches on (`%{country_code: "SA"} =
-account_configuration`) — not the billing info's country, and not the legal
-entity's. Countries with no entry have no required set, and the comparison stays
-purely informational for them.
+The **integration** comes from `account_configuration_plugins.integration` — that is what
+`LegalEntityBillingResolver` dispatches on. Country
+(`account_configurations.country_code`) is what `BillingDetailsPolicy` uses to pick the
+*send* path (`%{country_code: "SA"} = account_configuration`), and it is still the right
+grouping key for the report's output — but it does **not** determine the required set, because
+ES maps to two integrations. A provider with no plugin row yet has no integration to read, so
+the un-migrated path has to assume one: use `verifactu` for ES (the live one) and **say so**,
+because assuming `ticket_bai` would manufacture a `building_number` block for every ES
+provider. Countries with no integration have no required set, and the comparison stays purely
+informational for them.
 
 A required field missing on the **legal-entity** side is reported as
 `⛔ BLOCKS e-invoicing` and fails the run. That's stronger than "differs": the
@@ -1400,6 +1551,28 @@ silently loses answers as soon as you ask more than one thing in a row:
 `ask()` therefore listens for `line` once and queues what arrives. `closeRl()`
 runs before spawning Houston (which needs stdin for its own prompts) and in a
 `finally` at exit. If you add prompts, keep using `ask()`.
+
+## Don't write tests for these scripts
+
+**Do not add or extend a test suite here.** Not unit tests, not a harness, not a
+"just one case to pin this down" addition to an existing one. If you are tempted to
+prove a change works, prove it the way this script is meant to be proven: run a
+read-only mode against a real staging namespace and read the output.
+
+```sh
+./plugin_legal_entity_updates.js --report -n eng-pierogi --all --detail
+./plugin_legal_entity_updates.js --preflight -n eng-pierogi --all --json --yes | jq .tally
+```
+
+Every mode that reads is safe to run repeatedly, in production included, so a real
+namespace is always available as the oracle — and it exercises the actual psql
+queries, the actual jsonb shapes and the actual Houston plumbing, none of which a
+fixture reproduces faithfully. `--json` gives you something diffable across two
+revisions of the script, which is the closest thing to a regression check that is
+worth having here.
+
+`plugin_legal_entity_updates.test.sh` predates this convention. Leave it alone —
+don't grow it, and don't treat its existence as licence to add more.
 
 ## Prereqs
 
