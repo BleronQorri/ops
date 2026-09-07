@@ -20,6 +20,7 @@ the script's own `AGENTS.md`.
 
 | Script | Run | What it does |
 |--------|-----|--------------|
+| [account_config_legal_entity_audit](production/read-only/account_config_legal_entity_audit/) | `./account_config_legal_entity_audit.js --yes` | Where has a provider's tax identity drifted away from its legal entity? Walks every `account_configurations` row, follows each of its plugins to the legal entity that plugin points at (`plugins.legal_entity_id`), and reports a verdict per field: `plugins.parent_number` vs `<shape>.vatNumber`, `plugins.branch_number` vs `<shape>.registrationNumber`, `plugins.country_code` vs the entity's country. The two sides are **snapshots, not a link** — `maybe_update_tax_id/2` refreshes the columns only on a re-onboarding, and nothing subscribes to legal-entity change events. **The comparison is plugin-level on purpose:** provider 1135636's branch plugin (`is_default = false`) carries a different CRN *by design*, so comparing `account_configurations.company_registration_number` invents a conflict for it. Verdicts separate `PREFIX` (equal under the app's own `tax_id_variants/2`, differing only by the ISO country prefix — not a discrepancy) from real `CONFLICT`s, and sub-label those `CONFIG MALFORMED` / `LE MALFORMED` / `BOTH VALID` so a corrupt column is distinguishable from two well-formed values naming different things. Skips `configuration` (`{}` on every row, read nowhere), `enabled` (dead) and `vat_number` (a duplicate of `tax_id`, asserted equal instead). Excludes `invoice_entity_id` configurations, which have no legal entity by design. Also runs the service's own internal invariants (`tax_id == vat_number == plugin.parent_number`, the CRN/branch_number check for default plugins only, `unique_tax_entity_per_plugin`). Prints a matrix, per-country tallies and a detail section; writes a dated Markdown report, offers CSV, and has a `--json` mode. **Read-only and structurally so** — no `houston psql --write` and no `houston task run` in the file; `--yes` approves the reads for automation. |
 | [invopop_supplier_check](production/read-only/invopop_supplier_check/) | `./invopop_supplier_check.exs` | List Invopop "suppliers" silo entries, diagnose ones in problem states. Optional provider cross-ref via psql. |
 | [onboard_location_scripts](production/read-only/onboard_location_scripts/) ⚠️ **DEPRECATED** | `./onboard_location_scripts.exs <provider_id>` | **Deprecated — Billing Profiles migration** (checks the pre-migration onboarding model; legacy/reference only). Provider onboarding check across `shedul` + `accounting-documents` DBs; reads + polls, and prints the Houston onboarding tasks to run (never runs them). |
 
@@ -42,7 +43,8 @@ the script's own `AGENTS.md`.
 
 ## Danger tiers
 
-- **Read-only:** `b2b_credit_notes` in **matrix** mode — its only mode today; it sits
+- **Read-only:** `account_config_legal_entity_audit` — no write path exists in the file
+  at all, so `--yes` is safe to automate. Also `b2b_credit_notes` in **matrix** mode — its only mode today; it sits
   in `write/` for a planned mutating mode, but matrix is SELECTs only and there is no
   write path in the file yet. Also `invopop_supplier_check`, `onboard_location_scripts`,
   `plugin_legal_entity_updates` in **pre-flight**, **post-flight** or **plugin

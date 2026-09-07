@@ -3,6 +3,8 @@ invopop_report_*.md
 invopop_entries_*.csv
 b2b-credit-notes-*.md
 b2b-credit-notes-*.csv
+account-config-le-audit-*.md
+account-config-le-audit-*.csv
 
 # Elixir crash dumps
 erl_crash.dump

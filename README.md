@@ -10,6 +10,7 @@ Grouped by the environment it acts on, then by whether it only reads or also wri
 ### `production/` — touches real production data
 
 **read-only**
+- **account_config_legal_entity_audit** — where has a provider's tax identity drifted away from its legal entity? Walks every `account_configuration`, follows each plugin's `legal_entity_id`, and reports a verdict per field. Separates the ISO-country-prefix cases (which the app itself treats as equal) from real conflicts, and says which side is malformed. Read-only, with no write path in the file.
 - **invopop_supplier_check** — lists Invopop supplier silo entries and flags ones stuck in error/void states. Read-only.
 - **onboard_location_scripts** — ⚠️ _deprecated (Billing Profiles migration)._ Provider onboarding check across `shedul` + `accounting-documents`; prints the Houston tasks to run.
 
@@ -49,6 +50,91 @@ you don't pass and gates writes behind a confirmation. Add `-h`/`--help` to any
 `AGENTS.md`.
 
 ### production/read-only
+
+**account_config_legal_entity_audit** — has a provider's tax identity drifted from its legal entity?
+```sh
+./production/read-only/account_config_legal_entity_audit/account_config_legal_entity_audit.js --yes
+#   -n, --namespace NAME   namespace / psql env (default: production)
+#       --country XX       only this country; repeatable (SA / ES / IT)
+#       --provider ID      only this provider_id; repeatable or comma-separated
+#       --conflicts-only   hide rows that compared cleanly (terminal view only; the
+#                          Markdown and CSV always carry every row)
+#       --include-prefix   count PREFIX as a conflict (default: its own bucket)
+#       --md [PATH] / --no-md      the Markdown report (written by default)
+#       --csv / --no-csv   write the CSV or don't, either way no prompt
+#       --json             one result document on stdout, human lines on stderr
+#   -y, --yes              approve the READS without a terminal
+#
+# READ-ONLY, STRUCTURALLY: there is no `houston psql --write` and no `houston task run`
+# anywhere in the file. `grep -nE '\-\-write|task run'` is the test. So --yes is safe to
+# automate — there is no stronger action it could unlock.
+#
+# app-accounting-documents stores a provider's tax identity twice: on its own columns
+# (account_configurations.tax_id / .vat_number / .company_registration_number /
+# .country_code, mirrored onto the plugin as parent_number / branch_number /
+# country_code) and on the legal entity that account_configuration_plugins.legal_entity_id
+# points at. THE TWO ARE SNAPSHOTS, NOT A LINK — maybe_update_tax_id/2 refreshes the
+# columns only on a re-onboarding or a manual task run, and nothing subscribes to
+# legal-entity change events. The columns still back the onboarding uniqueness pre-check
+# and the KSA Fresha-B2B CRN fallback, so a stale one has consequences.
+#
+# THE COMPARISON IS PLUGIN-LEVEL ON PURPOSE. Provider 1135636 holds two enabled plugins
+# against one configuration; the branch one (is_default = false) carries a DIFFERENT CRN
+# by design (hardcoded in comarch/billing_details_policy.ex @ksa_location_branch_numbers).
+# Comparing account_configurations.company_registration_number invents a conflict for it;
+# comparing plugins.branch_number does not.
+#
+#   plugins.parent_number  vs  <shape>.vatNumber          (IDENTIFIER_KIND_TAX_NUMBER —
+#                                                          NOT taxInformation.number,
+#                                                          which is a different kind)
+#   plugins.branch_number  vs  <shape>.registrationNumber
+#   plugins.country_code   vs  the entity's country_code column
+#
+# <shape> is resolved per business_type, so an ES sole trader reads
+# soleProprietorship.vatNumber off the CHILD entity (joined via
+# legal_entity_associations) and an SA organization reads organization.vatNumber off the
+# root. Reading the root alone reports every populated ES/IT provider as missing
+# everything.
+#
+# NOT COMPARED: `configuration` jsonb ({} on all 442 rows, read nowhere in src/),
+# `enabled` (dead — not even in the Ecto schema), `vat_number` (a write-only duplicate of
+# tax_id — asserted equal instead of compared twice), `currency_code` (no counterpart).
+#
+# Verdicts: MATCH / PREFIX / CONFLICT / LE ONLY / CONFIG ONLY / NEITHER / NO SLOT.
+# PREFIX means the two sides are equal under the application's OWN tax_id_variants/2
+# normalisation and differ only by the leading ISO country code (ESB63912596 vs
+# B63912596) — not a discrepancy, and its own bucket so it never buries the real ones.
+# CONFLICT is sub-labelled CONFIG MALFORMED / LE MALFORMED / BOTH MALFORMED / BOTH VALID
+# using ValidationHelpers' KSA rules, because which side is malformed IS the finding: a
+# corrupt column against a well-formed entity has an obvious fix, two well-formed values
+# naming different numbers needs a human.
+#
+# States: COMPARED, UNLINKED (provider-side plugin with no legal_entity_id — every send
+# is refused with {:error, :missing_legal_entity_id}), LE MISSING, NO PLUGIN, and
+# FRESHA ENTITY (an invoice_entity_id configuration, which has NO legal entity by design
+# and is excluded from every tally — production's one `enabled` plugin without a legal
+# entity is exactly this, and counting it would report an outage that doesn't exist).
+#
+# Also checks accounting-documents against ITSELF, restating the invariants the service's
+# own pre_flight_check/0 helpers assert: tax_id == vat_number == plugin.parent_number,
+# country_code == plugin.country_code, crn == plugin.branch_number (default plugins ONLY
+# — branch plugins are listed as exempt), provider_id == plugin.provider_id where
+# populated, and unique_tax_entity_per_plugin.
+#
+# Prints a matrix, per-country tallies, a detail section for every row that didn't
+# compare cleanly, then a summary. Writes
+# account-config-le-audit-<namespace>-<YYYY-MM-DD>.md and offers the same table as .csv.
+# Exit: 0 clean, 1 a CONFLICT / LE MISSING / failed internal check, 2 the call was wrong.
+#
+# Production baseline (2026-09-07), useful as a regression test — 443 rows: 312 COMPARED,
+# 130 UNLINKED (0 of them enabled), 1 FRESHA ENTITY, 0 LE MISSING. Tax number: 294 MATCH,
+# 5 PREFIX, 12 CONFLICT (9 CONFIG MALFORMED, 3 BOTH VALID — all SA), 1 CONFIG ONLY.
+# Registration number: 0 conflicts. Internal checks all pass. Exit 1.
+#
+# WATCH OUT: the legal-entity field query must keep `WHERE le.id IN (...)` inside BOTH
+# arms of its UNION. Hoisted to an outer filter, jsonb_array_elements unnests 246k+
+# sole-proprietorship rows and the statement times out.
+```
 
 **invopop_supplier_check** — list + diagnose Invopop supplier silo entries.
 ```sh
