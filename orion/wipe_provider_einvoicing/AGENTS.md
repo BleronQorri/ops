@@ -5,7 +5,6 @@ env: staging
 access: write
 tier: staging
 lang: js
-aliases: [cpe]
 examples:
   - args: 646845
     note: preview the counts, type the id back, then yes

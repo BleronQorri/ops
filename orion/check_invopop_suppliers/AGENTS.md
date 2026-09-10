@@ -5,7 +5,6 @@ env: production
 access: read-only
 tier: read-only
 lang: exs
-aliases: [isc]
 help_flag: false
 examples:
   - args: ""

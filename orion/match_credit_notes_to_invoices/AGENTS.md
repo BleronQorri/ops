@@ -6,7 +6,6 @@ access: write
 tier: read-only
 lang: js
 also: [decode_payloads.js]
-aliases: [b2b]
 examples:
   - args: ""
     note: "interactive: asks for the mode, the namespace, then the ids"

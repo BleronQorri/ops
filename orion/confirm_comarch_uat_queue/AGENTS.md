@@ -5,7 +5,6 @@ env: staging
 access: write
 tier: staging
 lang: js
-aliases: [csu]
 help_flag: false
 examples:
   - args: ""

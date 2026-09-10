@@ -8,7 +8,6 @@ status: retired
 retired_on: 2026-09-10
 retired_reason: "The bug bash it was written for ran on 2026-09-04 with all ten cases green; RENEWAL_EMAIL_GAP.md stays as the open question (team-orion#575)"
 lang: js
-aliases: [iclb]
 examples:
   - args: ""
     note: asks for everything

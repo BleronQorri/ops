@@ -8,7 +8,6 @@ status: retired
 retired_on: 2026-09-10
 retired_reason: "Written to survey tax-identity drift during the Billing Profiles rollout; that migration is complete (team-orion #282 and #296) and the survey has served its purpose"
 lang: js
-aliases: [acla]
 examples:
   - args: "--yes"
     note: every row, no terminal needed; writes the Markdown report

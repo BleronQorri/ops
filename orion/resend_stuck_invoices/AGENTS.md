@@ -5,7 +5,6 @@ env: production
 access: write
 tier: prod-write
 lang: js
-aliases: [ri]
 examples:
   - args: 123,456
     note: tracker ids, comma-separated

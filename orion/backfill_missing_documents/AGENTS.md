@@ -5,7 +5,6 @@ env: production
 access: write
 tier: prod-write
 lang: exs
-aliases: [pms]
 examples:
   - args: ""
     note: prompts for provider_id and sale ids

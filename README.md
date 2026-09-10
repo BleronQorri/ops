@@ -9,6 +9,8 @@ history) and keeps their catalogue generated.
 ops <command> [<subcommand>] [flags]
 
 ops run <name> [args...]                  run a script; the run gets an id, a status and a log
+                                          (names are the whole surface — no per-script aliases;
+                                           `ops alias set ri 'run resend_stuck_invoices'` if you want one)
 ops task ls                               past runs, newest first (--script --status --param --since)
 ops task get  <id>                        one run's record, with the tail of its log
 ops task logs <id>                        everything that run printed
@@ -85,7 +87,7 @@ The one line on stderr before a run is the script's environment, access and tier
 
 | Shown by `ops` | Source of truth |
 |---|---|
-| summary, env, access, tier, status (incl. `retired`), aliases, examples, report globs | frontmatter at the top of the script's `AGENTS.md` |
+| summary, env, access, tier, status (incl. `retired`), examples, report globs | frontmatter at the top of the script's `AGENTS.md` |
 | DESCRIPTION | the `What it does` / `Pipeline` / `Safety` / `Prereqs` / `Output` sections of that `AGENTS.md` |
 | SCRIPT HELP (flags) | the script's own `--help`, run live for Node scripts |
 | `orion/AGENTS.md` tables, `orion/.gitignore` report globs | generated between `ops:begin` / `ops:end` markers by `ops orion docs sync` |

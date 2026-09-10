@@ -5,7 +5,6 @@ env: production
 access: write
 tier: read-only
 lang: js
-aliases: [fip]
 examples:
   - args: ""
     note: fully interactive

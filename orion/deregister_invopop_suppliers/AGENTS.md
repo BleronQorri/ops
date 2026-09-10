@@ -5,7 +5,6 @@ env: staging
 access: write
 tier: staging
 lang: exs
-aliases: [ds]
 examples:
   - args: "--dry-run"
     note: walk the whole flow, POST nothing

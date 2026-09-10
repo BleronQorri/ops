@@ -22,7 +22,7 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:production/read-only -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [check_invopop_suppliers](check_invopop_suppliers/) | read-only | `ops run check_invopop_suppliers` · `ops run isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
+| [check_invopop_suppliers](check_invopop_suppliers/) | read-only | `ops run check_invopop_suppliers` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
 <!-- ops:end catalogue:production/read-only -->
 
 ## production · write
@@ -30,12 +30,12 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:production/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [backfill_missing_documents](backfill_missing_documents/) | prod-write | `ops run backfill_missing_documents` · `ops run pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
+| [backfill_missing_documents](backfill_missing_documents/) | prod-write | `ops run backfill_missing_documents` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
 | [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
 | [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes |
-| [match_credit_notes_to_invoices](match_credit_notes_to_invoices/) | read-only | `ops run match_credit_notes_to_invoices` · `ops run b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
-| [patch_invoice_payloads](patch_invoice_payloads/) | read-only | `ops run patch_invoice_payloads` · `ops run fip` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
-| [resend_stuck_invoices](resend_stuck_invoices/) | prod-write | `ops run resend_stuck_invoices` · `ops run ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
+| [match_credit_notes_to_invoices](match_credit_notes_to_invoices/) | read-only | `ops run match_credit_notes_to_invoices` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
+| [patch_invoice_payloads](patch_invoice_payloads/) | read-only | `ops run patch_invoice_payloads` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
+| [resend_stuck_invoices](resend_stuck_invoices/) | prod-write | `ops run resend_stuck_invoices` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
 <!-- ops:end catalogue:production/write -->
 
 ## staging · write
@@ -43,9 +43,9 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:staging/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [confirm_comarch_uat_queue](confirm_comarch_uat_queue/) | staging | `ops run confirm_comarch_uat_queue` · `ops run csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
-| [deregister_invopop_suppliers](deregister_invopop_suppliers/) | staging | `ops run deregister_invopop_suppliers` · `ops run ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
-| [wipe_provider_einvoicing](wipe_provider_einvoicing/) | staging | `ops run wipe_provider_einvoicing` · `ops run cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
+| [confirm_comarch_uat_queue](confirm_comarch_uat_queue/) | staging | `ops run confirm_comarch_uat_queue` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
+| [deregister_invopop_suppliers](deregister_invopop_suppliers/) | staging | `ops run deregister_invopop_suppliers` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [wipe_provider_einvoicing](wipe_provider_einvoicing/) | staging | `ops run wipe_provider_einvoicing` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
 <!-- ops:end catalogue:staging/write -->
 
 ## Danger tiers
@@ -131,5 +131,5 @@ One paragraph on what it answers or changes and why it exists.
 ```
 
 The script's own `--help` owns its flags — do not repeat them in the document.
-The frontmatter owns the summary, env, access, tier, aliases and examples. No
+The frontmatter owns the summary, env, access, tier and examples. No
 `## Run it` section and no `**Env:**` line: `ops orion docs check` warns on both.

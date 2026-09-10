@@ -8,7 +8,6 @@ status: retired
 retired_on: 2026-09-10
 retired_reason: "The Billing Profiles migration it predates is complete (team-orion #282 and #296, 35/35 tickets), so its checks and task suggestions target a schema that no longer describes onboarding"
 lang: exs
-aliases: [ols]
 help_flag: false
 examples:
   - args: 646845

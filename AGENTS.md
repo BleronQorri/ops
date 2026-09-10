@@ -34,6 +34,9 @@ frozen — every update happens here.
 - **Help pages follow gh.** Read `docs/help-text-style.md` before writing a
   `summary()`, `description()` or example. Attach USAGE / EXAMPLES / LEARN MORE
   through `gh(cmd, {...})` from `lib/program.js`, never with raw `addHelpText`.
+- **Scripts have no aliases.** The name is the whole surface, which is why it has to
+  be a good one. A personal shortcut is `ops alias set ri 'run resend_stuck_invoices'`,
+  which lives in the user's config, not in the repo.
 - **A script is named for what it does**: verb first, then the object, snake_case,
   and name the external system when more than one exists (Invopop, Comarch). Avoid
   `check`/`fix` where a specific verb exists (audit, patch, resend, wipe, backfill,

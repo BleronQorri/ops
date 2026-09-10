@@ -8,7 +8,6 @@ status: retired
 retired_on: 2026-09-10
 retired_reason: "It drove the Billing Profiles migration, which is complete including the plugin backfills (team-orion #300 and #463); nothing is left to migrate or link"
 lang: js
-aliases: [ple]
 examples:
   - args: ""
     note: "interactive; guided mode walks the whole procedure"
