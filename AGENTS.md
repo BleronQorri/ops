@@ -27,6 +27,11 @@ frozen — every update happens here.
 - **Help pages follow gh.** Read `docs/help-text-style.md` before writing a
   `summary()`, `description()` or example. Attach USAGE / EXAMPLES / LEARN MORE
   through `gh(cmd, {...})` from `lib/program.js`, never with raw `addHelpText`.
+- **Retiring a script is a frontmatter change, never a delete.** `status: retired`
+  plus a one-line `retired_reason` (quote it if it cites a #ticket). It then leaves
+  the catalogue and the generated tables, gains a row in the Retired table, and
+  `ops run` refuses it; the file stays runnable on its own. Do not delete the
+  directory — its AGENTS.md is the record of what was done.
 - **Frontmatter is the source of truth** for the scripts catalogue; the root
   tables in the scripts repo are generated. If a field is added to the schema,
   update `KNOWN_KEYS` + `validateScript` in `lib/orion/catalogue.js`, the
@@ -47,7 +52,7 @@ command; `.enablePositionalOptions()` on every ancestor of a command that uses
 ```
 ops · ops --help · ops orion · ops run --help · ops help nope (exit 2)
 ops orion script list · NO_COLOR=1 ops orion script list | cat -v · ops orion script list | cut -f1
-ops orion script list --json | jq -r '.[].name' · ops orion script list -t bogus (exit 2)
+ops orion script list --json | jq -r '.[].name'  ·  --status retired  ·  --include-retired · ops orion script list -t bogus (exit 2)
 ops orion script view retry_invoices · --raw · --path · | cat
 ops orion script view process_missing_sales      (no live --help for Elixir, pointer shown)
 ops orion script view fix_credit_note_references (status BLOCKED, blocked_on shown)

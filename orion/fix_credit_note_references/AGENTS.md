@@ -4,8 +4,7 @@ summary: "Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 reje
 env: production
 access: write
 tier: prod-write
-status: blocked
-blocked_on: "app-accounting-documents change — B2BCreditNoteXMLBuilder lacks maybe_build_reference/1, so patching payload_base64 alone does nothing"
+status: runbook
 related: [b2b_credit_notes, edit_document_payload]
 ---
 # fix_credit_note_references

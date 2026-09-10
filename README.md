@@ -16,6 +16,7 @@ ops task rerun <id>                       same script, same arguments, new id
 ops task cancel <id>                      stop one that is still going
 
 ops orion script list                     catalogue: env · access · tier · status · summary
+ops orion script list --status retired    the decommissioned ones, hidden by default
 ops orion script view <name>              doc page + the script's live --help + examples
 ops orion script pick                     interactive picker (TTY only)
 ops orion script new  <name> --lang {js|exs} --env … --access …
@@ -84,7 +85,7 @@ The one line on stderr before a run is the script's environment, access and tier
 
 | Shown by `ops` | Source of truth |
 |---|---|
-| summary, env, access, tier, status, aliases, examples, report globs | frontmatter at the top of the script's `AGENTS.md` |
+| summary, env, access, tier, status (incl. `retired`), aliases, examples, report globs | frontmatter at the top of the script's `AGENTS.md` |
 | DESCRIPTION | the `What it does` / `Pipeline` / `Safety` / `Prereqs` / `Output` sections of that `AGENTS.md` |
 | SCRIPT HELP (flags) | the script's own `--help`, run live for Node scripts |
 | `orion/AGENTS.md` tables, `orion/.gitignore` report globs | generated between `ops:begin` / `ops:end` markers by `ops orion docs sync` |

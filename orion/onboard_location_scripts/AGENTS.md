@@ -1,10 +1,12 @@
 ---
 name: onboard_location_scripts
-summary: "Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run"
+summary: "Pre Billing Profiles onboarding check across shedul + accounting-documents; printed the Houston tasks to run"
 env: production
 access: read-only
 tier: read-only
-status: deprecated
+status: retired
+retired_on: 2026-09-10
+retired_reason: "The Billing Profiles migration it predates is complete (team-orion #282 and #296, 35/35 tickets), so its checks and task suggestions target a schema that no longer describes onboarding"
 lang: exs
 aliases: [ols]
 help_flag: false

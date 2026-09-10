@@ -24,7 +24,6 @@ Edit the frontmatter, not the tables.
 |--------|------|-----|--------------|
 | [account_config_legal_entity_audit](account_config_legal_entity_audit/) | read-only | `ops run account_config_legal_entity_audit` · `ops run acla` | Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field |
 | [invopop_supplier_check](invopop_supplier_check/) | read-only | `ops run invopop_supplier_check` · `ops run isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
-| [onboard_location_scripts](onboard_location_scripts/) ⚠️ **DEPRECATED** | read-only | `ops run onboard_location_scripts` · `ops run ols` | Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run |
 <!-- ops:end catalogue:production/read-only -->
 
 ## production · write
@@ -34,10 +33,8 @@ Edit the frontmatter, not the tables.
 |--------|------|-----|--------------|
 | [b2b_credit_notes](b2b_credit_notes/) | read-only | `ops run b2b_credit_notes` · `ops run b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
 | [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
-| [fix_credit_note_references](fix_credit_note_references/) ⛔ **BLOCKED** | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes **Blocked on:** app-accounting-documents change — B2BCreditNoteXMLBuilder lacks maybe_build_reference/1, so patching payload_base64 alone does nothing |
+| [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes |
 | [fix_invoice_payloads](fix_invoice_payloads/) | read-only | `ops run fix_invoice_payloads` · `ops run fip` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
-| [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | prod-write-irreversible | `ops run it_credential_lifecycle_bugbash` · `ops run iclb` | Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB |
-| [plugin_legal_entity_updates](plugin_legal_entity_updates/) | prod-write-no-dry-run | `ops run plugin_legal_entity_updates` · `ops run ple` | Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight |
 | [process_missing_sales](process_missing_sales/) | prod-write | `ops run process_missing_sales` · `ops run pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
 | [retry_invoices](retry_invoices/) | prod-write | `ops run retry_invoices` · `ops run ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
 <!-- ops:end catalogue:production/write -->
@@ -55,14 +52,26 @@ Edit the frontmatter, not the tables.
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `account_config_legal_entity_audit`, `b2b_credit_notes`, `fix_invoice_payloads`, `invopop_supplier_check`, `onboard_location_scripts`.
-- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `process_missing_sales`, `retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (blocked).
-- **Prod writes, partner-visible, one step irreversible** (`prod-write-irreversible`) — at least one step cannot be undone: `it_credential_lifecycle_bugbash`.
-- **Prod writes with NO dry run** (`prod-write-no-dry-run`) — the underlying task writes on the first call: `plugin_legal_entity_updates`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `account_config_legal_entity_audit`, `b2b_credit_notes`, `fix_invoice_payloads`, `invopop_supplier_check`.
+- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `process_missing_sales`, `retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
 - **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `clear_provider_einvoicing`, `confirm_sent_uat`, `deregister_suppliers`.
 
 Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the worst thing the script can do in any mode. `ops help tiers` has the long form.
 <!-- ops:end tiers -->
+
+## Retired
+
+<!-- ops:begin retired -->
+| Script | Retired | Why |
+|--------|---------|-----|
+| [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | 2026-09-10 | The bug bash it was written for ran on 2026-09-04 with all ten cases green; RENEWAL_EMAIL_GAP.md stays as the open question (team-orion#575) |
+| [onboard_location_scripts](onboard_location_scripts/) | 2026-09-10 | The Billing Profiles migration it predates is complete (team-orion #282 and #296, 35/35 tickets), so its checks and task suggestions target a schema that no longer describes onboarding |
+| [plugin_legal_entity_updates](plugin_legal_entity_updates/) | 2026-09-10 | It drove the Billing Profiles migration, which is complete including the plugin backfills (team-orion #300 and #463); nothing is left to migrate or link |
+
+These are decommissioned. They are hidden from `ops orion script list` (use
+`--status retired`) and `ops run` refuses them; the files still run directly if you
+ever need them.
+<!-- ops:end retired -->
 
 ## Prereqs (most scripts)
 
