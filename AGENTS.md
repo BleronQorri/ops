@@ -14,6 +14,13 @@ frozen — every update happens here.
   the one thing allowed to bend: a pty via `script(1)` when stdin and stdout are
   both terminals, pipes when stdout is already piped, and nothing at all when the
   two disagree or no pty can be had — capture gives way, the run never does.
+- **Production and staging are shown apart.** `ops orion script list` on a terminal
+  prints a table per environment, read-only before write; a pipe still gets one flat
+  TSV with the ENV column so nothing downstream breaks. The picker groups the same
+  way, with headings the cursor skips.
+- **Truncate with `ui.clip`, never `slice`.** A rendered line changes colour several
+  times, and slicing the plain text throws every escape away. `ui.clip` walks the
+  string, copies escapes and counts only visible columns.
 - **Colour comes from one place.** `TIERS[tier].color` in `lib/orion/catalogue.js`
   names a palette key in `lib/ui.js`; render it with `cat.paintTier(text, tier,
   palette)`, passing `ui.c` for stdout or `ui.cerr` for stderr. Production writes are
@@ -51,9 +58,9 @@ command; `.enablePositionalOptions()` on every ancestor of a command that uses
 
 ```
 ops · ops --help · ops orion · ops run --help · ops help nope (exit 2)
-ops orion script list · NO_COLOR=1 ops orion script list | cat -v · ops orion script list | cut -f1
+ops orion script list (two sections on a tty) · --flat · NO_COLOR=1 … | cat -v · … | cut -f1 (flat, ENV kept)
 ops orion script list --json | jq -r '.[].name'  ·  --status retired  ·  --include-retired · ops orion script list -t bogus (exit 2)
-ops orion script view retry_invoices · --raw · --path · | cat
+ops orion script view retry_invoices · --raw · --path · | cat  (md tables render as box tables, blockquotes as a bar)
 ops orion script view process_missing_sales      (no live --help for Elixir, pointer shown)
 ops orion script view fix_credit_note_references (status BLOCKED, blocked_on shown)
 cd /tmp && ops task run retry_invoices --dry-run 1   (banner + trailer on stderr, report in /tmp, exit code == direct run)

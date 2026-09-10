@@ -15,7 +15,7 @@ ops task logs <id>                        everything that run printed
 ops task rerun <id>                       same script, same arguments, new id
 ops task cancel <id>                      stop one that is still going
 
-ops orion script list                     catalogue: env · access · tier · status · summary
+ops orion script list                     catalogue, a table per environment (--flat for one)
 ops orion script list --status retired    the decommissioned ones, hidden by default
 ops orion script view <name>              doc page + the script's live --help + examples
 ops orion script pick                     interactive picker (TTY only)
