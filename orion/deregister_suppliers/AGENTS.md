@@ -13,7 +13,6 @@ examples:
     note: "real run: type the workspace slug, pick the workflow, final yes"
   - args: "--latest-only --wait 30"
     note: one job per supplier, block up to 30 s each
-env_vars: [INVOPOP_SANDBOX_API_TOKEN, INVOPOP_SANDBOX_API_BASE_URL, INVOPOP_DEREGISTER_WORKFLOW_ES_VERIFACTU, INVOPOP_DEREGISTER_WORKFLOW_ES_TICKETBAI, INVOPOP_DEREGISTER_WORKFLOW_IT_SMARTRECEIPTS]
 ---
 # deregister_suppliers
 

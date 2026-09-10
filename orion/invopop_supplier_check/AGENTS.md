@@ -16,7 +16,6 @@ examples:
     note: also write a Markdown report and a CSV
   - args: "--debug"
     note: verbose
-env_vars: [INVOPOP_API_TOKEN, INVOPOP_API_BASE_URL]
 reports: ["invopop_report_*.md", "invopop_entries_*.csv"]
 ---
 # invopop_supplier_check

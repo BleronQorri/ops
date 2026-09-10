@@ -48,9 +48,9 @@ cd /tmp && ops orion script run retry_invoices --dry-run 1   (banner on stderr, 
 ops orion script run ri --help  vs  ops orion script run --help
 ops orion script run edit_document_payload (exit 2, points to view)
 ops orion script run b2b_credit_notes/decode_payloads --help
-ops orion doctor · --json · --fix on a scratch copy without .env
+ops orion doctor · --json
 ops orion docs check · edit a summary → check fails → docs sync → git diff shows only marker regions
-ops orion script new staging/write/zz_probe --lang js  (on a scratch copy) → docs check green → run zz_probe --help
+ops orion script new zz_probe --lang js --env staging --access write  (on a scratch copy) → docs check green → run zz_probe --help
 ops alias set osr 'orion script run' && ops osr ri --help
 ops completion zsh > /tmp/_ops && zsh -n /tmp/_ops
 ops orion script pick (TTY) · ops orion script pick | cat (exit 2)

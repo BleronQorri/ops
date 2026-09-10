@@ -10,7 +10,6 @@ help_flag: false
 examples:
   - args: ""
     note: prompts for the queue type and, unless COMARCH_UAT_JWT is set, the JWT
-env_vars: [COMARCH_UAT_JWT]
 ---
 # confirm_sent_uat
 

@@ -1,69 +1,61 @@
 # orion/ — operational scripts
 
 Ad-hoc operational scripts for Orion (accounting-documents / e-invoicing and
-friends), living in the `ops` repo. This directory was the `einvoicing-scripts`
-repo until 2026-09-10; that repo is frozen and every update happens here. Scripts are grouped first by the environment they act on, then by
-whether they only read or also write:
-
-- **[production/](production/)** — touch real production data.
-  - **[read-only/](production/read-only/)** — never mutate.
-  - **[write/](production/write/)** — mutate prod (gated).
-- **[staging/](staging/)** — non-prod: Invopop sandbox + Comarch UAT + staging DB (all write).
-
-Each script is a single executable file (`.exs` or `.js`) in its own directory
-alongside an `AGENTS.md` explaining it. Run the file directly — there are no
-wrappers. The `ops` CLI (`../bin/ops`) is a launcher and a reader over this
-directory, nothing more: it never changes a script's arguments,
-prompts or gates.
+friends). One directory per script, named after its single executable entrypoint
+(`.exs` or `.js`), with an `AGENTS.md` beside it whose frontmatter declares the
+environment it acts on (`production` / `staging`), whether it only reads or also
+writes, and its danger tier. Run the file directly — there are no wrappers. The
+`ops` CLI (`../bin/ops`) is a launcher and a reader over this directory, nothing
+more: it never changes a script's arguments, prompts or gates.
 
 **How to recall a script:** `ops orion script list`, then
 `ops orion script view <name>` (its doc page, live `--help` and examples), then
 `ops orion script run <name> …`. Without `ops`: skim the tables below, then run
-`./<script> --help` or read the script's own `AGENTS.md`.
+`./<name>/<name>.js --help` or read the script's own `AGENTS.md`.
 
 The tables and the tier list below are **generated** from each script's
-`AGENTS.md` frontmatter by `ops orion docs sync` and checked by
-`ops orion docs check`. Edit the frontmatter, not the tables.
+frontmatter by `ops orion docs sync` and checked by `ops orion docs check`.
+Edit the frontmatter, not the tables.
 
-## production/read-only/
+## production · read-only
 
 <!-- ops:begin catalogue:production/read-only -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [account_config_legal_entity_audit](production/read-only/account_config_legal_entity_audit/) | read-only | `ops orion script run account_config_legal_entity_audit` · `acla` | Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field |
-| [invopop_supplier_check](production/read-only/invopop_supplier_check/) | read-only | `ops orion script run invopop_supplier_check` · `isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
-| [onboard_location_scripts](production/read-only/onboard_location_scripts/) ⚠️ **DEPRECATED** | read-only | `ops orion script run onboard_location_scripts` · `ols` | Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run |
+| [account_config_legal_entity_audit](account_config_legal_entity_audit/) | read-only | `ops orion script run account_config_legal_entity_audit` · `acla` | Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field |
+| [invopop_supplier_check](invopop_supplier_check/) | read-only | `ops orion script run invopop_supplier_check` · `isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
+| [onboard_location_scripts](onboard_location_scripts/) ⚠️ **DEPRECATED** | read-only | `ops orion script run onboard_location_scripts` · `ols` | Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run |
 <!-- ops:end catalogue:production/read-only -->
 
-## production/write/
+## production · write
 
 <!-- ops:begin catalogue:production/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [b2b_credit_notes](production/write/b2b_credit_notes/) | read-only | `ops orion script run b2b_credit_notes` · `b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 on a pod |
-| [edit_document_payload](production/write/edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 on a pod and re-drive the send |
-| [fix_credit_note_references](production/write/fix_credit_note_references/) ⛔ **BLOCKED** | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes **Blocked on:** app-accounting-documents change — B2BCreditNoteXMLBuilder lacks maybe_build_reference/1, so patching payload_base64 alone does nothing |
-| [fix_invoice_payloads](production/write/fix_invoice_payloads/) | read-only | `ops orion script run fix_invoice_payloads` · `fip` | Decode an invoice's payload_base64 on a pod, patch it with an Elixir expression, emit the remediation runbook |
-| [it_credential_lifecycle_bugbash](production/write/it_credential_lifecycle_bugbash/) | prod-write-irreversible | `ops orion script run it_credential_lifecycle_bugbash` · `iclb` | Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB |
-| [plugin_legal_entity_updates](production/write/plugin_legal_entity_updates/) | prod-write-no-dry-run | `ops orion script run plugin_legal_entity_updates` · `ple` | Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight |
-| [process_missing_sales](production/write/process_missing_sales/) | prod-write | `ops orion script run process_missing_sales` · `pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
-| [retry_invoices](production/write/retry_invoices/) | prod-write | `ops orion script run retry_invoices` · `ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
+| [b2b_credit_notes](b2b_credit_notes/) | read-only | `ops orion script run b2b_credit_notes` · `b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 on a pod |
+| [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 on a pod and re-drive the send |
+| [fix_credit_note_references](fix_credit_note_references/) ⛔ **BLOCKED** | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes **Blocked on:** app-accounting-documents change — B2BCreditNoteXMLBuilder lacks maybe_build_reference/1, so patching payload_base64 alone does nothing |
+| [fix_invoice_payloads](fix_invoice_payloads/) | read-only | `ops orion script run fix_invoice_payloads` · `fip` | Decode an invoice's payload_base64 on a pod, patch it with an Elixir expression, emit the remediation runbook |
+| [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | prod-write-irreversible | `ops orion script run it_credential_lifecycle_bugbash` · `iclb` | Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB |
+| [plugin_legal_entity_updates](plugin_legal_entity_updates/) | prod-write-no-dry-run | `ops orion script run plugin_legal_entity_updates` · `ple` | Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight |
+| [process_missing_sales](process_missing_sales/) | prod-write | `ops orion script run process_missing_sales` · `pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
+| [retry_invoices](retry_invoices/) | prod-write | `ops orion script run retry_invoices` · `ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
 <!-- ops:end catalogue:production/write -->
 
-## staging/write/
+## staging · write
 
 <!-- ops:begin catalogue:staging/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [clear_provider_einvoicing](staging/write/clear_provider_einvoicing/) | staging-destructive | `ops orion script run clear_provider_einvoicing` · `cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
-| [confirm_sent_uat](staging/write/confirm_sent_uat/) | sandbox | `ops orion script run confirm_sent_uat` · `csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
-| [deregister_suppliers](staging/write/deregister_suppliers/) | sandbox | `ops orion script run deregister_suppliers` · `ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [clear_provider_einvoicing](clear_provider_einvoicing/) | staging-destructive | `ops orion script run clear_provider_einvoicing` · `cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
+| [confirm_sent_uat](confirm_sent_uat/) | sandbox | `ops orion script run confirm_sent_uat` · `csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
+| [deregister_suppliers](deregister_suppliers/) | sandbox | `ops orion script run deregister_suppliers` · `ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
 <!-- ops:end catalogue:staging/write -->
 
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `account_config_legal_entity_audit`, `invopop_supplier_check`, `onboard_location_scripts`, `b2b_credit_notes`, `fix_invoice_payloads`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `account_config_legal_entity_audit`, `b2b_credit_notes`, `fix_invoice_payloads`, `invopop_supplier_check`, `onboard_location_scripts`.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `process_missing_sales`, `retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (blocked).
 - **Prod writes, partner-visible, one step irreversible** (`prod-write-irreversible`) — at least one step cannot be undone: `it_credential_lifecycle_bugbash`.
 - **Prod writes with NO dry run** (`prod-write-no-dry-run`) — the underlying task writes on the first call: `plugin_legal_entity_updates`.
@@ -81,28 +73,28 @@ Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the wors
 - Elixir/Erlang are pinned via `.tool-versions` (asdf); Node ≥ 20 on PATH.
   Elixir scripts that need deps auto-install them via `Mix.install` (e.g. `Req`);
   `process_missing_sales` and the Node scripts are dependency-free.
-- Secrets live in `orion/.env` (see `.env.example` here); `ops orion doctor --fix`
-  scaffolds it and reports what is still blank.
+- Tokens (`INVOPOP_API_TOKEN`, `INVOPOP_SANDBOX_API_TOKEN`, `COMARCH_UAT_JWT`) come
+  from your shell environment; the scripts prompt when one is unset.
+- `ops orion doctor` checks the runtimes and the catalogue.
 
 ## Adding a new script
 
-`ops orion script new <env>/<access>/<name> --lang {js|exs}` scaffolds the
-directory: an executable entrypoint with a shebang, `--help`, a single readline
-interface and a dry-run default, plus an `AGENTS.md` whose frontmatter already
-passes `ops orion docs check`. Then edit both and run `ops orion docs sync` to
-add the row above.
+`ops orion script new <name> --lang {js|exs} --env {production|staging} --access {read-only|write}`
+scaffolds the directory: an executable entrypoint with a shebang, `--help`, a
+single readline interface and a dry-run default, plus an `AGENTS.md` whose
+frontmatter already passes `ops orion docs check`. Then edit both and run
+`ops orion docs sync` to add the row above.
 
-By hand: pick the env (`production/` or `staging/`) then the access group
-(`read-only/` or `write/`), one directory per script, a single executable
-entrypoint (`.exs` with `#!/usr/bin/env elixir`, or `.js` with
-`#!/usr/bin/env node`), and a directory `AGENTS.md` shaped like this:
+By hand: one directory per script, a single executable entrypoint (`.exs` with
+`#!/usr/bin/env elixir`, or `.js` with `#!/usr/bin/env node`) named after the
+directory, and an `AGENTS.md` shaped like this:
 
 ```markdown
 ---
 name: <dir name>                 # must equal the directory
 summary: <one line, ≤ 110 chars, imperative, no trailing period>
-env: production | staging        # must match the path
-access: read-only | write        # must match the path
+env: production | staging
+access: read-only | write
 tier: read-only | prod-write | prod-write-irreversible | prod-write-no-dry-run | sandbox | staging-destructive
 status: active | deprecated | runbook | blocked   # default active; runbook/blocked = no script
 lang: js | exs                   # active/deprecated only
@@ -112,7 +104,6 @@ help_flag: false                 # only if the script has no --help
 examples:                        # ≥ 1 for an active script; args as typed after the script
   - args: "--dry-run 123"
     note: plan only
-env_vars: [SOME_TOKEN]           # keys from .env.example the script reads
 reports: [name-*.md]             # globs it writes to the cwd (feeds .gitignore)
 related: [other_script]
 blocked_on: <one line>           # status blocked only
@@ -128,5 +119,5 @@ One paragraph on what it answers or changes and why it exists.
 ```
 
 The script's own `--help` owns its flags — do not repeat them in the document.
-The frontmatter owns the summary, tier, aliases and examples. No `## Run it`
-section and no `**Env:**` line: `ops orion docs check` warns on both.
+The frontmatter owns the summary, env, access, tier, aliases and examples. No
+`## Run it` section and no `**Env:**` line: `ops orion docs check` warns on both.

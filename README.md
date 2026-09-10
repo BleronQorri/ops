@@ -12,8 +12,8 @@ ops orion script list                     catalogue: env · access · tier · st
 ops orion script view <name>              doc page + the script's live --help + examples
 ops orion script run  <name> [args...]    runs the file exactly as if you typed its path
 ops orion script pick                     interactive picker (TTY only)
-ops orion script new  <env>/<access>/<name> --lang {js|exs}
-ops orion doctor [--fix]                  runtimes, .env secrets, houston, catalogue
+ops orion script new  <name> --lang {js|exs} --env … --access …
+ops orion doctor                          runtimes, houston, catalogue
 ops orion docs check | sync               lint the catalogue / regenerate the root tables
 ops alias set osr 'orion script run'      shortcuts, gh-style
 ops help tiers | environment | exit-codes | conventions
@@ -25,7 +25,7 @@ ops help tiers | environment | exit-codes | conventions
 git clone <this repo> ~/Desktop/repos/ops
 cd ~/Desktop/repos/ops && npm ci
 echo 'export PATH="$HOME/Desktop/repos/ops/bin:$PATH"' >> ~/.zshrc && exec zsh
-ops orion doctor --fix
+ops orion doctor
 ```
 
 Node ≥ 20. The only dependency is [commander](https://github.com/tj/commander.js).
@@ -66,15 +66,15 @@ The one line on stderr before a run is the script's environment, access and tier
 
 | Shown by `ops` | Source of truth |
 |---|---|
-| summary, tier, status, aliases, examples, env vars, report globs | frontmatter at the top of the script's `AGENTS.md` |
+| summary, env, access, tier, status, aliases, examples, report globs | frontmatter at the top of the script's `AGENTS.md` |
 | DESCRIPTION | the `What it does` / `Pipeline` / `Safety` / `Prereqs` / `Output` sections of that `AGENTS.md` |
 | SCRIPT HELP (flags) | the script's own `--help`, run live for Node scripts |
-| `orion/AGENTS.md` tables, `orion/README.md` catalogue, `orion/.gitignore` report globs | generated between `ops:begin` / `ops:end` markers by `ops orion docs sync` |
+| `orion/AGENTS.md` tables, `orion/.gitignore` report globs | generated between `ops:begin` / `ops:end` markers by `ops orion docs sync` |
 
 ## Layout
 
 ```
-orion/                  the scripts: <env>/<access>/<name>/ with an AGENTS.md each, .env.example, .tool-versions
+orion/                  the scripts: one <name>/ per script with an AGENTS.md each; .tool-versions
 bin/ops                 entry: builds the commander program, expands aliases, maps errors to exit codes
 lib/program.js          root program, gh-style help formatter, help topics, config / alias / completion
 lib/ui.js               colour (NO_COLOR), TTY vs TSV tables, JSON, wrap, pager, error classes
