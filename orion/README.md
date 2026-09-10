@@ -1,24 +1,25 @@
-# einvoicing-scripts
+# orion scripts
 
-Ad-hoc operational scripts for Orion e-invoicing (`app-accounting-documents`).
-Each script is a single executable file — run it directly, no wrappers.
+Ad-hoc operational scripts for Orion e-invoicing (`app-accounting-documents`),
+living in the `ops` repo as `orion/` (moved from the `einvoicing-scripts` repo,
+which is frozen). Each script is a single executable file — run it directly, no wrappers.
 
 Grouped by the environment it acts on, then by whether it only reads or also writes.
 
 ## Setup
 
-Install the `ops` CLI (`~/Desktop/repos/ops`, a gh-style launcher and reader for
-this repo), then let it check the machine and scaffold `.env`:
+Install the `ops` CLI from the repo root (one level up), then let it check the
+machine and scaffold `.env`:
 
 ```sh
-(cd ~/Desktop/repos/ops && npm ci)   # the ops repo lives next to this one
+(cd ~/Desktop/repos/ops && npm ci)
 echo 'export PATH="$HOME/Desktop/repos/ops/bin:$PATH"' >> ~/.zshrc && exec zsh
 ops orion doctor --fix        # creates .env from .env.example, lists blank secrets, checks node/elixir/houston
 ```
 
 Then fill the secrets it flags in `.env`. (Manual equivalent: `cp .env.example .env`.)
 
-Secrets and config live in a repo-root `.env`, auto-loaded by the scripts that
+Secrets and config live in `orion/.env` (this directory), auto-loaded by the scripts that
 need it (anything in your shell env wins over `.env`). `.env` is gitignored —
 never commit it. See `.env.example` for every variable.
 
@@ -29,6 +30,7 @@ Generated from each script's `AGENTS.md` frontmatter by `ops orion docs sync`.
 <!-- ops:begin catalogue -->
 ### `production/read-only`
 
+- **account_config_legal_entity_audit** — Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field _(read-only)_
 - **invopop_supplier_check** — List Invopop supplier silo entries and flag the ones stuck in error or void states _(read-only)_
 - **onboard_location_scripts** ⚠️ _deprecated_ — Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run _(read-only)_
 

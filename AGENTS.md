@@ -1,7 +1,10 @@
 # ops — agent notes
 
-A gh-style personal CLI. Node ≥ 20, CommonJS, one dependency (commander). Entry
-`bin/ops`; code in `lib/`; one directory per command group under `lib/<group>/`.
+A gh-style personal CLI plus the operational scripts it runs. Node ≥ 20, CommonJS,
+one dependency (commander). Entry `bin/ops`; code in `lib/`; one directory per
+command group under `lib/<group>/`. The Orion scripts live in `orion/` (their own
+`AGENTS.md` has the script conventions); the old `einvoicing-scripts` repo is
+frozen — every update happens here.
 
 ## Rules
 
@@ -20,11 +23,10 @@ A gh-style personal CLI. Node ≥ 20, CommonJS, one dependency (commander). Entr
 - **Frontmatter is the source of truth** for the scripts catalogue; the root
   tables in the scripts repo are generated. If a field is added to the schema,
   update `KNOWN_KEYS` + `validateScript` in `lib/orion/catalogue.js`, the
-  template in `lib/orion/templates.js`, the schema block in the scripts repo's
+  template in `lib/orion/templates.js`, the schema block in orion/'s
   root `AGENTS.md`, and the topic text in `lib/program.js` if user-visible.
-- **No test suite.** Verify with the checklist below, by hand, against the real
-  scripts repo (`OPS_ORION_SCRIPTS=<path>` points at a scratch copy when a
-  change writes files).
+- **No test suite.** Verify with the checklist below, by hand, against `orion/`
+  (`OPS_ORION_SCRIPTS=<path>` points at a scratch copy when a change writes files).
 
 ## Adding a command group
 

@@ -1,7 +1,8 @@
-# scripts — operational toolbox
+# orion/ — operational scripts
 
 Ad-hoc operational scripts for Orion (accounting-documents / e-invoicing and
-friends). Scripts are grouped first by the environment they act on, then by
+friends), living in the `ops` repo. This directory was the `einvoicing-scripts`
+repo until 2026-09-10; that repo is frozen and every update happens here. Scripts are grouped first by the environment they act on, then by
 whether they only read or also write:
 
 - **[production/](production/)** — touch real production data.
@@ -11,8 +12,8 @@ whether they only read or also write:
 
 Each script is a single executable file (`.exs` or `.js`) in its own directory
 alongside an `AGENTS.md` explaining it. Run the file directly — there are no
-wrappers. The `ops` CLI (`~/Desktop/repos/ops`) is a launcher and a
-reader over this repo, nothing more: it never changes a script's arguments,
+wrappers. The `ops` CLI (`../bin/ops`) is a launcher and a reader over this
+directory, nothing more: it never changes a script's arguments,
 prompts or gates.
 
 **How to recall a script:** `ops orion script list`, then
@@ -29,6 +30,7 @@ The tables and the tier list below are **generated** from each script's
 <!-- ops:begin catalogue:production/read-only -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
+| [account_config_legal_entity_audit](production/read-only/account_config_legal_entity_audit/) | read-only | `ops orion script run account_config_legal_entity_audit` · `acla` | Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field |
 | [invopop_supplier_check](production/read-only/invopop_supplier_check/) | read-only | `ops orion script run invopop_supplier_check` · `isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
 | [onboard_location_scripts](production/read-only/onboard_location_scripts/) ⚠️ **DEPRECATED** | read-only | `ops orion script run onboard_location_scripts` · `ols` | Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run |
 <!-- ops:end catalogue:production/read-only -->
@@ -61,7 +63,7 @@ The tables and the tier list below are **generated** from each script's
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `invopop_supplier_check`, `onboard_location_scripts`, `b2b_credit_notes`, `fix_invoice_payloads`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `account_config_legal_entity_audit`, `invopop_supplier_check`, `onboard_location_scripts`, `b2b_credit_notes`, `fix_invoice_payloads`.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `process_missing_sales`, `retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (blocked).
 - **Prod writes, partner-visible, one step irreversible** (`prod-write-irreversible`) — at least one step cannot be undone: `it_credential_lifecycle_bugbash`.
 - **Prod writes with NO dry run** (`prod-write-no-dry-run`) — the underlying task writes on the first call: `plugin_legal_entity_updates`.
@@ -79,7 +81,7 @@ Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the wors
 - Elixir/Erlang are pinned via `.tool-versions` (asdf); Node ≥ 20 on PATH.
   Elixir scripts that need deps auto-install them via `Mix.install` (e.g. `Req`);
   `process_missing_sales` and the Node scripts are dependency-free.
-- Secrets live in the repo-root `.env` (see `.env.example`); `ops orion doctor --fix`
+- Secrets live in `orion/.env` (see `.env.example` here); `ops orion doctor --fix`
   scaffolds it and reports what is still blank.
 
 ## Adding a new script

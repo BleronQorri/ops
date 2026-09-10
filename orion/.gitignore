@@ -1,5 +1,7 @@
 # Generated reports / exports — from each script's AGENTS.md `reports:` (ops orion docs sync)
 # ops:begin reports
+account-config-le-audit-*.csv
+account-config-le-audit-*.md
 b2b-credit-notes-*.csv
 b2b-credit-notes-*.md
 decoded-payloads-*.csv

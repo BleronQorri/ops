@@ -1,8 +1,9 @@
 # ops
 
-Personal operations toolbox: a `gh`-style CLI whose command groups wrap the repos
-I operate. The first group, `orion`, browses, documents and runs the scripts in
-[`orion/scripts`](../orion/scripts) and keeps that repo's catalogue generated.
+Personal operations toolbox: a `gh`-style CLI plus the operational scripts it
+runs. The first group, `orion`, browses, documents and runs the scripts in
+[`orion/`](orion/) (formerly the `einvoicing-scripts` repo, moved here with its
+history) and keeps their catalogue generated.
 
 ```
 ops <group> <command> [<subcommand>] [flags]
@@ -29,12 +30,11 @@ ops orion doctor --fix
 
 Node ≥ 20. The only dependency is [commander](https://github.com/tj/commander.js).
 
-The Orion scripts repo is found through `OPS_ORION_SCRIPTS`, then
-`ops config get orion.scripts`, then a sibling checkout at `../orion/scripts`.
-Set it explicitly with:
+The scripts live in `orion/` in this repo and are found there by default. To point
+`ops` at another checkout use `OPS_ORION_SCRIPTS` or:
 
 ```sh
-ops config set orion.scripts ~/Desktop/repos/orion/scripts
+ops config set orion.scripts /path/to/another/orion
 ```
 
 Zsh completion (optional):
@@ -69,11 +69,12 @@ The one line on stderr before a run is the script's environment, access and tier
 | summary, tier, status, aliases, examples, env vars, report globs | frontmatter at the top of the script's `AGENTS.md` |
 | DESCRIPTION | the `What it does` / `Pipeline` / `Safety` / `Prereqs` / `Output` sections of that `AGENTS.md` |
 | SCRIPT HELP (flags) | the script's own `--help`, run live for Node scripts |
-| root `AGENTS.md` tables, `README.md` catalogue, `.gitignore` report globs in the scripts repo | generated between `ops:begin` / `ops:end` markers by `ops orion docs sync` |
+| `orion/AGENTS.md` tables, `orion/README.md` catalogue, `orion/.gitignore` report globs | generated between `ops:begin` / `ops:end` markers by `ops orion docs sync` |
 
 ## Layout
 
 ```
+orion/                  the scripts: <env>/<access>/<name>/ with an AGENTS.md each, .env.example, .tool-versions
 bin/ops                 entry: builds the commander program, expands aliases, maps errors to exit codes
 lib/program.js          root program, gh-style help formatter, help topics, config / alias / completion
 lib/ui.js               colour (NO_COLOR), TTY vs TSV tables, JSON, wrap, pager, error classes
