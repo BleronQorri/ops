@@ -1,0 +1,12 @@
+{
+  "name": "ops",
+  "version": "0.1.0",
+  "description": "Personal operations toolbox — a gh-style CLI over the Orion scripts",
+  "private": true,
+  "license": "UNLICENSED",
+  "bin": { "ops": "bin/ops" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "commander": "^15.0.0"
+  }
+}

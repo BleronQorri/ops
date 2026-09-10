@@ -1,0 +1,43 @@
+#!/usr/bin/env node
+"use strict";
+
+const { CommanderError } = require("commander");
+const { buildProgram, reservedWords, shortHelp } = require("../lib/program");
+const config = require("../lib/config");
+const ui = require("../lib/ui");
+
+async function main() {
+  const program = buildProgram();
+  require("../lib/orion").register(program);
+
+  const argv = config.expandAlias(process.argv.slice(2), reservedWords(program));
+  if (argv.length === 0) {
+    // Bare `ops`: short help, exit 0 (like `gh`).
+    process.stdout.write(shortHelp(program));
+    return 0;
+  }
+  try {
+    await program.parseAsync(argv, { from: "user" });
+    return typeof process.exitCode === "number" ? process.exitCode : 0;
+  } catch (err) {
+    if (err instanceof CommanderError) {
+      // --help / --version already printed by commander
+      if (err.code === "commander.helpDisplayed" || err.code === "commander.version" || err.code === "commander.help") return 0;
+      // commander already wrote the error line (and a suggestion) to stderr
+      return 2;
+    }
+    if (err instanceof ui.UsageError) {
+      ui.eprint(`${ui.cerr.bad("error:")} ${err.message}`);
+      if (err.hint) ui.eprint(err.hint);
+      return 2;
+    }
+    if (err instanceof ui.ProblemsError) {
+      if (err.message) ui.eprint(`${ui.cerr.bad("error:")} ${err.message}`);
+      return 1;
+    }
+    ui.eprint(`${ui.cerr.bad("error:")} ${err.stack || err.message}`);
+    return 1;
+  }
+}
+
+main().then((code) => process.exit(code));
