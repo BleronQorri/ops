@@ -34,6 +34,12 @@ frozen — every update happens here.
 - **Help pages follow gh.** Read `docs/help-text-style.md` before writing a
   `summary()`, `description()` or example. Attach USAGE / EXAMPLES / LEARN MORE
   through `gh(cmd, {...})` from `lib/program.js`, never with raw `addHelpText`.
+- **A script is named for what it does**: verb first, then the object, snake_case,
+  and name the external system when more than one exists (Invopop, Comarch). Avoid
+  `check`/`fix` where a specific verb exists (audit, patch, resend, wipe, backfill,
+  match). The directory, the entrypoint and `name:` always agree. Renaming means
+  `git mv` both, then a word-boundary rewrite of every mention — never inside a
+  longer identifier, since `process_missing_sales_events` is a Houston task name.
 - **Retiring a script is a frontmatter change, never a delete.** `status: retired`
   plus a one-line `retired_reason` (quote it if it cites a #ticket). It then leaves
   the catalogue and the generated tables, gains a row in the Retired table, and
@@ -60,13 +66,13 @@ command; `.enablePositionalOptions()` on every ancestor of a command that uses
 ops · ops --help · ops orion · ops run --help · ops help nope (exit 2)
 ops orion script list (two sections on a tty) · --flat · NO_COLOR=1 … | cat -v · … | cut -f1 (flat, ENV kept)
 ops orion script list --json | jq -r '.[].name'  ·  --status retired  ·  --include-retired · ops orion script list -t bogus (exit 2)
-ops orion script view retry_invoices · --raw · --path · | cat  (md tables render as box tables, blockquotes as a bar)
-ops orion script view process_missing_sales      (no live --help for Elixir, pointer shown)
+ops orion script view resend_stuck_invoices · --raw · --path · | cat  (md tables render as box tables, blockquotes as a bar)
+ops orion script view backfill_missing_documents      (no live --help for Elixir, pointer shown)
 ops orion script view fix_credit_note_references (status BLOCKED, blocked_on shown)
-cd /tmp && ops task run retry_invoices --dry-run 1   (banner + trailer on stderr, report in /tmp, exit code == direct run)
+cd /tmp && ops task run resend_stuck_invoices --dry-run 1   (banner + trailer on stderr, report in /tmp, exit code == direct run)
 ops task run ri --help  vs  ops task run --help
 ops task run edit_document_payload (exit 2, points to view)
-ops task run b2b_credit_notes/decode_payloads --help
+ops task run match_credit_notes_to_invoices/decode_payloads --help
 ops task run -p K=V <script>  (env var reaches the script; -p AFTER the name goes to the script + prints a note)
 ops task ls · --script · --status · --param K=V · --param K~V · --since 7d · -L · --json
 ops task get <id> [--json] · task logs <id> [--raw] · task rerun <id> · task cancel <id> (on a running one, and on a finished one -> exit 1)

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// clear_provider_einvoicing — wipe ALL of a provider's e-invoicing data in the
+// wipe_provider_einvoicing — wipe ALL of a provider's e-invoicing data in the
 // accounting-documents DB, on STAGING only.
 //
 // Scope: the e-invoicing domain rooted at `account_configurations` (keyed by
@@ -39,9 +39,9 @@
 //   * --dry-run prints the SQL and exits without writing.
 //
 // Usage:
-//   ./clear_provider_einvoicing.js 12345
-//   ./clear_provider_einvoicing.js --namespace eng-orion 12345
-//   ./clear_provider_einvoicing.js --dry-run 12345
+//   ./wipe_provider_einvoicing.js 12345
+//   ./wipe_provider_einvoicing.js --namespace eng-orion 12345
+//   ./wipe_provider_einvoicing.js --dry-run 12345
 
 const readline = require("readline/promises");
 const { stdin: input, stdout: output } = require("process");
@@ -81,10 +81,10 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  console.log(`clear_provider_einvoicing — wipe a provider's e-invoicing data (STAGING only)
+  console.log(`wipe_provider_einvoicing — wipe a provider's e-invoicing data (STAGING only)
 
 Usage:
-  ./clear_provider_einvoicing.js [flags] <PROVIDER_ID>
+  ./wipe_provider_einvoicing.js [flags] <PROVIDER_ID>
 
 Arguments:
   PROVIDER_ID            The integer provider_id to clear.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 //
-// b2b_credit_notes — which invoice does each B2B credit note belong to?
+// match_credit_notes_to_invoices — which invoice does each B2B credit note belong to?
 //
 // B2B (partner) billing documents live in two databases and are only loosely
 // coupled:
@@ -175,8 +175,8 @@
 //   - Every interpolated value is validated first (integers, uuids, dates).
 //
 // Usage:
-//   ./b2b_credit_notes.js          fully interactive — it asks you everything
-//   ./b2b_credit_notes.js --ids 4838124,4838004 --yes --csv     non-interactive
+//   ./match_credit_notes_to_invoices.js          fully interactive — it asks you everything
+//   ./match_credit_notes_to_invoices.js --ids 4838124,4838004 --yes --csv     non-interactive
 //
 // Anything you pass is not prompted for; anything you leave out is. Supply --ids and
 // --yes and it runs start to finish without a terminal, which is what a cron or a CI
@@ -245,10 +245,10 @@ class UsageError extends Error {
 // is no second implementation to keep in step.
 
 function usage() {
-  console.log(`b2b_credit_notes — which invoice does each B2B credit note belong to?
+  console.log(`match_credit_notes_to_invoices — which invoice does each B2B credit note belong to?
 
 Usage:
-  ./b2b_credit_notes.js [options]
+  ./match_credit_notes_to_invoices.js [options]
 
 Modes:
   matrix   credit note -> the invoice it credits (default)
@@ -271,10 +271,10 @@ Options:
 Anything not passed is prompted for. For a fully non-interactive run supply --ids
 and --yes (and --csv or --no-csv, or the CSV is simply skipped).
 
-  ./b2b_credit_notes.js
-  ./b2b_credit_notes.js --ids 4838124,4838004 --yes --csv
-  ./b2b_credit_notes.js -n eng-orion --ids 123 --yes --no-csv
-  ./b2b_credit_notes.js --mode decode --ids 4836650 --yes
+  ./match_credit_notes_to_invoices.js
+  ./match_credit_notes_to_invoices.js --ids 4838124,4838004 --yes --csv
+  ./match_credit_notes_to_invoices.js -n eng-orion --ids 123 --yes --no-csv
+  ./match_credit_notes_to_invoices.js --mode decode --ids 4836650 --yes
 
 matrix: the match is an E-INVOICED invoice of the same provider whose total is >= the
 credit note's value, in ANY billing period. Among those, the credit note's own period

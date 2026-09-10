@@ -1,15 +1,15 @@
 ---
 name: fix_credit_note_references
-summary: "Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes"
+summary: "Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes"
 env: production
 access: write
 tier: prod-write
 status: runbook
-related: [b2b_credit_notes, edit_document_payload]
+related: [match_credit_notes_to_invoices, edit_document_payload]
 ---
 # fix_credit_note_references
 
-Phase 2 of the B2B credit note work. Phase 1 ([b2b_credit_notes](../b2b_credit_notes/),
+Phase 2 of the B2B credit note work. Phase 1 ([match_credit_notes_to_invoices](../match_credit_notes_to_invoices/),
 shipped in `bce292f`) answered *which invoice does each credit note credit*. Phase 2 is
 meant to put that reference onto the documents so ZATCA will accept them.
 
@@ -159,7 +159,7 @@ ASDF_ELIXIR_VERSION=1.17.1-otp-26 ASDF_ERLANG_VERSION=26.2.1 elixir script.exs
 
 `previous_receipt_number` must be set to the matched invoice's
 `accounting_documents.receipt_number`. The match comes from `pickInvoice` in
-[b2b_credit_notes](../b2b_credit_notes/b2b_credit_notes.js), unchanged:
+[match_credit_notes_to_invoices](../match_credit_notes_to_invoices/match_credit_notes_to_invoices.js), unchanged:
 
 1. Validate the id: `document_type = 'credit_note'` **and** `einvoice_reference IS NOT NULL`
 2. Resolve to shedul via `einvoice_reference` → provider, billing period, and the credit
@@ -232,13 +232,13 @@ When the phase-2 script exists, the sheet id belongs in it as a constant:
 @scope_sheet_id "1ziLw2i6ISmye2DZV0dSThf0jscP9lpngPow5jZDwfuU"
 ```
 
-Deliberately **not** hardcoded into [b2b_credit_notes](../b2b_credit_notes/) — that is a
+Deliberately **not** hardcoded into [match_credit_notes_to_invoices](../match_credit_notes_to_invoices/) — that is a
 general tool that takes any ids; this is one operation's scope.
 
 ⚠ **The sheet's `upload_status` / `review_status` are a snapshot** from when it was exported
 (July 28 / Aug 2 2026). Once these documents start being re-driven the sheet will still say
 `rejected` for ones that have moved on. Use the sheet for *which 34*; use a fresh
-`b2b_credit_notes.js` run for *where they are now*.
+`match_credit_notes_to_invoices.js` run for *where they are now*.
 
 Reading it needs the claude.ai Google Drive connector with Drive scopes. It initially failed
 every call with `Request had insufficient authentication scopes` — fixed by reconnecting the

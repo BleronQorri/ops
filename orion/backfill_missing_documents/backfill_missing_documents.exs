@@ -1,6 +1,6 @@
 #!/usr/bin/env elixir
 
-# process_missing_sales — backfill accounting documents for sales that never
+# backfill_missing_documents — backfill accounting documents for sales that never
 # produced an invoice / credit note.
 #
 # Pipeline (production), each step gated by a confirmation:
@@ -20,7 +20,7 @@
 # skipped by the task (InvoiceProcessingRouter).
 #
 # Usage:
-#   ./process_missing_sales.exs <provider_id> <sale_id1,sale_id2,...> [flags]
+#   ./backfill_missing_documents.exs <provider_id> <sale_id1,sale_id2,...> [flags]
 #
 # Flags:
 #   --profile <name>   AWS profile for the S3 upload (default: fresha-production-team-orion).
@@ -138,7 +138,7 @@ defmodule ProcessMissingSales do
         "yes" ->
           houston!(task_args)
           IO.puts("")
-          IO.puts(ok("#{@check} process_missing_sales complete (provider #{provider_id}, #{length(sale_ids)} sale(s))."))
+          IO.puts(ok("#{@check} backfill_missing_documents complete (provider #{provider_id}, #{length(sale_ids)} sale(s))."))
 
         _ ->
           IO.puts("Aborted. CSV already uploaded at #{s3_uri} (S3_KEY: #{s3_key}).")
@@ -287,7 +287,7 @@ defmodule ProcessMissingSales do
   defp banner(provider_id, sale_count, s3_uri, dry_run?) do
     IO.puts("")
     IO.puts("============================================================")
-    IO.puts("  process_missing_sales")
+    IO.puts("  backfill_missing_documents")
     IO.puts("  provider_id : #{provider_id}")
     IO.puts("  sale ids    : #{sale_count} sale(s)")
     IO.puts("  db          : houston psql #{@db_env} #{@db_name}")

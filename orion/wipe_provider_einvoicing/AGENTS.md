@@ -1,5 +1,5 @@
 ---
-name: clear_provider_einvoicing
+name: wipe_provider_einvoicing
 summary: Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction
 env: staging
 access: write
@@ -14,7 +14,7 @@ examples:
   - args: "-n eng-pierogi 646845"
     note: "another staging namespace; production is refused"
 ---
-# clear_provider_einvoicing
+# wipe_provider_einvoicing
 
 Wipe **all of a provider's e-invoicing data** in the `accounting_documents` DB,
 **on staging only**. Keyed off a single integer `provider_id`.

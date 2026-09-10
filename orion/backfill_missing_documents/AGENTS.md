@@ -1,5 +1,5 @@
 ---
-name: process_missing_sales
+name: backfill_missing_documents
 summary: "Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task"
 env: production
 access: write
@@ -16,7 +16,7 @@ examples:
   - args: 646845 123,456 --skip-upload
     note: only build the CSV locally
 ---
-# process_missing_sales
+# backfill_missing_documents
 
 Backfill accounting documents (invoices / credit notes) for sales that never
 produced one. Drives the `process_missing_sales_events` houston task in
@@ -64,7 +64,7 @@ in prod).
 
 ## Prereqs
 
-- Elixir on PATH (script is `process_missing_sales.exs`; no external deps, so no
+- Elixir on PATH (script is `backfill_missing_documents.exs`; no external deps, so no
   `Mix.install` — starts instantly).
 - VPN + `houston` auth (production-developer profile for the psql read + S3
   upload).

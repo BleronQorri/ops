@@ -1,5 +1,5 @@
 ---
-name: b2b_credit_notes
+name: match_credit_notes_to_invoices
 summary: Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally
 env: production
 access: write
@@ -16,18 +16,18 @@ examples:
     note: decode payloads in the local app-accounting-documents checkout
   - args: "-n eng-orion --ids 123 --yes --no-csv"
 reports: ["b2b-credit-notes-*.md", "b2b-credit-notes-*.csv", "decoded-payloads-*.csv", "decoded-payloads-*.sql"]
-related: [fix_credit_note_references, edit_document_payload, fix_invoice_payloads]
+related: [fix_credit_note_references, edit_document_payload, patch_invoice_payloads]
 ---
-# b2b_credit_notes
+# match_credit_notes_to_invoices
 
 | Mode | Question | File |
 |---|---|---|
-| `matrix` | which invoice does each credit note credit? | `b2b_credit_notes.js` |
+| `matrix` | which invoice does each credit note credit? | `match_credit_notes_to_invoices.js` |
 | `decode` | what is inside a document's `payload_base64` — and what would it look like with that invoice's reference patched into it? | [`decode_payloads.js`](#mode-decode) |
 
 `decode` lives in its own file because it shares nothing with the matching logic but the
 psql idiom — it decodes Erlang terms in the service's own BEAM. It is a standalone executable in
-its own right; `b2b_credit_notes.js` `require`s it, so `--mode decode` and
+its own right; `match_credit_notes_to_invoices.js` `require`s it, so `--mode decode` and
 `./decode_payloads.js` run the same code rather than two implementations of it.
 
 > **Why they live in `write/`.** A mutating mode is planned. Both modes that exist
@@ -201,15 +201,15 @@ does — the period was tried as a hard constraint first, and it does not hold.
 Interactive — it asks for everything:
 
 ```bash
-./b2b_credit_notes.js
+./match_credit_notes_to_invoices.js
 ```
 
 Non-interactive — pass `--ids` and `--yes` and it needs no terminal at all:
 
 ```bash
-./b2b_credit_notes.js --ids 4838124,4838004 --yes --csv
-./b2b_credit_notes.js -n eng-orion --ids 123 --yes --no-csv
-./b2b_credit_notes.js --mode decode --ids 4836650,4762882 --yes
+./match_credit_notes_to_invoices.js --ids 4838124,4838004 --yes --csv
+./match_credit_notes_to_invoices.js -n eng-orion --ids 123 --yes --no-csv
+./match_credit_notes_to_invoices.js --mode decode --ids 4836650,4762882 --yes
 ./decode_payloads.js --ids 4836650,4762882 --yes        # the same thing, directly
 ```
 
@@ -237,7 +237,7 @@ piped in, because the prompt that would read them is skipped. You get a usage er
 so, and exit `2`:
 
 ```console
-$ printf '4838124\n' | ./b2b_credit_notes.js
+$ printf '4838124\n' | ./match_credit_notes_to_invoices.js
 Error: --ids is required when there is no terminal to prompt on.
 ```
 
@@ -347,7 +347,7 @@ and filters as absent rather than as text. Quoting is RFC 4180.
 like with the matched invoice's reference in it?
 
 ```bash
-./b2b_credit_notes.js --mode decode --ids 4836650 --yes   # decode AND patch
+./match_credit_notes_to_invoices.js --mode decode --ids 4836650 --yes   # decode AND patch
 ./decode_payloads.js --ids 4836650 --yes                  # decode only
 ```
 
@@ -507,7 +507,7 @@ This is the field all 34 rejected credit notes are missing, and the reason ZATCA
 beside the evidence for it. `pickInvoice` is not duplicated anywhere: a second copy of that
 ranking could drift and put the wrong invoice number into a tax document, which is the one
 kind of duplication worth avoiding here. That is also why the patch is only available
-through `b2b_credit_notes.js`; `./decode_payloads.js` on its own decodes and stops, because
+through `match_credit_notes_to_invoices.js`; `./decode_payloads.js` on its own decodes and stops, because
 a lone document id carries no way to know what it credits.
 
 **Read from `accounting_documents`, not shedul.** `provider_invoices.invoice_reference` and
@@ -688,7 +688,7 @@ has been patched and re-driven, re-run **matrix** mode over the same ids and rea
 `CN status` column: `rejected (rejected/rejected)` → `approved (approved/sent)`.
 
 ```bash
-./b2b_credit_notes.js --ids <the cohort> --yes --no-csv
+./match_credit_notes_to_invoices.js --ids <the cohort> --yes --no-csv
 ```
 
 Everything above is a proxy for that. A patched payload that ZATCA still rejects with

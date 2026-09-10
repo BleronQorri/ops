@@ -1,9 +1,12 @@
 ---
-name: account_config_legal_entity_audit
+name: audit_tax_identity_drift
 summary: "Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field"
 env: production
 access: read-only
 tier: read-only
+status: retired
+retired_on: 2026-09-10
+retired_reason: "Written to survey tax-identity drift during the Billing Profiles rollout; that migration is complete (team-orion #282 and #296) and the survey has served its purpose"
 lang: js
 aliases: [acla]
 examples:
@@ -15,7 +18,7 @@ examples:
     note: one result document on stdout, human lines on stderr
 reports: ["account-config-le-audit-*.md", "account-config-le-audit-*.csv"]
 ---
-# account_config_legal_entity_audit
+# audit_tax_identity_drift
 
 **Read-only, structurally.** There is no `houston psql --write` and no `houston task run`
 anywhere in the file. That absence is the safety property; `grep -nE '\-\-write|task run'`

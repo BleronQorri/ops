@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 //
-// account_config_legal_entity_audit — where has a provider's tax identity drifted
+// audit_tax_identity_drift — where has a provider's tax identity drifted
 // away from its legal entity?
 //
 // app-accounting-documents stores a provider's tax identity TWICE:
@@ -73,7 +73,7 @@
 //     databases first. --yes is that approval for automation; it cannot approve a write,
 //     because there is no write to approve.
 //
-// Usage: ./account_config_legal_entity_audit.js [flags]   (-h for all of them)
+// Usage: ./audit_tax_identity_drift.js [flags]   (-h for all of them)
 // Prereqs: VPN up, `houston` authenticated (prod reads use the
 // fresha-production-developer profile). Node only, no dependencies.
 
@@ -1444,14 +1444,14 @@ function writeCsv(namespace, analysed) {
 // --- CLI ---------------------------------------------------------------------
 
 const USAGE = `
-account_config_legal_entity_audit — where has a provider's tax identity drifted away
+audit_tax_identity_drift — where has a provider's tax identity drifted away
 from its legal entity?
 
 Walks every account_configuration in accounting_documents, follows each of its plugins
 to the legal entity that plugin points at in legal_entities, and reports a verdict per
 field. READ-ONLY: there is no write path in this file.
 
-Usage: ./account_config_legal_entity_audit.js [flags]
+Usage: ./audit_tax_identity_drift.js [flags]
 
   -n, --namespace NAME   namespace / psql env (default: ${DEFAULT_NAMESPACE})
       --country XX       only this country; repeatable (SA, ES, IT)
@@ -1488,11 +1488,11 @@ NO PLUGIN, FRESHA ENTITY (no legal entity by design; excluded).
 Exit: 0 clean, ${EXIT_DATA} the data is wrong, ${EXIT_USAGE} the call was wrong or approval refused.
 
 Examples:
-  ./account_config_legal_entity_audit.js                       # interactive
-  ./account_config_legal_entity_audit.js --yes --md            # full production audit
-  ./account_config_legal_entity_audit.js --country IT --yes
-  ./account_config_legal_entity_audit.js --provider 1135636 --yes
-  ./account_config_legal_entity_audit.js --json --yes | jq .summary
+  ./audit_tax_identity_drift.js                       # interactive
+  ./audit_tax_identity_drift.js --yes --md            # full production audit
+  ./audit_tax_identity_drift.js --country IT --yes
+  ./audit_tax_identity_drift.js --provider 1135636 --yes
+  ./audit_tax_identity_drift.js --json --yes | jq .summary
 `;
 
 function parseArgs(argv) {

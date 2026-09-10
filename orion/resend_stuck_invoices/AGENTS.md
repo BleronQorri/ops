@@ -1,5 +1,5 @@
 ---
-name: retry_invoices
+name: resend_stuck_invoices
 summary: "Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston"
 env: production
 access: write
@@ -14,7 +14,7 @@ examples:
   - args: "--dry-run 123,456"
     note: plan only, no writes
 ---
-# retry_invoices
+# resend_stuck_invoices
 
 Given a list of `e_invoice_tracker` IDs, it flips their status so they become
 retry-eligible, then force-retries sending the underlying accounting documents.

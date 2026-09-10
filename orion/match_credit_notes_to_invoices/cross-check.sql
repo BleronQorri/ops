@@ -1,5 +1,5 @@
 -- ============================================================================
--- b2b_credit_notes — the queries, and the matching algorithm in SQL
+-- match_credit_notes_to_invoices — the queries, and the matching algorithm in SQL
 --
 --   houston psql production accounting_documents -- -f cross-check.sql
 --   houston psql production shedul               -- -f cross-check.sql
@@ -17,7 +17,7 @@
 -- Read-only throughout. Amounts are stored in MINOR UNITS; queries divide by 100.
 -- Stored signs are inconsistent, so magnitudes are compared (abs()).
 --
--- ⚠ A run of `b2b_credit_notes.js` now emits the statements it actually executed
+-- ⚠ A run of `match_credit_notes_to_invoices.js` now emits the statements it actually executed
 -- (see "SQL executed" in the Markdown report, or the companion .sql file next to
 -- the decode CSV). Those are the truth; this file is a curated copy and can drift.
 -- ============================================================================
@@ -172,7 +172,7 @@ ORDER BY ad.id;
 -- ============================================================================
 -- §2  THE ALGORITHM, IN SQL
 --
--- `pickInvoice()` in b2b_credit_notes.js, reimplemented. The point is that this is
+-- `pickInvoice()` in match_credit_notes_to_invoices.js, reimplemented. The point is that this is
 -- an independent path to the same answer: `rank = 1` must equal the CSV's
 -- invoice_reference for every credit note, and a disagreement is a bug in one of
 -- the two implementations.
@@ -442,7 +442,7 @@ ORDER BY retry_eligible, ad.id;
 -- §4.2  The payload changed. ⚠ Length and md5 change on ANY re-encode, because
 -- term_to_binary does not preserve map key order — so these prove only that
 -- SOMETHING was written, never that it was the right thing. To check content,
--- decode it: `./b2b_credit_notes.js --mode decode --ids <id> --yes`.
+-- decode it: `./match_credit_notes_to_invoices.js --mode decode --ids <id> --yes`.
 SELECT id, receipt_number, length(payload_base64) AS b64_len,
        md5(payload_base64), updated_at
 FROM accounting_documents

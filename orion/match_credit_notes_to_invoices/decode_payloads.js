@@ -59,7 +59,7 @@
 //   ./decode_payloads.js                          fully interactive
 //   ./decode_payloads.js --ids 4836650 --yes      non-interactive
 //
-// Also reachable as `b2b_credit_notes.js --mode decode`, which hands its own ids and
+// Also reachable as `match_credit_notes_to_invoices.js --mode decode`, which hands its own ids and
 // namespace straight to runDecode() below rather than re-implementing any of this.
 //
 // Prereqs: VPN up, `houston` authenticated (prod reads use fresha-production-developer); a
@@ -462,7 +462,7 @@ function runCapture(cmd, args, opts = {}) {
   return res.stdout;
 }
 
-// Every statement this run executed, in order. See the note in b2b_credit_notes.js.
+// Every statement this run executed, in order. See the note in match_credit_notes_to_invoices.js.
 const EXECUTED = [];
 
 // Read-only psql. -t -A -F| gives bare pipe-delimited rows; a NULL column comes back as
@@ -1006,14 +1006,14 @@ async function confirmDataAccess(opts, env, app, count) {
 
 // --- the mode ----------------------------------------------------------------
 
-// The entry point b2b_credit_notes.js calls. It has already parsed the ids and confirmed
+// The entry point match_credit_notes_to_invoices.js calls. It has already parsed the ids and confirmed
 // the read, so this does the work and nothing else — no prompting, no gate. Running this
 // file directly goes through main() below, which supplies both.
 //
 // `opts` is { namespace, app: {dir} }.
 //
 // `patches` is an optional Map of accounting_documents.id -> { previousReceiptNumber },
-// supplied by b2b_credit_notes.js from its matrix. Without it this decodes and nothing
+// supplied by match_credit_notes_to_invoices.js from its matrix. Without it this decodes and nothing
 // more, which is all a standalone run can honestly do: the reference to write comes from
 // matching a credit note to its invoice, and that is the other file's job.
 function runDecode(opts, env, ids, patches = new Map()) {
@@ -1161,7 +1161,7 @@ checkout, which loads the app's modules but starts nothing and never sees a data
 DECODE ONLY. To also patch previous_receipt_number with the invoice each credit note
 credits, run it through the matrix instead:
 
-  ./b2b_credit_notes.js --mode decode --ids 4836650 --yes
+  ./match_credit_notes_to_invoices.js --mode decode --ids 4836650 --yes
 
 The reference comes from matching a credit note to its invoice, which a bare document id
 cannot tell you — so the patch columns are empty on a standalone run rather than guessed.
@@ -1241,7 +1241,7 @@ async function main() {
   return runDecode(opts, env, ids);
 }
 
-// Importable by b2b_credit_notes.js, runnable on its own. The two paths share every line
+// Importable by match_credit_notes_to_invoices.js, runnable on its own. The two paths share every line
 // below the gate — there is no second implementation to keep in step.
 module.exports = { runDecode, appDefaults, resolveApp, DEFAULT_APP_DIR };
 

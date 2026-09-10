@@ -1,5 +1,5 @@
 ---
-name: fix_invoice_payloads
+name: patch_invoice_payloads
 summary: Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook
 env: production
 access: write
@@ -14,9 +14,9 @@ examples:
   - args: "--ids 4687595 --patch-file fix.exs --yes"
     note: apply a patch expression and get the runbook for each document
 reports: ["invoice-payloads-*.csv", "invoice-payloads-*.sql", originals/]
-related: [edit_document_payload, b2b_credit_notes]
+related: [edit_document_payload, match_credit_notes_to_invoices]
 ---
-# fix_invoice_payloads
+# patch_invoice_payloads
 
 Automates both halves of [edit_document_payload](../edit_document_payload/) for
 `document_type = 'invoice'` documents: read `payload_base64`, decode it locally, apply a
@@ -53,7 +53,7 @@ writes there.
 This replaces an earlier path that borrowed a staging pod through `houston console … eval`,
 which needed cluster exec rights and a release path that moved with every redeploy.
 
-Why not [b2b_credit_notes/decode_payloads.js](../b2b_credit_notes/)? That one's patch is a
+Why not [match_credit_notes_to_invoices/decode_payloads.js](../match_credit_notes_to_invoices/)? That one's patch is a
 single literal (`previous_receipt_number`) and its assertions and CSV are credit-note-shaped.
 The plumbing here is copied, not imported — one directory, one entrypoint, no shared library.
 

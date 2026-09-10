@@ -1,5 +1,5 @@
 ---
-name: deregister_suppliers
+name: deregister_invopop_suppliers
 summary: Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace
 env: staging
 access: write
@@ -14,7 +14,7 @@ examples:
   - args: "--latest-only --wait 30"
     note: one job per supplier, block up to 30 s each
 ---
-# deregister_suppliers
+# deregister_invopop_suppliers
 
 Triggers the Invopop **supplier-deregistration** workflow for every supplier in a
 workspace — one Transform job per supplier.

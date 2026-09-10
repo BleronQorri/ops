@@ -474,7 +474,7 @@ defmodule DeregisterSuppliers do
 
   defp extract_entries(_), do: []
 
-  # --- Supplier identity (mirrors invopop_supplier_check.exs) ---
+  # --- Supplier identity (mirrors check_invopop_suppliers.exs) ---
 
   defp entry_state(e), do: e["state"] |> to_string() |> String.downcase()
 
@@ -547,7 +547,7 @@ defmodule DeregisterSuppliers do
 
   defp usage do
     IO.puts("""
-    deregister_suppliers — trigger the Invopop supplier-deregistration workflow for all suppliers
+    deregister_invopop_suppliers — trigger the Invopop supplier-deregistration workflow for all suppliers
 
     Usage:
       ./ds [flags]

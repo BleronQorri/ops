@@ -1,5 +1,5 @@
 ---
-name: invopop_supplier_check
+name: check_invopop_suppliers
 summary: List Invopop supplier silo entries and flag the ones stuck in error or void states
 env: production
 access: read-only
@@ -18,7 +18,7 @@ examples:
     note: verbose
 reports: ["invopop_report_*.md", "invopop_entries_*.csv"]
 ---
-# invopop_supplier_check
+# check_invopop_suppliers
 
 ## What it does
 

@@ -5,7 +5,7 @@ env: production
 access: write
 tier: prod-write
 status: runbook
-related: [fix_invoice_payloads, b2b_credit_notes]
+related: [patch_invoice_payloads, match_credit_notes_to_invoices]
 ---
 # edit_document_payload
 
@@ -460,7 +460,7 @@ reports success. Check the tracker first, every time.
 
 4687595's tracker is `{upload_status: :sent, review_status: :rejected}` — already
 eligible, so **skip the status flip**. Only reach for
-`update_einvoice_trackers_status` (what `retry_invoices.js` does) when the tracker
+`update_einvoice_trackers_status` (what `resend_stuck_invoices.js` does) when the tracker
 is in neither state:
 
 ```bash
@@ -572,11 +572,11 @@ the second time round.
 - A local `app-accounting-documents` checkout with its deps fetched, for the IEx shell that
   decodes (§3). Under asdf, pin `ASDF_ELIXIR_VERSION` / `ASDF_ERLANG_VERSION` to the
   `mise.toml` versions; with `mise` installed it is automatic.
-- No cluster exec rights are needed for the decode — [fix_invoice_payloads](../fix_invoice_payloads/)
+- No cluster exec rights are needed for the decode — [patch_invoice_payloads](../patch_invoice_payloads/)
   automates the whole of §2–§4 the same way.
 
 ## Related
 
-- [retry_invoices](../retry_invoices/) — bulk version of §7 (status flip + force
+- [resend_stuck_invoices](../resend_stuck_invoices/) — bulk version of §7 (status flip + force
   retry) for KSA trackers. Note it targets `accounting-documents-web` and does not
   pass `OBAN_STORER_ENABLED`, relying on the component's own `"1"`.

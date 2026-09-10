@@ -662,7 +662,7 @@ const RESET_UNTOUCHED = [
 // rooted at `account_configurations` (keyed by provider_id). The migration never
 // created any of it, so it is off unless you ask for it.
 //
-// Same SQL as staging/write/clear_provider_einvoicing/clear_provider_einvoicing.js
+// Same SQL as staging/write/wipe_provider_einvoicing/wipe_provider_einvoicing.js
 // — kept in step by hand, because scripts here stay self-contained. NOT touched,
 // by design: the invoicing/ domain (invoice_parties / invoices / invoicing_periods
 // — Fresha periodic billing, keyed by legal_entity_id), and anything keyed only
@@ -1208,7 +1208,7 @@ function parseProviderIds(raw) {
 }
 
 // The psql database environment for a given deploy namespace. Mirrors
-// retry_invoices.js: "production" is its own env, anything else is the namespace.
+// resend_stuck_invoices.js: "production" is its own env, anything else is the namespace.
 function psqlEnv(namespace) {
   return namespace === "production" ? "production" : namespace;
 }
@@ -6371,7 +6371,7 @@ async function main() {
   requireInteractive(opts);
 
   // Reset is destructive and has no undo, so it is staging-only — the same stance
-  // clear_provider_einvoicing takes. Checked before anything else happens.
+  // wipe_provider_einvoicing takes. Checked before anything else happens.
   if (opts.mode === "reset" && isProd(opts.namespace)) {
     throw new UsageError(
       `Refusing to reset against "${opts.namespace}".\n` +

@@ -244,7 +244,7 @@ skip the rest. The verification pass below is what catches which one lost.
 
 Clears the migration state for a provider so `legal_entities_migration:migrate`
 starts from scratch. **Refuses production outright** — same stance as
-`clear_provider_einvoicing`. There is no undo.
+`wipe_provider_einvoicing`. There is no undo.
 
 ```sh
 ./plugin_legal_entity_updates.js --reset 33
@@ -301,7 +301,7 @@ Answering yes deletes, children-first in one statement in
 `e_invoice_it_smart_receipts_configuration`, `account_configuration_plugins`,
 and finally `account_configurations`.
 
-This is the **same SQL** as `clear_provider_einvoicing` — a single
+This is the **same SQL** as `wipe_provider_einvoicing` — a single
 data-modifying-CTE statement, so every FK check fires at statement end and the
 CTE order can't cause a violation. The two copies are kept in step by hand;
 scripts here stay self-contained. Still **not** touched: the `invoicing/` domain

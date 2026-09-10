@@ -1,5 +1,5 @@
 ---
-name: confirm_sent_uat
+name: confirm_comarch_uat_queue
 summary: "Process the Comarch UAT queue by confirming \"sent\" items via the edoc-online UAT REST API"
 env: staging
 access: write
@@ -11,7 +11,7 @@ examples:
   - args: ""
     note: prompts for the queue type and, unless COMARCH_UAT_JWT is set, the JWT
 ---
-# confirm_sent_uat
+# confirm_comarch_uat_queue
 
 ## What it does
 

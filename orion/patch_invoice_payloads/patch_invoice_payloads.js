@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 //
-// fix_invoice_payloads — decode an invoice's payload_base64, patch it, get the runbook.
+// patch_invoice_payloads — decode an invoice's payload_base64, patch it, get the runbook.
 //
 // `accounting_documents.payload_base64` is
 //
@@ -20,7 +20,7 @@
 //                   remediation sequence this document needs — conditional on its country,
 //                   its persisted line items and its tracker's current state.
 //
-// WHY A SEPARATE SCRIPT FROM ../b2b_credit_notes/decode_payloads.js. That one does the same
+// WHY A SEPARATE SCRIPT FROM ../match_credit_notes_to_invoices/decode_payloads.js. That one does the same
 // three steps, but its patch is one literal — `%{doc | previous_receipt_number: ref}` — and
 // its fatal assertion `only_field_changed` names that field explicitly. Neither generalises
 // to an arbitrary fix. Its CSV columns are credit-note-shaped too. The plumbing below is
@@ -62,9 +62,9 @@
 //     only rollback there is.
 //
 // Usage:
-//   ./fix_invoice_payloads.js                                    fully interactive
-//   ./fix_invoice_payloads.js --ids 4687595,4762930 --yes         decode only
-//   ./fix_invoice_payloads.js --ids 4687595 --patch-file fix.exs --yes
+//   ./patch_invoice_payloads.js                                    fully interactive
+//   ./patch_invoice_payloads.js --ids 4687595,4762930 --yes         decode only
+//   ./patch_invoice_payloads.js --ids 4687595 --patch-file fix.exs --yes
 //
 // Prereqs: VPN up, `houston` authenticated (prod reads use fresha-production-developer); a
 // local app-accounting-documents checkout with deps fetched. Node only, no dependencies.
@@ -102,7 +102,7 @@ const BEAM_CHUNK = 200;
 const ROW_PREFIX = "ROW ";
 
 // Only `invoice` is in scope. The enum has four values (enums.ex:71-78) and the other three
-// are a different problem: a credit note belongs to ../b2b_credit_notes, and the two
+// are a different problem: a credit note belongs to ../match_credit_notes_to_invoices, and the two
 // onboarding types carry a differently-shaped payload entirely.
 const WANTED_DOCUMENT_TYPE = "invoice";
 
@@ -1062,7 +1062,7 @@ function writeSql(namespace) {
   const file = outputPath(namespace, "sql");
 
   const lines = [
-    `-- SQL executed by fix_invoice_payloads, namespace ${namespace}`,
+    `-- SQL executed by patch_invoice_payloads, namespace ${namespace}`,
     `-- ${EXECUTED.length} statement${EXECUTED.length === 1 ? "" : "s"}, in order. Read-only.`,
     "--",
     "-- Run against the database named above each one:",
@@ -1496,10 +1496,10 @@ function firstAssertionFailure(result) {
 // --- entry point -------------------------------------------------------------
 
 function usage() {
-  console.log(`fix_invoice_payloads — decode, patch and remediate an invoice's payload_base64
+  console.log(`patch_invoice_payloads — decode, patch and remediate an invoice's payload_base64
 
 Usage:
-  ./fix_invoice_payloads.js [options]
+  ./patch_invoice_payloads.js [options]
 
 Options:
   -m, --mode <mode>         ${MODES.join(" | ")} (default decode; implied by --patch-file)
@@ -1517,8 +1517,8 @@ Options:
 
 Anything not passed is prompted for. For a fully non-interactive run supply --ids and --yes.
 
-  ./fix_invoice_payloads.js --ids 4687595,4762930 --yes
-  ./fix_invoice_payloads.js --ids 4687595 --patch-file fix.exs --yes
+  ./patch_invoice_payloads.js --ids 4687595,4762930 --yes
+  ./patch_invoice_payloads.js --ids 4687595 --patch-file fix.exs --yes
 
 payload_base64 is an Erlang term, so reading it needs a BEAM: the payloads are read from
 production and decoded locally by 'mix run --no-start' in the app-accounting-documents

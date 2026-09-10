@@ -56,21 +56,21 @@ mkdir -p ~/.zfunc && ops completion zsh > ~/.zfunc/_ops
 ```
 $ ops orion script list --env production --access write
 NAME                             ENV         ACCESS  TIER                     STATUS   SUMMARY
-b2b_credit_notes                 production  write   read-only                active   Map each B2B credit note to the invoice it credits, …
-fix_credit_note_references       production  write   prod-write               blocked  Phase 2 of b2b_credit_notes: put the BillingReference …
-retry_invoices                   production  write   prod-write               active   Re-drive stuck KSA e-invoices: flip trackers retry-eligible, …
+match_credit_notes_to_invoices                 production  write   read-only                active   Map each B2B credit note to the invoice it credits, …
+fix_credit_note_references       production  write   prod-write               blocked  Phase 2 of match_credit_notes_to_invoices: put the BillingReference …
+resend_stuck_invoices                   production  write   prod-write               active   Re-drive stuck KSA e-invoices: flip trackers retry-eligible, …
 
 $ ops orion script view ri          # the page: summary, tier, key AGENTS.md sections, live --help, examples
 
 $ ops orion task run ri --dry-run 123,456
-ops ▸ run 42  retry_invoices (alias ri)  production · write · prod-write — Prod writes (gated, reversible-ish)
+ops ▸ run 42  resend_stuck_invoices (alias ri)  production · write · prod-write — Prod writes (gated, reversible-ish)
 …the script's own prompts, gates and output…
 ops ▸ run 42 completed in 18s (exit 0)  · ops orion task logs 42
 
 $ ops orion task ls --script ri
 ID  STATUS     SCRIPT          STARTED    DURATION  ARGS
-42  completed  retry_invoices  2m ago     18s       --dry-run 123,456
-41  failed     retry_invoices  yesterday  4s        999
+42  completed  resend_stuck_invoices  2m ago     18s       --dry-run 123,456
+41  failed     resend_stuck_invoices  yesterday  4s        999
 ```
 
 Runs are modelled on `houston task`: `run`, `ls`, `get`, `logs`, `rerun`, `cancel`,

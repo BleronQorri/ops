@@ -22,8 +22,7 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:production/read-only -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [account_config_legal_entity_audit](account_config_legal_entity_audit/) | read-only | `ops run account_config_legal_entity_audit` · `ops run acla` | Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field |
-| [invopop_supplier_check](invopop_supplier_check/) | read-only | `ops run invopop_supplier_check` · `ops run isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
+| [check_invopop_suppliers](check_invopop_suppliers/) | read-only | `ops run check_invopop_suppliers` · `ops run isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
 <!-- ops:end catalogue:production/read-only -->
 
 ## production · write
@@ -31,12 +30,12 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:production/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [b2b_credit_notes](b2b_credit_notes/) | read-only | `ops run b2b_credit_notes` · `ops run b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
+| [backfill_missing_documents](backfill_missing_documents/) | prod-write | `ops run backfill_missing_documents` · `ops run pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
 | [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
-| [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes |
-| [fix_invoice_payloads](fix_invoice_payloads/) | read-only | `ops run fix_invoice_payloads` · `ops run fip` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
-| [process_missing_sales](process_missing_sales/) | prod-write | `ops run process_missing_sales` · `ops run pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
-| [retry_invoices](retry_invoices/) | prod-write | `ops run retry_invoices` · `ops run ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
+| [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes |
+| [match_credit_notes_to_invoices](match_credit_notes_to_invoices/) | read-only | `ops run match_credit_notes_to_invoices` · `ops run b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
+| [patch_invoice_payloads](patch_invoice_payloads/) | read-only | `ops run patch_invoice_payloads` · `ops run fip` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
+| [resend_stuck_invoices](resend_stuck_invoices/) | prod-write | `ops run resend_stuck_invoices` · `ops run ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
 <!-- ops:end catalogue:production/write -->
 
 ## staging · write
@@ -44,17 +43,17 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:staging/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [clear_provider_einvoicing](clear_provider_einvoicing/) | staging | `ops run clear_provider_einvoicing` · `ops run cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
-| [confirm_sent_uat](confirm_sent_uat/) | staging | `ops run confirm_sent_uat` · `ops run csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
-| [deregister_suppliers](deregister_suppliers/) | staging | `ops run deregister_suppliers` · `ops run ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [confirm_comarch_uat_queue](confirm_comarch_uat_queue/) | staging | `ops run confirm_comarch_uat_queue` · `ops run csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
+| [deregister_invopop_suppliers](deregister_invopop_suppliers/) | staging | `ops run deregister_invopop_suppliers` · `ops run ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [wipe_provider_einvoicing](wipe_provider_einvoicing/) | staging | `ops run wipe_provider_einvoicing` · `ops run cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
 <!-- ops:end catalogue:staging/write -->
 
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `account_config_legal_entity_audit`, `b2b_credit_notes`, `fix_invoice_payloads`, `invopop_supplier_check`.
-- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `process_missing_sales`, `retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
-- **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `clear_provider_einvoicing`, `confirm_sent_uat`, `deregister_suppliers`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `check_invopop_suppliers`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
+- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `resend_stuck_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
+- **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
 
 Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the worst thing the script can do in any mode. `ops help tiers` has the long form.
 <!-- ops:end tiers -->
@@ -64,6 +63,7 @@ Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the wors
 <!-- ops:begin retired -->
 | Script | Retired | Why |
 |--------|---------|-----|
+| [audit_tax_identity_drift](audit_tax_identity_drift/) | 2026-09-10 | Written to survey tax-identity drift during the Billing Profiles rollout; that migration is complete (team-orion #282 and #296) and the survey has served its purpose |
 | [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | 2026-09-10 | The bug bash it was written for ran on 2026-09-04 with all ten cases green; RENEWAL_EMAIL_GAP.md stays as the open question (team-orion#575) |
 | [onboard_location_scripts](onboard_location_scripts/) | 2026-09-10 | The Billing Profiles migration it predates is complete (team-orion #282 and #296, 35/35 tickets), so its checks and task suggestions target a schema that no longer describes onboarding |
 | [plugin_legal_entity_updates](plugin_legal_entity_updates/) | 2026-09-10 | It drove the Billing Profiles migration, which is complete including the plugin backfills (team-orion #300 and #463); nothing is left to migrate or link |
@@ -77,10 +77,10 @@ ever need them.
 
 - **VPN up** + `houston` authenticated. Prod DB reads use the
   `fresha-production-developer` profile; some writes need a stronger role
-  (e.g. `process_missing_sales` uploads to S3 with `fresha-production-team-orion`).
+  (e.g. `backfill_missing_documents` uploads to S3 with `fresha-production-team-orion`).
 - Elixir/Erlang are pinned via `.tool-versions` (asdf); Node ≥ 20 on PATH.
   Elixir scripts that need deps auto-install them via `Mix.install` (e.g. `Req`);
-  `process_missing_sales` and the Node scripts are dependency-free.
+  `backfill_missing_documents` and the Node scripts are dependency-free.
 - Tokens (`INVOPOP_API_TOKEN`, `INVOPOP_SANDBOX_API_TOKEN`, `COMARCH_UAT_JWT`) come
   from your shell environment; the scripts prompt when one is unset.
 - `ops orion doctor` checks the runtimes and the catalogue.
@@ -92,6 +92,10 @@ scaffolds the directory: an executable entrypoint with a shebang, `--help`, a
 single readline interface and a dry-run default, plus an `AGENTS.md` whose
 frontmatter already passes `ops orion docs check`. Then edit both and run
 `ops orion docs sync` to add the row above.
+
+Names say what the script does: verb first, then the object, snake_case, naming the
+external system when more than one exists (Invopop, Comarch). The directory, the
+entrypoint and the frontmatter `name` always agree.
 
 By hand: one directory per script, a single executable entrypoint (`.exs` with
 `#!/usr/bin/env elixir`, or `.js` with `#!/usr/bin/env node`) named after the
