@@ -1,3 +1,17 @@
+---
+name: onboard_location_scripts
+summary: "Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run"
+env: production
+access: read-only
+tier: read-only
+status: deprecated
+lang: exs
+aliases: [ols]
+help_flag: false
+examples:
+  - args: 646845
+    note: "asks \"still deprecated, continue?\" first, then checks provider 646845"
+---
 # onboard_location_scripts
 
 > ⚠️ **DEPRECATED — Billing Profiles migration.**
@@ -8,9 +22,6 @@
 > longer reflect how onboarding works once a provider is on billing profiles.
 > Kept for reference / legacy providers only — **do not rely on it for new
 > onboarding.** Remove once the migration completes.
-
-**Env: production (read + polling; task suggestions only).** Provider onboarding
-check across the `shedul` and `accounting-documents` databases.
 
 ## What it does
 
@@ -25,12 +36,6 @@ check across the `shedul` and `accounting-documents` databases.
    `account_configuration_plugins`) after revoke/onboard tasks to confirm state.
 
 Queries can be run directly (via `houston psql`) or pasted in manually.
-
-## Run it
-
-```bash
-./onboard_location_scripts.exs <provider_id>
-```
 
 ## Prereqs
 

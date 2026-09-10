@@ -468,13 +468,15 @@ const withPrefix = (prefix, subs) => subs.map((s) => `${prefix}.${s}`);
 
 const DECLARED_KEYS = {
   // country/sa.ex — implements ONLY individual_root, organization_root and
-  // sole_proprietorship_child. Note there is no soleProprietorship.name and no
-  // soleProprietorship.registrationNumber.
+  // sole_proprietorship_child. Note there is no soleProprietorship.name. The CR
+  // (registrationNumber) IS declared on both shapes: zatca requires it and the invoice
+  // projection reads a sole trader's identifiers from the child, so the child must be
+  // able to hold it (identifier_fields/1 in sa.ex).
   SA: new Set([
     "individual.name.firstName", "individual.name.lastName",
     "organization.legalName", "organization.registrationNumber", "organization.vatNumber",
     ...withPrefix("organization.registeredAddress", DECLARED_ADDRESS_SA),
-    "soleProprietorship.vatNumber",
+    "soleProprietorship.registrationNumber", "soleProprietorship.vatNumber",
     ...withPrefix("soleProprietorship.registeredAddress", DECLARED_ADDRESS_SA),
     "individual.residentialAddress.country", // country_field_injection.ex
   ]),
@@ -593,7 +595,12 @@ const PBI_COLUMNS = [
 ];
 
 const DEFAULT_NAMESPACE = "eng-orion";
+// The Houston service the task runs on. Production splits the app into web and
+// worker components and registers the web one under its own name, so there the
+// service is `accounting-documents-web`; every other namespace runs it
+// undivided. -s wins over both.
 const DEFAULT_SERVICE = "accounting-documents";
+const PROD_SERVICE = "accounting-documents-web";
 const TASK = "link_plugins_to_legal_entities_from_env";
 
 // Migrate mode drives a different service entirely — the migration lives in
@@ -819,6 +826,7 @@ function parseArgs(argv) {
     // without it, passing the flag and then being asked anyway is worse than
     // having no flag at all.
     namespaceGiven: false,
+    serviceGiven: false,
     modeGiven: false,
     verboseGiven: false,
     applyGiven: false,
@@ -871,6 +879,7 @@ function parseArgs(argv) {
       opts.namespaceGiven = true;
     } else if (a === "-s" || a === "--service") {
       opts.service = value();
+      opts.serviceGiven = true;
     } else if (a === "-f" || a === "--file") {
       opts.file = value();
     } else if (a === "--all") {
@@ -1016,7 +1025,17 @@ function parseArgs(argv) {
     );
   }
 
+  resolveService(opts);
+
   return opts;
+}
+
+// The service name follows the namespace unless -s said otherwise. Called again
+// after the interactive namespace prompt, since that answer arrives long after
+// the flags are parsed.
+function resolveService(opts) {
+  if (opts.serviceGiven) return;
+  opts.service = isProd(opts.namespace) ? PROD_SERVICE : DEFAULT_SERVICE;
 }
 
 function usage() {
@@ -1040,7 +1059,9 @@ FLAGS
   Target
     -n, --namespace NAME   namespace / env; drives the psql env AND the task's
                            --namespace. Default ${DEFAULT_NAMESPACE}.
-    -s, --service NAME     Houston service. Default ${DEFAULT_SERVICE}.
+    -s, --service NAME     Houston service. Follows the namespace by default:
+                           ${PROD_SERVICE} on production,
+                           ${DEFAULT_SERVICE} everywhere else.
   Providers
         --all              every provider in account_configurations. Rejected by
                            migrate and reset — they need an explicit list.
@@ -1534,24 +1555,43 @@ function fetchAppliedLegalEntities(env, pluginIds) {
   return map;
 }
 
-// provider_id -> [{ id, pluginType, integrator, pluginStatus, legalEntityId, integration }]
+// provider_id -> [{ id, pluginType, integrator, pluginStatus, legalEntityId, integration,
+//                   thirdPartyStatus }]
 //
 // `integration` is what LegalEntityBillingResolver.for_integration/1 dispatches on, so it
 // — not the country — decides which required set applies. Selected here rather than in a
 // new query because this table was already being read.
+//
+// `third_party_integration_status` rides along for the same reason. It is the OTHER half of
+// "is this plugin actually working": plugin_status is our side, third-party is the
+// integrator's (comarch/invopop) — enabled, disabled, revoked, pending. Both are reported,
+// neither decides a verdict; see pluginStatusTable.
+//
+// It goes LAST on purpose. parseRowsLoose folds any surplus pipes into the final field, so
+// the column a malformed row can corrupt is this informational one rather than
+// `integration`, which selects the required-field set.
 function fetchPlugins(env, providerIds) {
   const sql =
     "SELECT ac.provider_id, p.id, p.plugin_type, p.integrator, p.plugin_status,\n" +
-    "       coalesce(p.legal_entity_id::text, ''), coalesce(p.integration::text, '')\n" +
+    "       coalesce(p.legal_entity_id::text, ''), coalesce(p.integration::text, ''),\n" +
+    "       coalesce(p.third_party_integration_status::text, '')\n" +
     "FROM account_configuration_plugins p\n" +
     "JOIN account_configurations ac ON ac.id = p.account_configuration_id\n" +
     `WHERE ac.provider_id IN (${providerIds.join(",")})\n` +
     "ORDER BY ac.provider_id, p.id;";
 
   const map = new Map();
-  for (const fields of parseRowsLoose(psqlRead(env, AD_DB, sql), 7)) {
-    const [providerId, id, pluginType, integrator, pluginStatus, legalEntityId, integration] =
-      fields;
+  for (const fields of parseRowsLoose(psqlRead(env, AD_DB, sql), 8)) {
+    const [
+      providerId,
+      id,
+      pluginType,
+      integrator,
+      pluginStatus,
+      legalEntityId,
+      integration,
+      thirdPartyStatus,
+    ] = fields;
     if (!map.has(providerId)) map.set(providerId, []);
     map.get(providerId).push({
       id,
@@ -1560,6 +1600,7 @@ function fetchPlugins(env, providerIds) {
       pluginStatus,
       legalEntityId: legalEntityId || null,
       integration: integration || null,
+      thirdPartyStatus: thirdPartyStatus || null,
     });
   }
   return map;
@@ -1576,6 +1617,64 @@ function integrationOfProvider(plugins) {
   return null;
 }
 
+// --- providers with more than one legal entity -------------------------------
+//
+// `provider_purchases_primary_legal_entities` holds at most ONE active row per provider,
+// so the primary pointer can only ever name one entity. Every mode that reasons from the
+// primary alone is therefore wrong for a provider that has two: link refuses to guess
+// between the plugins ("ambiguous, pick one by hand") and post-flight reads the plugin
+// holding the other entity as drift. Neither is a data problem — the data is right and the
+// pointer simply cannot express it.
+//
+// Provider 1135636 (KSA) is the first such provider. Verified in production 2026-08-24,
+// from `accounting_documents.company_registration_number` per plugin against each entity's
+// `organization.registrationNumber`:
+//
+//   plugin 12  created 2025-07-28 — CRN 1010291884 to 2026-05-04, then 1010403997 onward
+//   plugin 402 created 2026-05-05 — CRN 1010880577 throughout
+//
+//   01a03382-5190-7862-ba72-586683867ae5  "Supernova Salon Olaya"   reg 1010403997
+//   01a03382-5166-710b-bdf9-b1264d4cd40c  "Supernova Salon Murooj"  reg 1010880577  ← primary
+//
+// Both entities came out of the same migration run (11:22:53) and share one VAT number,
+// 300474119700003, with different registration numbers: two branches of one taxpayer, not a
+// duplicate to be cleaned up. CRN 1010291884 is the pre-split number, has no legal entity,
+// and nothing links to it.
+//
+// The mapping is the branch each plugin has actually been invoicing as — 866 and 1,424
+// documents respectively — not an inference from plugin ids or creation order. That is the
+// only evidence that distinguishes them, and it is why this is a table of verified facts
+// rather than a rule: a provider absent here keeps the refuse-to-guess behaviour, which is
+// the right default for an ambiguity nobody has looked at yet. To extend it, run the same
+// two queries and add what they say.
+const MULTI_ENTITY_PROVIDERS = new Map([
+  [
+    "1135636",
+    new Map([
+      ["12", "01a03382-5190-7862-ba72-586683867ae5"],
+      ["402", "01a03382-5166-710b-bdf9-b1264d4cd40c"],
+    ]),
+  ],
+]);
+
+// Ids arrive as strings from psql and as numbers from JSON, so both sides are stringified.
+function isMultiEntityProvider(providerId) {
+  return MULTI_ENTITY_PROVIDERS.has(String(providerId));
+}
+
+function entityForPlugin(providerId, pluginId) {
+  const byPlugin = MULTI_ENTITY_PROVIDERS.get(String(providerId));
+  return (byPlugin && byPlugin.get(String(pluginId))) || null;
+}
+
+// The entities this provider has that the primary pointer does not name. Drives the
+// pre-flight note: pre-flight compares one entity, so it has to say which one it left out.
+function unmappedByPrimary(providerId, primary) {
+  const byPlugin = MULTI_ENTITY_PROVIDERS.get(String(providerId));
+  if (!byPlugin) return [];
+  return [...new Set([...byPlugin.values()].filter((id) => id !== primary))];
+}
+
 // --- resolution ------------------------------------------------------------
 
 // Decide, per provider, which plugin (if any) should receive the primary legal
@@ -1588,6 +1687,47 @@ function resolve(providerIds, primaryByProvider, pluginsByProvider) {
   for (const providerId of providerIds) {
     const legalEntityId = primaryByProvider.get(providerId);
     const plugins = pluginsByProvider.get(providerId) || [];
+
+    // A provider with more than one legal entity is resolved per PLUGIN, from the
+    // verified mapping — see MULTI_ENTITY_PROVIDERS. Decided before the primary is
+    // consulted at all: the primary names one of its entities, so it is not the answer
+    // to "which entity does this plugin get?" for any of them.
+    if (plugins.length && isMultiEntityProvider(providerId)) {
+      const candidates = plugins.filter((p) => !p.legalEntityId);
+
+      if (!candidates.length) {
+        skipped.push({
+          providerId,
+          reason: "all plugins already have a legal_entity_id (never overwritten)",
+          plugins,
+        });
+        continue;
+      }
+
+      for (const plugin of candidates) {
+        const mapped = entityForPlugin(providerId, plugin.id);
+        // A plugin this provider grew after the mapping was written. Guessing here is
+        // exactly what the mapping exists to avoid, so it is skipped and named.
+        if (!mapped) {
+          skipped.push({
+            providerId,
+            reason: `plugin ${plugin.id} is not in the multi-entity mapping — link it by hand`,
+            plugins: [plugin],
+          });
+          continue;
+        }
+        updates.push({
+          plugin_id: Number(plugin.id),
+          legal_entity_id: mapped,
+          _providerId: providerId,
+          _plugin: plugin,
+          // Not the provider's primary, and not meant to be. Carried so the printers can
+          // say so rather than looking like they resolved the pointer wrongly.
+          _multiEntity: true,
+        });
+      }
+      continue;
+    }
 
     // Reasons are kept short — they're rendered as a table column. The full
     // explanation of each lives in this directory's AGENTS.md.
@@ -3139,12 +3279,22 @@ function printReportSummary(rows, survey, scope) {
   }
   // Explains two states, so it is worth nothing when neither is present — it used to
   // print regardless, which is the same failing as naming countries you filtered out.
-  if (reportView.verbose && (count("no_rules") || count("no_country"))) {
+  // Each clause is now gated on ITS OWN count: explaining "no e-invoicing rules" under a
+  // zero invites the reader to apply it to the country they ARE looking at, which for KSA
+  // says the opposite of the truth.
+  if (reportView.verbose && count("no_rules")) {
     console.log(
       c.faint(
-        "\n  \"no e-invoicing rules\" is not a problem — those countries have no required\n" +
-          "  field set, so there is nothing for migrate to fall short of. \"no country\" is:\n" +
-          "  the country is what selects the validator, so nothing can be assessed."
+        `\n  "no e-invoicing rules" is not a problem — the ${count("no_rules")} provider(s)\n` +
+          "  counted there are in countries with no required-field set, so there is nothing\n" +
+          "  for migrate to fall short of."
+      )
+    );
+  }
+  if (reportView.verbose && count("no_country")) {
+    console.log(
+      c.faint(
+        '\n  "no country" is: the country selects the validator, so nothing can be assessed.'
       )
     );
   }
@@ -3761,6 +3911,30 @@ function printMigrateReadback(providerIds, before, after) {
 // claim PASSED from the database.
 const ADYEN_DB = "adyen_platform";
 
+// Markets with no Adyen KYC, where this whole gate is inapplicable rather than unmet.
+//
+// The gate resolves through adyen-platform. Where Fresha Pay does not run on adyen-platform
+// there is no KYC to gate on, and reporting it produced a table saying nothing: on the first
+// KSA production run, 279 rows of which 257 were the identical "pending_migrate" sentence.
+//
+// Verified in production 2026-08-12: SA holds no legal_entities rows at all, and the other
+// non-Adyen markets show the same shape at scale — AE 7,244 entities and ZA 16,552, both
+// with ZERO adyen_platform_legal_entity_id. Only SA is listed because only SA was asked
+// about; adding a code here is how you extend it, and the count it suppresses is stated
+// wherever other countries remain in the same report.
+const NO_KYC_COUNTRIES = new Set(["SA"]);
+
+function kycGateApplies(country) {
+  return !NO_KYC_COUNTRIES.has(String(country || "").toUpperCase());
+}
+
+// Which of the shown countries the gate was skipped for. Drives the qualifier line: the
+// section's counts describe the providers left, so an unstated exclusion would read as all
+// of them. Empty for a report that shows no such country — nothing to qualify.
+function kycExcludedCountries(rows) {
+  return [...new Set(rows.filter((r) => !kycGateApplies(r.country)).map((r) => r.country))].sort();
+}
+
 // providers.fresha_pay is enum %i[not_set enabled disabled] — see Provider model.
 const FRESHA_PAY = { 0: "not_set", 1: "enabled", 2: "disabled" };
 
@@ -4338,6 +4512,19 @@ function buildPreflightMarkdown(
     out.push("");
     out.push("## KYC / payments gate");
     out.push("");
+    // The gate covers fewer providers than the tables above. Stated for the same reason
+    // the report states it: a count describing a subset would read as the whole run.
+    const kycSkipped = kycExcludedCountries(
+      comparisons.map((cmp) => ({ country: cmp.countryCode }))
+    );
+    if (kycSkipped.length) {
+      out.push(
+        `> Excludes **${kycSkipped.map((x) => countryLabel(x)).join(", ")}** — no Adyen KYC ` +
+          "in that market, so the gate is inapplicable rather than unmet. Covers " +
+          `${kycRows.length} of ${comparisons.length} provider(s) below.`
+      );
+      out.push("");
+    }
     out.push(
       mdTable(
         ["Provider", "Payments", "KYC provider (adyen LE)", "Tier", "Gate", "Basis"],
@@ -4469,6 +4656,73 @@ function preflightMarkdownPath(opts, stem = "preflight") {
   return path.resolve(`${stem}-${opts.namespace}-${day}.md`);
 }
 
+// --- plugin status (report) ---------------------------------------------------
+//
+// What accounting_documents thinks of the plugin itself, as opposed to what the report's
+// State column says about the provider's data. The two are independent: a provider can be
+// `ready` to migrate while its plugin sits `failed`, and nothing in classifyProvider reads
+// these columns. Reported so that is visible rather than inferred.
+
+// Anything but `enabled` wants looking at. Marked rather than counted as a verdict —
+// deciding what a `paused` plugin means is the rollout's call, not this script's.
+function mdPluginState(value) {
+  if (!value) return "∅";
+  return value === "enabled" ? value : `⚠ **${value}**`;
+}
+
+// Same columns wherever a plugin is listed, so the per-provider block and the per-country
+// section read alike. `withProvider` prepends the provider id for the section, where rows
+// from different providers sit in one table.
+function pluginStatusTable(plugins, { withProvider = false } = {}) {
+  const headers = [
+    "Plugin",
+    "Type",
+    "Integrator",
+    "Integration",
+    "Plugin status",
+    "Third party",
+    "Linked legal entity",
+  ];
+  const row = (p) => [
+    p.id,
+    p.pluginType || "∅",
+    p.integrator || "∅",
+    p.integration ? `\`${p.integration}\`` : "∅",
+    mdPluginState(p.pluginStatus),
+    mdPluginState(p.thirdPartyStatus),
+    p.legalEntityId ? `\`${p.legalEntityId}\`` : "∅",
+  ];
+
+  return withProvider
+    ? mdTable(["Provider", ...headers], plugins.map((p) => [p.providerId, ...row(p)]))
+    : mdTable(headers, plugins.map(row));
+}
+
+// One provider's value for one status column, for the summary tables where a provider gets a
+// single row. A provider can hold several plugins, and they are joined rather than reduced to
+// a worst case: two plugins in different states is the fact the row should show, and picking
+// one would hide the other. `—` means no plugin row at all, which is not the same as a plugin
+// whose status is empty (`∅`).
+function pluginStateCell(plugins, key) {
+  if (!plugins || !plugins.length) return "—";
+  return plugins.map((p) => mdPluginState(p[key])).join(" · ");
+}
+
+// "261 enabled · 14 failed · 6 disabled" for one of the two status columns. Ordered by count
+// rather than by severity: the line is there to show the shape of the set, and the table
+// below names every row that is not enabled. Counted from the plugins on show, so a filtered
+// report never quotes a namespace-wide number.
+function pluginStateTally(plugins, key) {
+  const byState = {};
+  for (const p of plugins) byState[p[key] || "∅"] = (byState[p[key] || "∅"] || 0) + 1;
+  return (
+    Object.entries(byState)
+      .sort((a, b) => b[1] - a[1])
+      .map(([state, n]) => `${n} ${state}`)
+      .join(" · ") || "none"
+  );
+}
+
 // One provider's block: the same five columns whether or not a legal entity exists,
 // so every provider in the report reads the same way. For an un-migrated provider the
 // legal-entity column names the key migrate has to land the value in, and shows ∅ —
@@ -4504,6 +4758,12 @@ function providerDetail(r) {
         (r.linkedElsewhere ? `, ${r.linkedElsewhere} linked elsewhere` : "") +
         "."
     );
+    // Which entity the plugins point at is the question above; whether they are working
+    // is this one. Both, because a correctly linked plugin can still be failed.
+    if (r.plugins.length) {
+      out.push("");
+      out.push(pluginStatusTable(r.plugins));
+    }
     return out;
   }
 
@@ -4541,7 +4801,15 @@ function providerDetail(r) {
       "shown in their `organization` form.*"
   );
   out.push("");
-  out.push(`${r.plugins.length} plugin(s) already exist for this provider.`);
+  // The count alone said a plugin existed and nothing about whether it works. `link` will
+  // point one of these at the entity migrate creates, so its state matters before then.
+  if (r.plugins.length) {
+    out.push(`${r.plugins.length} plugin(s) already exist for this provider.`);
+    out.push("");
+    out.push(pluginStatusTable(r.plugins));
+  } else {
+    out.push("No plugin row exists for this provider yet.");
+  }
   return out;
 }
 
@@ -4595,9 +4863,18 @@ function buildReportMarkdown(opts, rows, tally, survey, scope, kycRows) {
             `${tally.no_billing} with no billing row, ${tally.not_linked} not linked, ` +
             `${tally.no_country} with no country`,
         ],
+        // A count of PROVIDERS in the no_rules state, never a statement about this report's
+        // country. Worded as "country has no required-field set" it read as "SA has no
+        // rules" on the first KSA run — the exact opposite of the truth, next to a 0. The
+        // label carries the subject now, and a single-country report whose country DOES have
+        // a required set says which country it is rather than explaining an empty state.
         [
-          "no e-invoicing rules",
-          `${tally.no_rules} — country has no required-field set, nothing to fall short of`,
+          "providers with no e-invoicing rules",
+          onlyCountry && requiredFieldsFor(onlyCountry)
+            ? `${tally.no_rules} — ${countryLabel(onlyCountry)} has a required-field set, so ` +
+              "every provider here is scored against it"
+            : `${tally.no_rules} — their country has no required-field set, so there is ` +
+              "nothing for them to fall short of",
         ],
       ]
     )
@@ -4743,10 +5020,20 @@ function buildReportMarkdown(opts, rows, tally, survey, scope, kycRows) {
     out.push(`## ${countryLabel(country)} — needs attention`);
     out.push("");
     if (attention.length) {
+      // The plugin columns sit before the note: the note is the widest thing in the row, so
+      // anything after it stops being scannable. They do not feed State — see the plugin
+      // status section — but reading a verdict without them meant opening another table.
       out.push(
         mdTable(
-          ["Provider", "Migrated?", "State", "What's wrong"],
-          attention.map((r) => [r.providerId, r.migrated ? "yes" : "no", `**${r.state}**`, r.note])
+          ["Provider", "Migrated?", "State", "Plugin", "Third party", "What's wrong"],
+          attention.map((r) => [
+            r.providerId,
+            r.migrated ? "yes" : "no",
+            `**${r.state}**`,
+            pluginStateCell(r.plugins, "pluginStatus"),
+            pluginStateCell(r.plugins, "thirdPartyStatus"),
+            r.note,
+          ])
         )
       );
     } else {
@@ -4757,14 +5044,67 @@ function buildReportMarkdown(opts, rows, tally, survey, scope, kycRows) {
     out.push(`## ${countryLabel(country)} — ready, and nothing required`);
     out.push("");
     if (ready.length) {
+      // Same columns as the attention table above. This is where they earn their place: a
+      // provider whose billing info is complete still reads `ready` with a failed plugin, and
+      // on the first production SA run 20 of them did.
       out.push(
         mdTable(
-          ["Provider", "Migrated?", "State", "Detail"],
-          ready.map((r) => [r.providerId, r.migrated ? "yes" : "no", `\`${r.state}\``, r.note])
+          ["Provider", "Migrated?", "State", "Plugin", "Third party", "Detail"],
+          ready.map((r) => [
+            r.providerId,
+            r.migrated ? "yes" : "no",
+            `\`${r.state}\``,
+            pluginStateCell(r.plugins, "pluginStatus"),
+            pluginStateCell(r.plugins, "thirdPartyStatus"),
+            r.note,
+          ])
         )
       );
     } else {
       out.push("None.");
+    }
+
+    // Plugin health, before the per-provider blocks: it is a property of the group that
+    // someone reads at a glance, and the blocks below are hundreds of tables long.
+    //
+    // One row per PLUGIN, not per provider — a provider can hold more than one and they can
+    // disagree, so a per-provider row would have to pick one and hide the other.
+    const groupPlugins = group.flatMap((r) =>
+      (r.plugins || []).map((p) => ({ ...p, providerId: r.providerId }))
+    );
+    const noPlugin = group.filter((r) => !(r.plugins || []).length);
+
+    out.push("");
+    out.push(`## ${countryLabel(country)} — plugin status`);
+    out.push("");
+    if (groupPlugins.length) {
+      out.push(
+        `**plugin:** ${pluginStateTally(groupPlugins, "pluginStatus")} · ` +
+          `**third party:** ${pluginStateTally(groupPlugins, "thirdPartyStatus")}`
+      );
+      out.push("");
+      out.push(pluginStatusTable(groupPlugins, { withProvider: true }));
+      // A provider with no plugin at all is a different fact from one whose plugin is in a
+      // bad state, so it is counted rather than given an empty row.
+      if (noPlugin.length) {
+        out.push("");
+        out.push(
+          `${noPlugin.length} provider(s) here have no plugin row at all — ` +
+            "nothing for `link` to point at yet."
+        );
+      }
+    } else {
+      out.push("No plugin rows exist for any provider here yet.");
+    }
+    if (reportView.verbose) {
+      out.push("");
+      out.push(
+        "`plugin status` is ours (`account_configuration_plugins.plugin_status`), `third " +
+          "party` is the integrator's (`third_party_integration_status`). Neither feeds the " +
+          "**State** column above: they say whether e-invoicing is working *today*, not " +
+          "whether `migrate` can build a usable legal entity, so a provider can be `ready` " +
+          "with a `failed` plugin."
+      );
     }
 
     out.push("");
@@ -4799,6 +5139,17 @@ function buildReportMarkdown(opts, rows, tally, survey, scope, kycRows) {
     out.push("");
     out.push("## KYC / payments gate");
     out.push("");
+    // Fewer providers than the report covers, so the exclusion travels with the counts.
+    // Not verbose-gated, for the same reason the filter callout above isn't.
+    const kycSkipped = kycExcludedCountries(rows);
+    if (kycSkipped.length) {
+      out.push(
+        `> Excludes **${kycSkipped.map((x) => countryLabel(x)).join(", ")}** — no Adyen KYC ` +
+          "in that market, so the gate does not apply there. " +
+          `${kycRows.length} of ${rows.length} provider(s) below.`
+      );
+      out.push("");
+    }
     out.push(
       mdTable(
         ["Provider", "Payments", "Legal entity?", "KYC provider (adyen LE)", "Gate", "Basis"],
@@ -4817,9 +5168,9 @@ function buildReportMarkdown(opts, rows, tally, survey, scope, kycRows) {
       out.push("");
       out.push(
         "`payments` is `providers.fresha_pay` and needs no legal entity, so it is reported " +
-          "for every provider. The KYC link is `legal_entities.adyen_platform_legal_entity_id`, " +
-          "which does — a provider with no entity yet gets `pending_migrate`, meaning the gate " +
-          "is undecidable rather than failed."
+          "for every provider the gate applies to. The KYC link is " +
+          "`legal_entities.adyen_platform_legal_entity_id`, which does — a provider with no " +
+          "entity yet gets `pending_migrate`, meaning the gate is undecidable rather than failed."
       );
       out.push("");
       out.push(
@@ -4853,21 +5204,52 @@ function buildReportMarkdown(opts, rows, tally, survey, scope, kycRows) {
 // One row per provider. `state` drives both the symbol and the exit code:
 // "ok" and "exempt" pass, "drift" fails.
 function auditProviders(providerIds, primaryByProvider, pluginsByProvider) {
-  return providerIds.map((providerId) => {
+  return providerIds.flatMap((providerId) => {
     const expected = primaryByProvider.get(providerId) || null;
     const plugins = pluginsByProvider.get(providerId) || [];
     const row = { providerId, expected, plugins };
 
+    // Multi-entity providers are judged per plugin, each against the entity mapped to
+    // it — see MULTI_ENTITY_PROVIDERS. This is the one case that yields more than one
+    // row for a provider, which is why the caller flattens: a single row cannot carry
+    // two expected values, and folding them into one would report the plugin holding
+    // the non-primary entity as drift, which is precisely the bug.
+    if (plugins.length && isMultiEntityProvider(providerId)) {
+      return plugins.map((plugin) => {
+        const want = entityForPlugin(providerId, plugin.id);
+        const base = { ...row, expected: want, plugin, multiEntity: true };
+
+        if (!want) {
+          return {
+            ...base,
+            state: "drift",
+            status: "not in the multi-entity mapping — cannot say what it should hold",
+          };
+        }
+        if (plugin.legalEntityId === want) {
+          return {
+            ...base,
+            state: "ok",
+            status: want === expected ? "linked correctly" : "linked correctly (non-primary entity)",
+          };
+        }
+        if (plugin.legalEntityId) {
+          return { ...base, state: "drift", status: "MISMATCH — holds a different legal entity" };
+        }
+        return { ...base, state: "drift", status: "not linked" };
+      });
+    }
+
     if (!expected) {
-      return { ...row, state: "exempt", status: "no primary legal entity — nothing to link" };
+      return [{ ...row, state: "exempt", status: "no primary legal entity — nothing to link" }];
     }
     if (!plugins.length) {
-      return { ...row, state: "exempt", status: "no plugins — no e-invoicing config" };
+      return [{ ...row, state: "exempt", status: "no plugins — no e-invoicing config" }];
     }
 
     const holder = plugins.find((p) => p.legalEntityId === expected);
     if (holder) {
-      return { ...row, state: "ok", plugin: holder, status: "linked correctly" };
+      return [{ ...row, state: "ok", plugin: holder, status: "linked correctly" }];
     }
 
     // Nothing holds the expected value. Distinguish "never linked" from "linked
@@ -4876,21 +5258,31 @@ function auditProviders(providerIds, primaryByProvider, pluginsByProvider) {
     const unlinked = plugins.filter((p) => !p.legalEntityId);
 
     if (wrong.length) {
-      return {
-        ...row,
-        state: "drift",
-        plugin: wrong[0],
-        status: "MISMATCH — holds a different legal entity",
-      };
+      return [
+        {
+          ...row,
+          state: "drift",
+          plugin: wrong[0],
+          status: "MISMATCH — holds a different legal entity",
+        },
+      ];
     }
     if (unlinked.length > 1) {
-      return { ...row, state: "drift", status: `not linked — ${unlinked.length} candidates` };
+      return [{ ...row, state: "drift", status: `not linked — ${unlinked.length} candidates` }];
     }
-    return { ...row, state: "drift", plugin: unlinked[0], status: "not linked" };
+    return [{ ...row, state: "drift", plugin: unlinked[0], status: "not linked" }];
   });
 }
 
 const AUDIT_SYMBOL = { ok: c.ok("✓"), exempt: c.faint("–"), drift: c.bad("✗") };
+
+// The audit is one row per provider EXCEPT for a multi-entity provider, which gets one per
+// plugin. Every count a human reads is therefore over distinct providers — "2 need
+// attention" must not mean one provider counted twice. A provider with an ok plugin and a
+// drifting one appears in both counts, which is the truth about it.
+function auditProviderCount(audit, state) {
+  return new Set(audit.filter((a) => a.state === state).map((a) => a.providerId)).size;
+}
 
 function printAudit(opts, audit) {
   const short = (uuid) => uuid || "∅";
@@ -4910,8 +5302,6 @@ function printAudit(opts, audit) {
     )
   );
 
-  const ok = audit.filter((a) => a.state === "ok");
-  const exempt = audit.filter((a) => a.state === "exempt");
   const drift = audit.filter((a) => a.state === "drift");
 
   console.log(
@@ -4920,9 +5310,9 @@ function printAudit(opts, audit) {
       `(${SHEDUL_DB}) for each provider. Both reads, no writes.`
   );
   console.log(
-    `\n  ✓ ${ok.length} linked correctly   ` +
-      `– ${exempt.length} exempt   ` +
-      `✗ ${drift.length} need attention`
+    `\n  ✓ ${auditProviderCount(audit, "ok")} linked correctly   ` +
+      `– ${auditProviderCount(audit, "exempt")} exempt   ` +
+      `✗ ${auditProviderCount(audit, "drift")} need attention`
   );
 
   if (drift.length) {
@@ -4938,14 +5328,16 @@ function printAudit(opts, audit) {
     }
     const fixable = drift.filter((a) => a.status === "not linked");
     if (fixable.length) {
+      const providers = [...new Set(fixable.map((a) => a.providerId))];
       console.log(
-        `\n  ${fixable.length} provider(s) simply not linked yet. To link them, re-run without\n` +
-          `  --verify and choose apply:  ${fixable.map((a) => a.providerId).join(",")}`
+        `\n  ${providers.length} provider(s) simply not linked yet. To link them, re-run without\n` +
+          `  --verify and choose apply:  ${providers.join(",")}`
       );
     }
   }
 
-  return drift.length;
+  // Providers, not rows: this is the number the FAIL line reports.
+  return auditProviderCount(audit, "drift");
 }
 
 // --- verification -----------------------------------------------------------
@@ -5996,6 +6388,7 @@ async function main() {
   // which is the right way round.
   if (!opts.namespaceGiven && input.isTTY) {
     opts.namespace = await askNamespace();
+    resolveService(opts);
   }
   const env = psqlEnv(opts.namespace);
 
@@ -6417,18 +6810,24 @@ async function main() {
     // them; only the KYC half depends on an entity existing. Reporting just the
     // migrated ones meant a pre-rollout run — the whole point of this mode — showed no
     // payments or KYC information at all.
+    //
+    // Countries with no Adyen KYC are dropped outright — see NO_KYC_COUNTRIES. Filtering
+    // here rather than at each printer is what makes the section disappear from the screen
+    // AND the export together: both already skip an empty list.
     const kycRowsFor = (shown) =>
-      shown.map((r) => {
-        const adyenLegalEntityId = r.migrated ? kycSync.get(r.primary) || null : null;
-        const row = {
-          providerId: r.providerId,
-          payments: payments.get(r.providerId) || "unknown",
-          adyenLegalEntityId,
-          adyen: adyenLegalEntityId ? adyenById.get(adyenLegalEntityId) || null : null,
-          hasLegalEntity: r.migrated,
-        };
-        return { ...row, verdict: kycVerdict(row) };
-      });
+      shown
+        .filter((r) => kycGateApplies(r.country))
+        .map((r) => {
+          const adyenLegalEntityId = r.migrated ? kycSync.get(r.primary) || null : null;
+          const row = {
+            providerId: r.providerId,
+            payments: payments.get(r.providerId) || "unknown",
+            adyenLegalEntityId,
+            adyen: adyenLegalEntityId ? adyenById.get(adyenLegalEntityId) || null : null,
+            hasLegalEntity: r.migrated,
+          };
+          return { ...row, verdict: kycVerdict(row) };
+        });
 
     // One country in the shown set means the report is about that country, and nothing
     // that speaks of another one gets printed. Recomputed per render because the refine
@@ -6499,6 +6898,19 @@ async function main() {
       if (kycRows.length) {
         if (detail) printKycStatus(kycRows, reportView.verbose);
         else printPaymentsKycSummary(kycRows);
+        // The gate covered fewer providers than the report does. Said even in a concise
+        // run: it qualifies a count, which is data, not prose. Where every shown country
+        // is a no-KYC one there is no table above to qualify — kycRows is empty and
+        // nothing printed at all.
+        const skipped = kycExcludedCountries(shown);
+        if (skipped.length) {
+          console.log(
+            c.faint(
+              `  Excludes ${skipped.map((x) => countryLabel(x)).join(", ")} — ` +
+                "no Adyen KYC in that market, so the gate does not apply."
+            )
+          );
+        }
       }
 
       const tally = printReportSummary(shown, survey, scope);
@@ -7018,33 +7430,88 @@ async function main() {
 
     // KYC / payments gate — a separate concern from field consistency, but the
     // other thing that decides whether a provider can onboard.
-    console.log(c.faint(`\nReading payments status from ${SHEDUL_DB} (read-only)…`));
-    const payments = fetchPaymentsEnabled(env, withLegalEntity);
+    //
+    // Markets with no Adyen KYC are dropped — see NO_KYC_COUNTRIES. The report filters
+    // inside kycRowsFor, because its refine loop can widen the country filter again
+    // without re-querying; pre-flight has no such loop, so here the exclusion happens
+    // BEFORE the reads and a provider the gate cannot apply to never has its payments
+    // row queried at all. A pre-flight over KSA alone therefore issues none of these
+    // three reads and prints no gate table — the same outcome the report already gives.
+    const gateIds = withLegalEntity.filter((id) => kycGateApplies(countries.get(id)));
+    const gateSkipped = kycExcludedCountries(
+      withLegalEntity.map((id) => ({ country: countries.get(id) }))
+    );
 
-    console.log(c.faint(`Reading KYC-provider links from ${LE_DB} (read-only)…`));
-    const kycSync = fetchKycSync(env, [
-      ...new Set(withLegalEntity.map((id) => primaryByProvider.get(id))),
-    ]);
+    let kycRows = [];
+    if (gateIds.length) {
+      console.log(c.faint(`\nReading payments status from ${SHEDUL_DB} (read-only)…`));
+      const payments = fetchPaymentsEnabled(env, gateIds);
 
-    const adyenIds = [...new Set([...kycSync.values()].filter(Boolean))];
-    let adyenById = new Map();
-    if (adyenIds.length) {
-      console.log(c.faint(`Reading verifications from ${ADYEN_DB} (read-only)…`));
-      adyenById = fetchAdyenVerifications(env, adyenIds);
+      console.log(c.faint(`Reading KYC-provider links from ${LE_DB} (read-only)…`));
+      const kycSync = fetchKycSync(env, [
+        ...new Set(gateIds.map((id) => primaryByProvider.get(id))),
+      ]);
+
+      const adyenIds = [...new Set([...kycSync.values()].filter(Boolean))];
+      let adyenById = new Map();
+      if (adyenIds.length) {
+        console.log(c.faint(`Reading verifications from ${ADYEN_DB} (read-only)…`));
+        adyenById = fetchAdyenVerifications(env, adyenIds);
+      }
+
+      kycRows = gateIds.map((id) => {
+        const adyenLegalEntityId = kycSync.get(primaryByProvider.get(id)) || null;
+        const row = {
+          providerId: id,
+          payments: payments.get(id) || "unknown",
+          adyenLegalEntityId,
+          adyen: adyenLegalEntityId ? adyenById.get(adyenLegalEntityId) || null : null,
+        };
+        return { ...row, verdict: kycVerdict(row) };
+      });
+
+      printKycStatus(kycRows);
+      // The gate covered fewer providers than the pre-flight did. Same reasoning as the
+      // report: it qualifies a count, so it is data, not prose, and is never suppressed.
+      if (gateSkipped.length) {
+        console.log(
+          c.faint(
+            `  Excludes ${gateSkipped.map((x) => countryLabel(x)).join(", ")} — ` +
+              "no Adyen KYC in that market, so the gate does not apply. Covers " +
+              `${kycRows.length} of ${withLegalEntity.length} provider(s) above.`
+          )
+        );
+      }
+    } else if (withLegalEntity.length) {
+      // Every provider compared is in a no-KYC market. The report prints nothing at all
+      // here — it is a survey, and an absent section reads as "not surveyed". Pre-flight
+      // ends in PASS/FAIL over providers you named, where silence about the gate would
+      // read as "the gate passed". One line, saying it never applied.
+      console.log(
+        c.faint(
+          "\nKYC / payments gate: not applicable — no Adyen KYC in " +
+            `${gateSkipped.map((x) => countryLabel(x)).join(", ")}, so there is nothing to gate on.`
+        )
+      );
     }
 
-    const kycRows = withLegalEntity.map((id) => {
-      const adyenLegalEntityId = kycSync.get(primaryByProvider.get(id)) || null;
-      const row = {
-        providerId: id,
-        payments: payments.get(id) || "unknown",
-        adyenLegalEntityId,
-        adyen: adyenLegalEntityId ? adyenById.get(adyenLegalEntityId) || null : null,
-      };
-      return { ...row, verdict: kycVerdict(row) };
-    });
-
-    printKycStatus(kycRows);
+    // A provider with more than one legal entity was compared against its PRIMARY only —
+    // the pointer names one entity and compareFields takes one entity. Said out loud so a
+    // PASS is not read as "both branches check out": the other entity backs a plugin of
+    // its own, and --plugins is the mode that compares each plugin against what it holds.
+    for (const providerId of withLegalEntity) {
+      const primary = primaryByProvider.get(providerId);
+      const others = unmappedByPrimary(providerId, primary);
+      if (!others.length) continue;
+      console.log(
+        c.warn(`\n  ⚠  provider=${providerId} has more than one legal entity.`) +
+          c.faint(
+            `\n     Compared against the primary only: ${primary}` +
+              `\n     NOT compared: ${others.join(", ")}` +
+              "\n     Run --plugins to check each plugin against the entity it points at."
+          )
+      );
+    }
 
     const failed = printPreflightVerdict(tally, missing);
 
@@ -7098,6 +7565,11 @@ async function main() {
         // answer is behind the adyen-platform RPC — do not treat it as decided.
         exact: r.verdict.exact,
       })),
+      // Countries the gate was not applied in, so a `kyc` array shorter than
+      // `providers` cannot be read as the whole set. Empty unless a NO_KYC_COUNTRIES
+      // market was in scope; where every provider is in one, `kyc` is [] and this
+      // names why.
+      kyc_excluded_countries: gateSkipped,
       skipped: missing.map(({ providerId, hasBilling }) => ({
         provider_id: providerId,
         reason: "no active primary legal entity",
@@ -7142,9 +7614,9 @@ async function main() {
     emitJson(opts, {
       verdict: verdictOf(drift),
       tally: {
-        ok: audit.filter((a) => a.state === "ok").length,
-        drift: audit.filter((a) => a.state === "drift").length,
-        exempt: audit.filter((a) => a.state === "exempt").length,
+        ok: auditProviderCount(audit, "ok"),
+        drift: auditProviderCount(audit, "drift"),
+        exempt: auditProviderCount(audit, "exempt"),
       },
       providers: audit.map((a) => ({
         provider_id: a.providerId,
@@ -7154,6 +7626,11 @@ async function main() {
         plugin_id: a.plugin ? Number(a.plugin.id) : null,
         expected_legal_entity_id: a.expected,
         actual_legal_entity_id: a.plugin ? a.plugin.legalEntityId || null : null,
+        // A provider with more than one legal entity appears once PER PLUGIN, each with
+        // its own expected value — see MULTI_ENTITY_PROVIDERS. Absent otherwise, so a
+        // consumer keying on provider_id alone can detect the case rather than
+        // silently overwrite one row with the other.
+        ...(a.multiEntity ? { multi_entity: true } : {}),
       })),
     });
     return;
@@ -7168,7 +7645,14 @@ async function main() {
     for (const u of updates) {
       console.log(
         `  provider=${u._providerId}  ${fmtPlugin(u._plugin)}\n` +
-          `      → legal_entity_id=${u.legal_entity_id}`
+          `      → legal_entity_id=${u.legal_entity_id}` +
+          // Otherwise this reads as the primary pointer resolved to the wrong entity.
+          (u._multiEntity
+            ? c.faint(
+                "\n        (provider has more than one legal entity — mapped per plugin from" +
+                  "\n         MULTI_ENTITY_PROVIDERS, not from the primary pointer)"
+              )
+            : "")
       );
     }
   }

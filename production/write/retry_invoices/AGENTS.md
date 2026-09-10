@@ -1,6 +1,20 @@
+---
+name: retry_invoices
+summary: "Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston"
+env: production
+access: write
+tier: prod-write
+lang: js
+aliases: [ri]
+examples:
+  - args: 123,456
+    note: tracker ids, comma-separated
+  - args: "--namespace eng-orion 123,456"
+    note: target another namespace
+  - args: "--dry-run 123,456"
+    note: plan only, no writes
+---
 # retry_invoices
-
-**Env: production (writes).** Re-drives stuck KSA e-invoices via Houston.
 
 Given a list of `e_invoice_tracker` IDs, it flips their status so they become
 retry-eligible, then force-retries sending the underlying accounting documents.
@@ -20,14 +34,6 @@ retry-eligible, then force-retries sending the underlying accounting documents.
 
 Step 2 runs first because the retry action only enqueues docs whose tracker is
 `upload_status = failed_to_send` OR `review_status = rejected`.
-
-## Run it
-
-```bash
-./retry_invoices.js 123,456                        # tracker ids (comma-separated)
-./retry_invoices.js --namespace eng-orion 123,456  # target another namespace
-./retry_invoices.js --dry-run 123,456              # plan only, no writes
-```
 
 ## Prereqs
 

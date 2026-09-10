@@ -1,3 +1,20 @@
+---
+name: deregister_suppliers
+summary: Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace
+env: staging
+access: write
+tier: sandbox
+lang: exs
+aliases: [ds]
+examples:
+  - args: "--dry-run"
+    note: walk the whole flow, POST nothing
+  - args: ""
+    note: "real run: type the workspace slug, pick the workflow, final yes"
+  - args: "--latest-only --wait 30"
+    note: one job per supplier, block up to 30 s each
+env_vars: [INVOPOP_SANDBOX_API_TOKEN, INVOPOP_SANDBOX_API_BASE_URL, INVOPOP_DEREGISTER_WORKFLOW_ES_VERIFACTU, INVOPOP_DEREGISTER_WORKFLOW_ES_TICKETBAI, INVOPOP_DEREGISTER_WORKFLOW_IT_SMARTRECEIPTS]
+---
 # deregister_suppliers
 
 Triggers the Invopop **supplier-deregistration** workflow for every supplier in a
@@ -20,20 +37,6 @@ token points at a **sandbox** workspace. The script **refuses to run unless
 
 - `elixir` (already pinned via `../.tool-versions`; deps are auto-installed by `Mix.install`).
 - An Invopop API token for a **sandbox** workspace.
-
-## Run it
-
-```bash
-cd scripts/deregister_suppliers
-
-# 1. Dry run first — walks the whole flow but POSTs nothing:
-INVOPOP_SANDBOX_API_TOKEN=<staging-token> ./deregister_suppliers.exs --dry-run
-
-# 2. Real run — same flow + a final "yes" gate before firing:
-INVOPOP_SANDBOX_API_TOKEN=<staging-token> ./deregister_suppliers.exs
-```
-
-No token set? It prompts you to paste one. Or `export INVOPOP_SANDBOX_API_TOKEN=...` once for the session.
 
 ## Interactive prompts
 

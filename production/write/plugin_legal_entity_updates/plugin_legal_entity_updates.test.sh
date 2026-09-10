@@ -261,7 +261,11 @@ case "$sql" in
   *FROM\ providers*)          # fetchPaymentsEnabled: 0 not_set, 1 enabled, 2 disabled
     echo "71|1"; echo "72|0"; echo "90|2"; echo "91|0"; echo "92|1"
     echo "101|1"; echo "102|0" ;;
-  *account_configuration_plugins*)             echo "33|9001|e_invoicing|comarch|active|019f-aaa" ;;
+  # Eight fields, in fetchPlugins' column order: provider, plugin, type, integrator,
+  # plugin_status, legal_entity_id, integration, third_party_integration_status. Short rows
+  # are dropped by parseRowsLoose, so a stale stub silently means "this provider has no
+  # plugins" — which is how this one sat through the integration column being added.
+  *account_configuration_plugins*)             echo "33|9001|einvoicing|comarch|failed|019f-aaa|zatca|revoked" ;;
   *adyen_platform_legal_entity_id*)            : ;;
   *jsonb_array_elements*)
     for k in "organization.legalName=My business" \
@@ -390,8 +394,16 @@ run3 --report --yes >/dev/null
 match3 '(Payments / KYC|KYC / payments) gate' \
   && ok "the payments/KYC gate is reported pre-rollout" \
   || bad "the payments/KYC gate is reported pre-rollout"
-match3 '71 +enabled' && ok "…with payments status for un-migrated providers" \
+# 92, not 71: 71 is SA, and SA has no Adyen KYC, so the gate excludes it entirely (see
+# NO_KYC_COUNTRIES). 92 is the un-migrated ES provider with payments enabled.
+match3 '92 +enabled' && ok "…with payments status for un-migrated providers" \
   || bad "…with payments status for un-migrated providers"
+# The suppression is per country, not global: SA is dropped, the rest of the report is not,
+# and the count that shrank says so rather than reading as every provider shown.
+match3 '71 +enabled' && bad "SA must not appear in the KYC gate" \
+  || ok "SA is excluded from the KYC gate"
+match3 'no Adyen KYC in that market' && ok "…and the exclusion is stated, not silent" \
+  || bad "…and the exclusion is stated, not silent"
 # KYC genuinely does need an entity, so it must say undecidable rather than "failed".
 match3 'pending migrate' && ok "…and KYC is 'pending migrate', not a failure" \
   || bad "…and KYC is 'pending migrate', not a failure"
@@ -634,12 +646,16 @@ node -e '
   if (d.tally.ready !== 2) fail(`tally.ready ${d.tally.ready}, want 2 (GB must not count)`);
   if (d.tally.entity_type_unclear !== 1) fail("the ES sole trader is not tallied");
   if (d.tally.blocked !== 2) fail(`tally.blocked ${d.tally.blocked}, want 2 (92 must not count)`);
-  // Payments for everyone; KYC only where an entity exists.
-  if (d.kyc.length !== 8) fail(`kyc rows ${d.kyc.length}, want one per provider`);
-  const k71 = d.kyc.find((k) => k.provider_id === "71");
-  if (k71.payments !== "enabled") fail("71 payments not read");
-  if (k71.has_legal_entity !== false) fail("71 should have no legal entity");
-  if (k71.gate !== "pending_migrate") fail(`71 gate ${k71.gate}, want pending_migrate`);
+  // Payments for everyone in a market the gate applies to; KYC only where an entity
+  // exists. 5 of the 8, because 33/71/72 are SA and SA has no Adyen KYC at all.
+  if (d.kyc.length !== 5) fail(`kyc rows ${d.kyc.length}, want 5 (SA excluded)`);
+  if (d.kyc.some((k) => ["33", "71", "72"].includes(k.provider_id))) {
+    fail("SA providers must not be gated");
+  }
+  const k92 = d.kyc.find((k) => k.provider_id === "92");
+  if (k92.payments !== "enabled") fail("92 payments not read");
+  if (k92.has_legal_entity !== false) fail("92 should have no legal entity");
+  if (k92.gate !== "pending_migrate") fail(`92 gate ${k92.gate}, want pending_migrate`);
   if (d.scope.by_country.GB !== 1) fail("GB missing from scope.by_country");
   if (d.scope.by_country.IT !== 2) fail("IT missing from scope.by_country");
   if (d.scope.account_configurations_without_provider_id !== 1) fail("NULL provider_id not counted");

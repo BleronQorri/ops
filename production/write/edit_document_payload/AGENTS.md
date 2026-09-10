@@ -1,6 +1,13 @@
+---
+name: edit_document_payload
+summary: "Runbook: hand-edit an accounting document's payload_base64 on a pod and re-drive the send"
+env: production
+access: write
+tier: prod-write
+status: runbook
+related: [fix_invoice_payloads, b2b_credit_notes]
+---
 # edit_document_payload
-
-**Env: production (writes). Manual runbook — there is no script in this directory.**
 
 How to edit an accounting document's stored `payload_base64` and re-drive the
 send. Written against the worked example of document **4687595** (Italy / Invopop

@@ -1,3 +1,21 @@
+---
+name: plugin_legal_entity_updates
+summary: "Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight"
+env: production
+access: write
+tier: prod-write-no-dry-run
+lang: js
+aliases: [ple]
+examples:
+  - args: ""
+    note: "interactive; guided mode walks the whole procedure"
+  - args: "--preflight --all --json --yes"
+    note: read-only, no terminal needed
+  - args: "--postflight --all --json --yes | jq .verdict"
+  - args: "--link --dry-run 33"
+    note: rehearse linking provider 33
+reports: ["preflight-*.md", "rollout-report-*.md"]
+---
 # plugin_legal_entity_updates
 
 Link providers' e-invoicing plugins to their **primary legal entity**, by driving
@@ -442,11 +460,43 @@ sole traders in exactly this shape. Conflating them with genuinely missing field
 the problem by 60 providers, which is why the distinction is load-bearing and must not
 regress even as the population approaches zero.
 
-### Payments and KYC are reported for every provider
+### Payments and KYC are reported for every provider the gate applies to
 
 `providers.fresha_pay` is keyed on `provider_id` and needs **no** legal entity, so
 payments status is knowable for every provider in the report. The KYC link
 (`legal_entities.adyen_platform_legal_entity_id`) lives on the entity and is not.
+
+**Except where there is no KYC at all.** `NO_KYC_COUNTRIES` in the script lists the
+markets where Fresha Pay does not run on adyen-platform, so the gate is *inapplicable*
+rather than unmet — SA today. In the report those providers are filtered out in
+`kycRowsFor`: both the screen printers and the Markdown builder already skip an empty row
+list, so one filter removes the section from both. A report narrowed to SA therefore prints
+nothing about KYC anywhere. Verified in production 2026-08-12: SA holds no `legal_entities`
+rows at all, and AE (7,244 entities) and ZA (16,552) have zero
+`adyen_platform_legal_entity_id` between them. Reporting it anyway produced 279 rows of
+which 257 were the identical `pending_migrate` sentence.
+
+**Pre-flight applies the same exemption**, and applies it *earlier*. The report filters at
+render time because its refine loop can widen the country filter again without re-querying;
+pre-flight has no such loop, so `kycGateApplies` picks the provider set **before** the three
+reads and a provider the gate cannot apply to never has its `fresha_pay` row queried at all.
+A pre-flight over KSA issues none of those reads. Where it would otherwise print an empty
+section it prints one line instead —
+
+```
+KYC / payments gate: not applicable — no Adyen KYC in KSA (SA), so there is nothing to gate on.
+```
+
+— which is the one place pre-flight and the report deliberately differ. The report is a
+survey, where an absent section reads as "not surveyed"; pre-flight ends in PASS/FAIL over
+providers you named, where silence about the gate would read as "the gate passed". Mixed
+country sets keep the table and gain the same `Excludes …` qualifier the report carries,
+naming how many of the compared providers it covered.
+
+Where other countries remain in the same report the gate still prints, and carries a
+qualifier naming what it excluded and how many providers it covers — a count that quietly
+described a subset would read as the whole report. That line is **not** `--full`-gated: it
+qualifies a number, so it is data, not prose.
 
 So the gate splits:
 
@@ -735,6 +785,36 @@ building number   yes   9876   organization.registeredAddress.buildingNumber = �
 
 Keys that vary by entity type are shown in their `organization` form, since the type
 isn't decided until `migrate` runs. The table footnote says so.
+
+### Plugin status is reported, and decides nothing
+
+The export carries a `— plugin status` section per country, between the ready table and the
+per-provider blocks, plus the same table inside each provider's block. Columns:
+`plugin_status` (ours) and `third_party_integration_status` (the integrator's — comarch,
+invopop), alongside type, integrator, integration and the linked entity. Both come off
+`account_configuration_plugins`, which `fetchPlugins` was already reading.
+
+Both statuses also appear as columns in the **needs attention** and **ready** tables, before
+the note — the note is the widest cell, so anything after it stops being scannable. That is
+where they matter most: a provider with complete billing info reads `ready` even when its
+plugin is `failed`, and 20 of the first SA run's 279 were in that shape. A provider holding
+several plugins gets their states joined (`disabled · paused`) rather than reduced to a worst
+case, since picking one would hide the other; `—` means no plugin row exists at all, which is
+not the same as a plugin whose status is empty (`∅`).
+
+**Neither feeds the State column.** `classifyProvider` does not look at them, on purpose:
+they say whether e-invoicing works *today*, while the report's states say whether `migrate`
+can build a usable legal entity. A provider can be `ready` with a `failed` plugin, and the
+first production SA run had 20 of 279 in exactly that shape while every one of them read
+`ready`. Folding plugin health into the state would have moved the headline counts and made
+two runs incomparable; marking it leaves the numbers alone.
+
+One row per **plugin row**, not per provider — the same reason the plugin audit does it that
+way. Anything other than `enabled` is marked `⚠ **state**`; a provider holding no plugin at
+all is counted in a trailing line rather than given an empty row, because "no plugin yet" and
+"plugin in a bad state" are different problems. The tally line above the table is computed
+from the plugins on show, so a filtered report never quotes a namespace-wide number. The
+paragraph explaining the two columns is prose, so `--full` only.
 
 Default filename: `rollout-report-<namespace>-<YYYY-MM-DD>.md`.
 
@@ -1403,6 +1483,11 @@ houston task run accounting-documents --namespace eng-orion \
     -p DRY_RUN="true"
 ```
 
+On **production** the service is `accounting-documents-web` — the app is split
+into web and worker components there and only the web one carries the plain name.
+Every other namespace runs it undivided as `accounting-documents`. The script
+picks the right one from the namespace; `-s` overrides it.
+
 When the script runs it itself, it appends `--no-tui -w` so the task's logs
 stream into your terminal; the full argv is echoed before the spawn.
 
@@ -1491,6 +1576,53 @@ mode (pass a mode flag) and the provider set (pass IDs, `--all`, or `--file`).
 `--json` repeats the code in `exit`, so a caller reading the document never has to
 also inspect `$?`.
 
+### Providers with more than one legal entity
+
+`provider_purchases_primary_legal_entities` has a partial unique index on `provider_id
+WHERE valid_to IS NULL`, so a provider has **at most one** active primary. A provider with
+two legal entities therefore cannot be described by that pointer, and every mode that
+reasons from it alone gets that provider wrong:
+
+| Mode | What it did | Why it was wrong |
+|---|---|---|
+| link | skipped it — "2 unlinked plugins — ambiguous, pick one by hand" | there is no ambiguity; each plugin has its own entity |
+| post-flight | one row, one expected value — the second plugin read as drift | the second plugin is *supposed* to hold a different entity |
+| pre-flight | compared billing info against the primary | one billing row, two branches: 8 of 10 fields "differ" |
+
+`MULTI_ENTITY_PROVIDERS` is the exemption: provider → plugin → legal entity, hand-verified,
+never inferred. A provider absent from it keeps the refuse-to-guess behaviour, which is the
+right default for an ambiguity nobody has looked at yet.
+
+**Provider 1135636 (KSA)** is the first entry. Verified in production 2026-08-24 by joining
+`accounting_documents.company_registration_number` per plugin to each entity's
+`organization.registrationNumber` — the branch each plugin has actually been invoicing as,
+which is the only evidence that distinguishes them:
+
+| Plugin | Created | CRN in its documents | → entity |
+|---|---|---|---|
+| 12 | 2025-07-28 | 1010291884 until 2026-05-04, then 1010403997 (1,424 docs) | `01a03382-5190-…` "Supernova Salon Olaya" |
+| 402 | 2026-05-05 | 1010880577 throughout (866 docs) | `01a03382-5166-…` "Supernova Salon Murooj" ← primary |
+
+Both entities came out of the same migrate run (11:22:53) and share one VAT number,
+`300474119700003`, with different registration numbers: two branches of one taxpayer, not a
+duplicate to clean up. CRN 1010291884 is the pre-split number, has no legal entity, and
+nothing links to it. To add a provider, run those two queries and record what they say.
+
+Consequences to keep in mind:
+
+- **The audit is one row per provider except here**, where it is one per plugin — a single
+  row cannot carry two expected values. `auditProviders` therefore `flatMap`s, and every
+  count a human reads (`auditProviderCount`) is over **distinct providers**, so one
+  provider is never counted twice. A provider with one correct plugin and one drifting one
+  appears in both counts, which is the truth about it.
+- **Link resolves per plugin** and annotates each line, because an entity that is not the
+  provider's primary otherwise reads as the pointer having resolved wrongly.
+- **Pre-flight still compares the primary only** — `compareFields` takes one entity — but
+  now says which entity it left out and points at `--plugins`. For 1135636 that means it
+  FAILs by construction: the billing row describes Olaya (reg 1010403997) and the primary
+  is Murooj (reg 1010880577), so 8 fields "differ" without anything being wrong. Read the
+  `--plugins` audit for that provider instead.
+
 ### The JSON document
 
 One object on stdout per run. Common envelope: `schema_version`, `mode`,
@@ -1507,6 +1639,17 @@ a check against a real entity. `scope` records everything the country filter
 excluded. Pre-flight also carries `kyc`, where
 `exact: false` means the database cannot settle the answer and the
 adyen-platform RPC is authoritative — do not read it as decided.
+
+Pre-flight's `kyc` array covers only the providers the gate applies to, so it carries
+`kyc_excluded_countries` alongside — the `NO_KYC_COUNTRIES` markets in scope. It is `[]`
+for an ordinary run; where every provider is in such a market, `kyc` is `[]` and this names
+why, so a short array is never read as the whole provider set.
+
+Post-flight's `providers[]` is one entry per provider, **except** for a provider in
+`MULTI_ENTITY_PROVIDERS`, which appears once per plugin — each with its own
+`expected_legal_entity_id` and `multi_entity: true`. The flag is absent otherwise, so a
+consumer keying on `provider_id` alone can detect the case instead of silently overwriting
+one row with the other. `tally` counts distinct providers, matching the screen.
 
 Pre-flight's `skipped[]` holds the providers it could not check, each with
 `reason` and `has_billing_details` — the flag that separates "run `migrate`" from

@@ -1,7 +1,25 @@
+---
+name: invopop_supplier_check
+summary: List Invopop supplier silo entries and flag the ones stuck in error or void states
+env: production
+access: read-only
+tier: read-only
+lang: exs
+aliases: [isc]
+help_flag: false
+examples:
+  - args: ""
+    note: list + classify every supplier entry
+  - args: "--problems"
+    note: only entries in a problem state
+  - args: "--report"
+    note: also write a Markdown report and a CSV
+  - args: "--debug"
+    note: verbose
+env_vars: [INVOPOP_API_TOKEN, INVOPOP_API_BASE_URL]
+reports: ["invopop_report_*.md", "invopop_entries_*.csv"]
+---
 # invopop_supplier_check
-
-**Env: production (read-only).** Lists Invopop "suppliers" silo entries and
-diagnoses ones stuck in problem states.
 
 ## What it does
 
@@ -15,18 +33,6 @@ diagnoses ones stuck in problem states.
 
 The Bearer token (`INVOPOP_API_TOKEN`, else paste prompt) selects the
 workspace/integration (ES, IT, …) being queried.
-
-## Run it
-
-```bash
-./invopop_supplier_check.exs                 # list + classify all supplier entries
-./invopop_supplier_check.exs --problems      # only entries in problem states
-./invopop_supplier_check.exs --report        # generate a report file
-./invopop_supplier_check.exs --debug         # verbose
-```
-
-Optional provider cross-reference uses `houston psql accounting-documents`
-(read-only).
 
 ## Prereqs
 

@@ -1,3 +1,19 @@
+---
+name: clear_provider_einvoicing
+summary: Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction
+env: staging
+access: write
+tier: staging-destructive
+lang: js
+aliases: [cpe]
+examples:
+  - args: 646845
+    note: preview the counts, type the id back, then yes
+  - args: "--dry-run 646845"
+    note: preview + print the SQL, write nothing
+  - args: "-n eng-pierogi 646845"
+    note: "another staging namespace; production is refused"
+---
 # clear_provider_einvoicing
 
 Wipe **all of a provider's e-invoicing data** in the `accounting_documents` DB,
@@ -41,15 +57,6 @@ account_configurations                      (by provider_id)
 - The **`invoicing/` domain** (`invoice_parties` / `invoices` / `invoicing_periods`
   — Fresha periodic billing, keyed by `legal_entity_id`). Not touched.
 - Rows keyed **only by `invoice_entity_id`** (this matches by `provider_id`).
-
-## Usage
-
-```sh
-./clear_provider_einvoicing.js <provider_id>
-#   -n, --namespace NAME   staging namespace (default: eng-orion); prod refused
-#   --dry-run              preview + print the SQL, write nothing
-#   -h, --help             help
-```
 
 ## Safety
 

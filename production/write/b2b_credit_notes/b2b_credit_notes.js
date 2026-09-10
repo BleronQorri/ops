@@ -21,39 +21,151 @@
 // is an adjustment, not a reversal of that month's fees). 37 of 295 production credit
 // notes exceed every invoice in their own period.
 //
-// Pipeline (mode "matrix"):
-//   1. accounting_documents — confirm every supplied id really is a B2B credit
-//      note, and read its ZATCA tracker status.
-//   2. shedul — resolve each credit note via einvoice_reference to get the provider,
-//      the billing period and the credit note's VALUE. THE PROVIDER MUST COME FROM
-//      HERE: accounting_documents.provider_id is NULL for these rows.
-//   3. shedul — every E-INVOICED invoice of those providers, in ANY billing period.
-//   4. accounting_documents — the matched invoices' ZATCA tracker status.
-//   5. Match in Node (cross-database joins are impossible) and print the matrix.
+// ============================================================================
+// THE LOGIC, QUERY BY QUERY
 //
-// MATCHING. Candidates are the provider's e-invoiced invoices — `einvoice_reference IS
-// NOT NULL`, so only documents ZATCA has actually seen. Among those the hard constraint
-// is the amount and nothing else: the invoice's total must be at least the credit note's
-// value, regardless of billing period. The period only ranks the survivors — the credit
-// note's own month first, then invoices created at or before it (one that did not yet
-// exist cannot be the one credited), most recent first. Statuses play no part; they are
-// reported, never matched on.
+// Four queries, then the match in Node (a cross-database join is impossible). Each
+// query supplies one piece of the reconstruction, and each carries at least one
+// decision that is not the obvious one. What follows is those decisions and why they
+// went the way they did.
 //
-// The credit note's value is the SUM OF ITS LINE ITEMS, not provider_invoices.total.
-// That column is unusable on credit notes: on 280 of 295 production rows it does not
-// equal its own items — it carries the invoice's total — so comparing against it would
-// compare an invoice's total with a copy of itself. Invoice totals are self-consistent
-// on all 12 893 e-invoiced rows and are used as stored.
+// The SQL is not repeated here — every statement is echoed as it runs and written
+// into the outputs (see "SQL executed" in the Markdown report, and the .sql file
+// beside the decode CSV). ./cross-check.sql annotates the same five, and expresses
+// the ranking below as a row_number() window.
 //
-// A credit note larger than every e-invoiced invoice the provider has comes back
-// UNMATCHED (7 of 295 on production), with the largest invoice available printed beside
-// it. That line is the whole explanation for the verdict, so it is not optional.
+// ---------------------------------------------------------------------------
+// 1. accounting_documents — fetchSuppliedDocs(). Is the input the right kind of
+//    thing, and what is its cross-database key?
+//
+//    You supply accounting_documents.id values. Two things must come out: proof
+//    each is a B2B credit note, and einvoice_reference, which is the ONLY key that
+//    reaches shedul.
+//
+//    The validation is two conditions and needs both. `document_type =
+//    'credit_note'` alone is not enough — a B2C sale refund is also a credit note,
+//    but it has a sale_id and no partner-billing counterpart, so shedul has nothing
+//    to resolve it to. `einvoice_reference IS NOT NULL` is what separates partner
+//    billing from sale refunds.
+//
+// ---------------------------------------------------------------------------
+// 2. shedul — fetchShedulCreditNotes(). The provider, the period, and the credit
+//    note's true value.
+//
+//    THE PROVIDER MUST COME FROM HERE. accounting_documents.provider_id is NULL on
+//    B2B billing documents. Take it from query 1 and the candidate pool is empty.
+//    Not a preference — the only source.
+//
+//    THE VALUE IS sum(provider_invoice_items.fee), NOT provider_invoices.total, and
+//    this is the most important line in the file. `total` is wrong on 280 of 295
+//    production credit notes: it carries the CO-CREATED INVOICE's total. So a match
+//    that compared credit_note.total against invoice.total would be comparing an
+//    invoice's total with a copy of itself — every match would look right and the
+//    whole exercise would be circular, passing by construction.
+//
+//    Worked example, CN/1006: stored total 1224042, items sum -81606. 12240.42 is
+//    exactly INV/16204's total.
+//
+// ---------------------------------------------------------------------------
+// 3. shedul — fetchProviderInvoices(). The candidate pool. Three decisions, three
+//    ways to be wrong.
+//
+//    NO BILLING-PERIOD FILTER. The obvious query restricts to the credit note's own
+//    month and is wrong: 37 of 295 credit notes are worth more than every invoice
+//    in their own period, because handle_invoice_and_credit_note splits by SIGN and
+//    a `credit` item is an adjustment rather than a reversal of that month's fees —
+//    nothing constrains the negatives to be smaller than the positives. CN/1044 is
+//    2000.00 against an own-month invoice of 1165.13. Filter by period and those 37
+//    come back unmatched.
+//
+//    einvoice_reference IS NOT NULL. Without it the pool gains the 1.8M pre-rollout
+//    invoices and the 1.25M not_applicable non-KSA ones. Those are NOT failed
+//    emissions — the check for "an e-invoicing provider's invoice, after the cutoff,
+//    missing a reference" returns 0 — but pointing a ZATCA credit note at a document
+//    ZATCA has never seen is not a useful answer. Costs 2 matches of 295.
+//
+//    NO einvoice_status FILTER, and this is the one people reach for. An earlier
+//    version dropped `rejected`/`refunded` candidates and it was wrong: invoices and
+//    their credit notes are created in the SAME TRANSACTION, 23-24 ms apart, and for
+//    43 of 63 then-ambiguous credit notes the co-created invoice was the `refunded`
+//    one — precisely the row the status rule discarded.
+//
+// ---------------------------------------------------------------------------
+// 4. THE MATCH — pickInvoice(), in Node. Three hard constraints, then a ranking:
+//
+//      ELIGIBLE  1. einvoice_reference IS NOT NULL  (applied in query 3)
+//                2. billing_end <= credit note's billing_end
+//                3. total >= credit note value
+//      RANK      closest first, going backwards: latest billing period, then latest
+//                created_at within it, then highest id
+//
+//    (2) IS THE BILLING PERIOD, NOT created_at. Not interchangeable: a February
+//    invoice is written on 2026-03-02, after February has ended, and its credit note
+//    35 ms later in the same transaction. `created_at < billingStart` is therefore
+//    false for EVERY own-period invoice and would discard the common case outright.
+//    The period is the key; the timestamps only break ties within one.
+//
+//    A LATER invoice is INELIGIBLE, not a last resort — a document that did not exist
+//    cannot be the one credited. A credit note whose only large-enough invoice is
+//    later comes back UNMATCHED rather than citing it.
+//
+//    No separate "own period first" key is needed: with (2) in force the own period
+//    has the greatest billing_end of any eligible invoice, so it sorts first by
+//    construction.
+//
+//    (3) compares invoice.total AS STORED against the credit note's magnitude, so the
+//    194 production invoices with negative totals never qualify. Intended. Both sides
+//    are GROSS — `total` = subtotal + tax, and the credit note sums `fee`, which is
+//    itself gross with `fee_tax` inside it.
+//
+//    There is deliberately NO AMBIGUOUS verdict: the ranking is a total order, so it
+//    always resolves to one invoice or to none. UNMATCHED prints the largest ELIGIBLE
+//    invoice beside it, plus the eligible and total counts — "none eligible" and "none
+//    big enough" are different problems.
+//
+// ---------------------------------------------------------------------------
+// 5. accounting_documents — fetchInvoiceTrackers(). The matched invoice's own
+//    reference and ZATCA status.
+//
+//    receipt_number is read HERE rather than taken from shedul's invoice_reference
+//    because it is the value a credit note's previous_receipt_number must carry, and
+//    that field is consumed by the e-invoicing side. Both agree on all 34 — but
+//    "they agree" is a fact about today's data, not a guarantee, and a divergence
+//    would yield a valid-looking document citing an invoice number the tax authority
+//    cannot resolve. A mismatch is reported, never assumed away.
+//
+// ---------------------------------------------------------------------------
+// WHAT THE CHECKS DO AND DO NOT PROVE
+//
+//   SQL row_number()  34/34   transcription and ordering bugs in either
+//                             implementation. NOT the rule — both encode the same one.
+//   co-creation       29/34   whether the rule agrees with the code that created the
+//                             rows. Unavailable for the 5 that differ, which is
+//                             exactly where the answer is least obvious.
+//   payload asserts   34/34   that the bytes are sound. NOT that the reference is right.
+//   ZATCA's verdict           everything. The only one that settles it.
+//
+// THE HONEST WEAK POINT: the amount rule and the ranking are inferences chosen
+// against production data, not consequences of a schema relationship. Nothing here
+// can prove them. The strongest evidence is co-creation agreeing on 29 of 34 with
+// all 5 divergences explained by the same documented mechanism.
+//
+// THE THINNEST RESULT IN THE COHORT is CN/1098: worth 278.00, its provider has no
+// invoice at all in the credit note's month, and the nearest is 277.18 — short by
+// 0.82. The match lands three months back on INV/18891. The rule working as
+// specified, and the row to check by hand before writing anything.
+// ============================================================================
+//
+// The other mode, `decode`, answers a different question — what is actually inside a
+// document's payload_base64 — and lives in ./decode_payloads.js, which is a standalone
+// executable this file requires. See its header; the short version is that payload_base64
+// is an Erlang term, so reading one needs a BEAM, and a pod is where the nearest one is.
 //
 // SAFETY
-//   - Lives under write/ because a mutating mode is planned. The only mode that
-//     exists today, `matrix`, is READ-ONLY: SELECTs only, in both databases, and
-//     there is no `houston psql --write` anywhere in this file. The one thing it
-//     writes is the Markdown report, in the working directory.
+//   - Lives under write/ because a mutating mode is planned. Both modes that exist
+//     today, `matrix` and `decode`, are READ-ONLY: SELECTs only, and there is no
+//     `houston psql --write` anywhere in either file. The only things they write are
+//     the Markdown report and the CSVs, in the working directory.
 //   - READ_ONLY_MODES governs that. Any mode not listed there refuses to run
 //     without a TTY, in every namespace — so adding a write mode gates it by
 //     default instead of by remembering to.
@@ -80,6 +192,12 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
+// The `decode` mode lives in its own file: it decodes Erlang terms on a pod and shares
+// nothing with the matching logic here beyond the psql idiom. It is a standalone
+// executable in its own right — this requires it rather than re-implementing it, so
+// `--mode decode` and `./decode_payloads.js` run exactly the same code.
+const decodePayloads = require("./decode_payloads");
+
 // --- constants ---------------------------------------------------------------
 
 // provider_invoices (the billing documents themselves) is owned by shedul; the
@@ -97,9 +215,9 @@ const CHUNK = 500;
 // Modes that cannot mutate anything, and so may run without a terminal — piping
 // answers in is how you re-run a check reproducibly. Every other mode refuses
 // without a TTY, in every namespace: a piped "yes" is not explicit approval for a
-// write. `matrix` is the only mode today; this lives here so that adding a write
+// write. Both modes today are read-only; this lives here so that adding a write
 // mode gates it by default rather than by remembering to.
-const READ_ONLY_MODES = new Set(["matrix"]);
+const READ_ONLY_MODES = new Set(["matrix", "decode"]);
 
 function writesAnything(mode) {
   return !READ_ONLY_MODES.has(mode);
@@ -108,7 +226,7 @@ function writesAnything(mode) {
 const EXIT_DATA = 1; // something in the data is wrong or unresolved
 const EXIT_USAGE = 2; // the call was wrong, or approval was refused
 
-const MODES = ["matrix"];
+const MODES = ["matrix", "decode"];
 
 class UsageError extends Error {
   constructor(message) {
@@ -130,15 +248,25 @@ function usage() {
 Usage:
   ./b2b_credit_notes.js [options]
 
+Modes:
+  matrix   credit note -> the invoice it credits (default)
+  decode   dump each document's decoded payload_base64 to CSV — see decode_payloads.js,
+           which this mode calls and which also runs on its own
+
 Options:
-  -n, --namespace <ns>   deploy namespace (default ${DEFAULT_NAMESPACE})
-      --ids <list>       accounting_documents.id values, comma or space separated
-      --mode <mode>      ${MODES.join(" | ")} (default ${MODES[0]})
-      --csv              also write the CSV, without asking
-      --no-csv           never write the CSV, without asking
-  -y, --yes              approve the database reads without prompting.
-                         Read-only modes only — it cannot approve a write.
-  -h, --help             this text
+  -n, --namespace <ns>      deploy namespace (default ${DEFAULT_NAMESPACE})
+      --ids <list>          accounting_documents.id values, comma or space separated
+      --mode <mode>         ${MODES.join(" | ")} (default ${MODES[0]})
+      --csv                 also write the CSV, without asking          (matrix)
+      --no-csv              never write the CSV. matrix asks without it;
+                            decode always writes unless you pass this.
+      --pod-namespace <ns>  namespace of the pod that decodes           (decode)
+      --component <name>    pod component                              (decode)
+      --release-bin <path>  release entry point on the pod              (decode)
+      --task-service <svc>  deployment named in the emitted write command  (decode)
+  -y, --yes                 approve the database reads without prompting.
+                            Read-only modes only — it cannot approve a write.
+  -h, --help                this text
 
 Anything not passed is prompted for. For a fully non-interactive run supply --ids
 and --yes (and --csv or --no-csv, or the CSV is simply skipped).
@@ -146,13 +274,17 @@ and --yes (and --csv or --no-csv, or the CSV is simply skipped).
   ./b2b_credit_notes.js
   ./b2b_credit_notes.js --ids 4838124,4838004 --yes --csv
   ./b2b_credit_notes.js -n eng-orion --ids 123 --yes --no-csv
+  ./b2b_credit_notes.js --mode decode --ids 4836650 --yes
 
-The match is an E-INVOICED invoice of the same provider whose total is >= the credit
-note's value, in ANY billing period. Among those, the credit note's own period wins,
-then the most recent invoice created at or before it. The credit note's value is the
-sum of its line items, not provider_invoices.total (unreliable on credit notes).
+matrix: the match is an E-INVOICED invoice of the same provider whose total is >= the
+credit note's value, in ANY billing period. Among those, the credit note's own period
+wins, then the most recent invoice created at or before it. The credit note's value is
+the sum of its line items, not provider_invoices.total (unreliable on credit notes).
 
-Exit codes: 0 all matched, 1 unmatched/orphan/rejected input, 2 bad invocation.`);
+decode: payload_base64 is an Erlang term, so reading it needs a BEAM. The payloads are
+read from --namespace and decoded on a --pod-namespace pod borrowed purely as a runtime.
+
+Exit codes: 0 all resolved, 1 anything unresolved or rejected, 2 bad invocation.`);
 }
 
 function parseArgs(argv) {
@@ -162,6 +294,9 @@ function parseArgs(argv) {
     ids: null,
     mode: null,
     csv: null, // null = ask, true = write, false = skip
+    // Only the decode mode uses these; its own defaults are the single source of truth,
+    // so they are not restated here.
+    pod: decodePayloads.podDefaults(),
     yes: false,
   };
 
@@ -199,6 +334,18 @@ function parseArgs(argv) {
         break;
       case "--no-csv":
         opts.csv = false;
+        break;
+      case "--pod-namespace":
+        opts.pod.namespace = value(arg, i++);
+        break;
+      case "--component":
+        opts.pod.component = value(arg, i++);
+        break;
+      case "--release-bin":
+        opts.pod.bin = value(arg, i++);
+        break;
+      case "--task-service":
+        opts.taskService = value(arg, i++);
         break;
       case "-y":
       case "--yes":
@@ -253,13 +400,16 @@ const SQL_ECHO_LIMIT = 500;
 
 // Echo a statement before it runs, indented and cyan. This script reads
 // production, so what it asks for should never be a mystery.
-function echoSql(label, sql) {
+function echoSql(label, sql, why) {
   const shown =
     sql.length > SQL_ECHO_LIMIT
       ? `${sql.slice(0, SQL_ECHO_LIMIT)}\n… (${sql.length - SQL_ECHO_LIMIT} more chars)`
       : sql;
 
   output.write(`  ${c.faint(label)}\n`);
+  // The reasoning travels with the statement. A query you can read but not justify is
+  // the thing that gets copied into the next script unchanged.
+  if (why) for (const line of why.split("\n")) output.write(`    ${c.faint(`· ${line}`)}\n`);
   for (const line of shown.split("\n")) output.write(`    ${c.sql(line)}\n`);
 }
 
@@ -388,11 +538,17 @@ function runCapture(cmd, args) {
   return res.stdout;
 }
 
+// Every statement this run executed, in order, so the outputs can carry the exact
+// SQL rather than a prose description of it. cross-check.sql is a curated copy and
+// can drift; this cannot.
+const EXECUTED = [];
+
 // Read-only psql. -t -A -F| gives bare pipe-delimited rows; a NULL column comes
 // back as an empty field, which is why every nullable column below is wrapped in
 // coalesce() — an empty field is then unambiguous rather than "NULL or ''".
-function psqlRead(env, db, sql) {
-  echoSql(`houston psql ${env} ${db}`, sql);
+function psqlRead(env, db, sql, why = "") {
+  echoSql(`houston psql ${env} ${db}`, sql, why);
+  EXECUTED.push({ db, sql, why });
 
   return runCapture("houston", [
     "psql",
@@ -457,11 +613,127 @@ function guardDate(value, what) {
 }
 
 // --- queries -----------------------------------------------------------------
+//
+// Each query carries a WHY, printed above it as it runs and written into every output
+// (the report's "SQL executed" section, and the .sql beside the decode CSV). Single
+// source: the reasoning cannot drift from the statement it explains, because they are
+// passed together.
+
+const WHY = {
+  suppliedDocs: [
+    "STEP 1 of 4 — is the input the right kind of thing, and what is its cross-database key?",
+    "",
+    "You supply accounting_documents.id values. Two things must come out: proof each is a",
+    "B2B credit note, and einvoice_reference — the ONLY key that reaches shedul.",
+    "",
+    "Both conditions are needed. document_type = 'credit_note' alone lets a B2C sale refund",
+    "through, and that has a sale_id and no partner-billing counterpart for shedul to",
+    "resolve. einvoice_reference IS NOT NULL is what separates the two.",
+  ].join("\n"),
+
+  shedulCreditNotes: [
+    "STEP 2 of 4 — the provider, the billing period, and the credit note's TRUE value.",
+    "",
+    "THE PROVIDER MUST COME FROM HERE. accounting_documents.provider_id is NULL on B2B",
+    "billing documents; take it from step 1 and the candidate pool is empty. Not a",
+    "preference — the only source.",
+    "",
+    "THE VALUE IS sum(provider_invoice_items.fee), NOT provider_invoices.total. `total` is",
+    "wrong on 280 of 295 production credit notes: it carries the CO-CREATED INVOICE's total.",
+    "Comparing against it would compare an invoice's total with a copy of itself, so every",
+    "match would pass by construction and prove nothing.",
+    "  e.g. CN/1006 — stored total 1224042, items sum -81606. 12240.42 is INV/16204's total.",
+  ].join("\n"),
+
+  providerInvoices: [
+    "STEP 3 of 4 — the candidate pool. Three decisions, three ways to be wrong.",
+    "",
+    "NO BILLING-PERIOD FILTER. The obvious query restricts to the credit note's own month and",
+    "is wrong: 37 of 295 credit notes are worth more than every invoice in their own period,",
+    "because handle_invoice_and_credit_note splits a month's items by SIGN, not by amount, and",
+    "a `credit` item is an adjustment rather than a reversal of that month's fees. CN/1044 is",
+    "2000.00 against an own-month invoice of 1165.13. Filter by period and those 37 go",
+    "unmatched.",
+    "",
+    "einvoice_reference IS NOT NULL. Without it the pool gains the 1.8M pre-rollout invoices",
+    "and the 1.25M not_applicable non-KSA ones. Those are NOT failed emissions — the check for",
+    "'an e-invoicing provider's invoice, after the cutoff, missing a reference' returns 0 — but",
+    "pointing a ZATCA credit note at a document ZATCA has never seen is not a useful answer.",
+    "Costs 2 matches of 295.",
+    "",
+    "NO einvoice_status FILTER, and this is the one people reach for. An earlier version",
+    "dropped `rejected`/`refunded` candidates and was wrong: invoices and their credit notes",
+    "are created in the SAME transaction, 23-24 ms apart, and for 43 of 63 then-ambiguous",
+    "credit notes the co-created invoice was the `refunded` one — the very row it discarded.",
+  ].join("\n"),
+
+  invoiceTrackers: [
+    "STEP 4 of 4 — the matched invoice's own reference and ZATCA status.",
+    "",
+    "receipt_number is read HERE rather than taken from shedul's invoice_reference because it",
+    "is the value a credit note's previous_receipt_number must carry, and that field is",
+    "consumed by the e-invoicing side. Both agree on all 34 — but that is a fact about today's",
+    "data, not a guarantee, and a divergence would yield a valid-looking document citing an",
+    "invoice number the tax authority cannot resolve. A mismatch is reported, not assumed away.",
+  ].join("\n"),
+};
+
+// The match itself runs in Node, so it has no query to hang its reasoning on. It is
+// printed under the matrix and written into the report instead.
+const WHY_MATCH = [
+  "THE MATCH — pickInvoice(). Three hard constraints, then a ranking:",
+  "",
+  "  ELIGIBLE  1. einvoice_reference IS NOT NULL   (applied in the candidate query)",
+  "            2. billing_end <= credit note's billing_end",
+  "            3. total >= credit note value",
+  "  RANK      closest first, going backwards: latest billing period, then latest",
+  "            created_at within it, then highest id",
+  "",
+  "(2) IS THE BILLING PERIOD, NOT created_at, and they are not interchangeable: a February",
+  "invoice is written on 2026-03-02, after February ends, and its credit note 35 ms later in",
+  "the same transaction. So `created_at < billingStart` is false for EVERY own-period invoice",
+  "and would discard the common case entirely. The period is the key; timestamps break ties.",
+  "",
+  "A LATER invoice is INELIGIBLE, not a last resort — a document that did not exist cannot be",
+  "the one credited. So a credit note whose only large-enough invoice is later comes back",
+  "UNMATCHED rather than citing it.",
+  "",
+  "No 'own period first' key is needed: with (2) in force the own period has the greatest",
+  "billing_end of any eligible invoice, so it sorts first by construction.",
+  "",
+  "(3) compares invoice.total AS STORED against the credit note's magnitude, so the 194",
+  "production invoices with a negative total never qualify — intended. Both sides are GROSS:",
+  "total = subtotal + tax, and the credit note sums `fee`, which is gross with `fee_tax`",
+  "inside it.",
+  "",
+  "No AMBIGUOUS verdict exists — the ranking is a total order, so it resolves to one invoice",
+  "or to none. UNMATCHED prints the largest ELIGIBLE invoice beside it, and both the eligible",
+  "and total invoice counts, since 'none eligible' and 'none big enough' want different fixes.",
+  "",
+  "HOW FAR THE CHECKS GO:",
+  "  SQL row_number()  34/34  transcription and ordering bugs in either implementation.",
+  "                           NOT the rule — both encode the same one. (cross-check.sql §2)",
+  "  co-creation       29/34  whether the rule agrees with the code that created the rows.",
+  "                           Unavailable for the 5 that differ — exactly where the answer is",
+  "                           least obvious. (cross-check.sql §3)",
+  "  ZATCA's verdict          everything. The only check that settles it.",
+  "",
+  "THE HONEST WEAK POINT: the amount rule and the ranking are inferences chosen against",
+  "production data, not consequences of a schema relationship. Nothing here can prove them.",
+  "",
+  "THINNEST RESULT IN THE 34: CN/1098, worth 278.00 — its provider has no invoice at all in",
+  "the credit note's month and the nearest is 277.18, short by 0.82, so the match lands three",
+  "months back on INV/18891. The rule working as specified, and the row to check by hand.",
+].join("\n");
 
 // Step 1 — the supplied ids, as accounting_documents sees them, plus the latest
 // tracker. This is what decides whether the input really is a B2B credit note:
 // document_type says credit note, and einvoice_reference (not sale_id) says the
 // document came from partner billing rather than from a sale refund.
+//
+// Both conditions are needed. document_type alone lets a B2C sale refund through, and
+// that has no partner-billing counterpart for shedul to resolve. einvoice_reference is
+// also the only key that reaches the other database.
 function fetchSuppliedDocs(env, ids) {
   const docs = new Map();
 
@@ -477,7 +749,7 @@ function fetchSuppliedDocs(env, ids) {
       `WHERE ad.id IN (${idList})\n` +
       "ORDER BY ad.id;";
 
-    for (const f of parseRows(psqlRead(env, AD_DB, sql), 8)) {
+    for (const f of parseRows(psqlRead(env, AD_DB, sql, WHY.suppliedDocs), 8)) {
       docs.set(f[0], {
         id: f[0],
         documentType: f[1],
@@ -507,7 +779,11 @@ function fetchShedulCreditNotes(env, refs) {
     // match uses. `total` is NOT usable here: on 280 of 295 production credit notes it
     // does not equal the sum of its items — it carries the invoice's total instead
     // (verified: invoices are self-consistent 12893/12893, credit notes 15/295). Using
-    // it would compare an invoice's total against a copy of itself.
+    // it would compare an invoice's total against a copy of itself, so every match
+    // would pass by construction and prove nothing.
+    //
+    // Worked example, CN/1006: stored total 1224042, items sum -81606. 12240.42 is
+    // exactly INV/16204's total.
     const sql =
       "SELECT c.einvoice_reference::text, c.id::text, c.provider_id::text,\n" +
       "       coalesce(c.invoice_reference, ''), c.billing_start::text, c.billing_end::text,\n" +
@@ -522,7 +798,7 @@ function fetchShedulCreditNotes(env, refs) {
       "  AND c.billing_document_type = 'credit_note'\n" +
       "ORDER BY c.provider_id, c.id;";
 
-    for (const f of parseRows(psqlRead(env, SHEDUL_DB, sql), 11)) {
+    for (const f of parseRows(psqlRead(env, SHEDUL_DB, sql, WHY.shedulCreditNotes), 11)) {
       const itemValue = f[9] === "" ? null : Number(f[9]);
       byRef.set(f[0], {
         einvoiceReference: f[0],
@@ -561,6 +837,12 @@ function fetchShedulCreditNotes(env, refs) {
 // emissions — nothing was dropped, e-invoicing simply did not apply — but matching a
 // ZATCA credit note to a document ZATCA has never seen is not a useful answer.
 //
+// einvoice_status is deliberately NOT filtered on, and it is the thing people reach for.
+// An earlier version dropped `rejected`/`refunded` candidates and was wrong: invoices and
+// their credit notes are created in the SAME transaction, 23-24 ms apart, and for 43 of
+// 63 then-ambiguous credit notes the co-created invoice was the `refunded` one — exactly
+// the row the status rule discarded. See "Why not statuses" in AGENTS.md.
+//
 // A provider has one invoice per month, so this is tens of rows each, not thousands.
 // `total` is used as stored — unlike credit notes, invoice totals agree with their
 // line items on all 12 893 e-invoiced rows.
@@ -580,7 +862,7 @@ function fetchProviderInvoices(env, providerIds) {
       "  AND i.einvoice_reference IS NOT NULL\n" +
       "ORDER BY i.provider_id, i.created_at, i.id;";
 
-    for (const f of parseRows(psqlRead(env, SHEDUL_DB, sql), 10)) {
+    for (const f of parseRows(psqlRead(env, SHEDUL_DB, sql, WHY.providerInvoices), 10)) {
       const invoice = {
         providerId: f[0],
         billingStart: f[1],
@@ -602,6 +884,13 @@ function fetchProviderInvoices(env, providerIds) {
 
 // Step 4 — the matched invoices as accounting_documents sees them, so the matrix
 // can show how far each invoice actually got with the tax authority.
+//
+// receipt_number is read here rather than taken from shedul's invoice_reference because
+// it is the value a credit note's `previous_receipt_number` must carry (the `decode` mode
+// patches it in), and that field is consumed by the e-invoicing side, whose own idea of
+// the reference is this column. The two agree on every row checked — but "they agree" is
+// a fact about today's data, not a guarantee, and the cost of reading the authoritative
+// one is nil.
 function fetchInvoiceTrackers(env, refs) {
   const byRef = new Map();
 
@@ -610,7 +899,7 @@ function fetchInvoiceTrackers(env, refs) {
       .map((r) => `'${guardUuid(r, "accounting_documents.einvoice_reference")}'`)
       .join(", ");
     const sql =
-      "SELECT ad.einvoice_reference, ad.id::text,\n" +
+      "SELECT ad.einvoice_reference, ad.id::text, coalesce(ad.receipt_number, ''),\n" +
       "       coalesce(t.review_status::text, ''), coalesce(t.upload_status::text, '')\n" +
       "FROM accounting_documents ad\n" +
       "LEFT JOIN e_invoice_trackers t ON t.id = ad.latest_tracker_id\n" +
@@ -618,8 +907,13 @@ function fetchInvoiceTrackers(env, refs) {
       `  AND ad.einvoice_reference IN (${list})\n` +
       "ORDER BY ad.id;";
 
-    for (const f of parseRows(psqlRead(env, AD_DB, sql), 4)) {
-      byRef.set(f[0], { docId: f[1], reviewStatus: f[2], uploadStatus: f[3] });
+    for (const f of parseRows(psqlRead(env, AD_DB, sql, WHY.invoiceTrackers), 5)) {
+      byRef.set(f[0], {
+        docId: f[1],
+        receiptNumber: f[2],
+        reviewStatus: f[3],
+        uploadStatus: f[4],
+      });
     }
   }
   return byRef;
@@ -642,45 +936,58 @@ function samePeriod(a, b) {
 
 // The invoice that carries the credit note.
 //
-// The hard constraint is the amount: the invoice's total must be at least the credit
-// note's value, and that holds regardless of billing period. The period only ranks the
-// survivors — a credit note belongs to its own month's invoice when that invoice is big
-// enough, and reaches outside only when it isn't.
+// THREE HARD CONSTRAINTS. An invoice is eligible only if all three hold:
 //
-// Order of preference among invoices that are large enough:
-//   1. the credit note's own billing period
-//   2. created at or before the credit note — an invoice that did not yet exist cannot
-//      be the one being credited, so later invoices are the last resort
-//   3. within those, the LAST one (most recent), which is the tie-break originally asked
-//      for; among only-later invoices, the nearest instead
+//   1. it has a reference          einvoice_reference IS NOT NULL, applied in the
+//                                  candidate query — a document ZATCA has never seen is
+//                                  not one a ZATCA credit note can cite
+//   2. its period is at or before  billing_end <= creditNote.billingEnd
+//   3. it is large enough          total >= creditNote.value
+//
+// (2) is the billing PERIOD, not created_at. Those are not interchangeable: a February
+// invoice is written on 2026-03-02, after February has ended, and its credit note 35 ms
+// later in the same transaction. So `created_at < billingStart` is false for EVERY
+// own-period invoice and would discard the common case entirely. The period is the right
+// key; the timestamps only break ties.
+//
+// An invoice from a LATER period is not a last resort here — it is ineligible. A document
+// that did not exist cannot be the one credited. The consequence is that a credit note
+// whose only large-enough invoice is later comes back UNMATCHED rather than citing it.
+//
+// (3) compares `i.total` AS STORED against the credit note's magnitude, so the 194
+// production invoices with a negative total never qualify. Intended. Both sides are gross
+// (tax-inclusive): `total` = subtotal + tax, and the credit note's value sums `fee`, which
+// is itself gross with `fee_tax` inside it.
+//
+// RANKING among the eligible — closest first, going backwards:
+//   1. latest billing period      (the credit note's own, when it qualifies)
+//   2. latest created_at within that period
+//   3. highest id
+//
+// No separate "own period first" key is needed: with (2) in force, the own period has the
+// greatest billing_end of any eligible invoice, so it sorts first by construction.
 function pickInvoice(creditNote, candidates) {
-  const qualifying = candidates.filter((i) => i.total >= creditNote.value);
+  // Constraint 2, then 3. Kept as one pass with the reason each row survived or died
+  // available to the caller below.
+  const inWindow = candidates.filter((i) => i.billingEnd <= creditNote.billingEnd);
+  const qualifying = inWindow.filter((i) => i.total >= creditNote.value);
 
   const sorted = qualifying.slice().sort((a, b) => {
-    const period = Number(!samePeriod(a, creditNote)) - Number(!samePeriod(b, creditNote));
-    if (period) return period;
-
-    const aBefore = a.createdAt <= creditNote.createdAt;
-    const bBefore = b.createdAt <= creditNote.createdAt;
-    if (aBefore !== bBefore) return aBefore ? -1 : 1;
-
-    // Latest first among earlier invoices; earliest first among later ones. Both mean
-    // "closest to the credit note".
-    if (a.createdAt !== b.createdAt) {
-      return aBefore ? b.createdAt.localeCompare(a.createdAt) : a.createdAt.localeCompare(b.createdAt);
-    }
+    if (a.billingEnd !== b.billingEnd) return b.billingEnd.localeCompare(a.billingEnd);
+    if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
     return Number(b.id) - Number(a.id);
   });
 
-  // For an unmatched credit note the useful fact is the best the provider had to offer,
-  // not every invoice that was too small — there can be dozens across all periods.
-  const largest = candidates.reduce(
+  // For an unmatched credit note the useful fact is the best that was ELIGIBLE, not the
+  // provider's biggest invoice overall — a later invoice being large enough is not a near
+  // miss, it is out of scope.
+  const largest = inWindow.reduce(
     (best, i) => (best === null || i.total > best.total ? i : best),
     null
   );
 
   // The credit note's OWN-period invoice, reported whether or not it won. When the match
-  // reached outside the period this is what explains why — and the largest of them is the
+  // reached further back this is what explains why — and the largest of them is the
   // relevant one, since if any own-period invoice had been big enough the ranking above
   // would have chosen it.
   const ownPeriod = candidates.filter((i) => samePeriod(i, creditNote));
@@ -692,6 +999,7 @@ function pickInvoice(creditNote, candidates) {
   return {
     invoice: sorted.length ? sorted[0] : null,
     candidateCount: candidates.length,
+    eligibleCount: inWindow.length,
     largest: sorted.length ? null : largest,
     ownPeriodBest,
     ownPeriodCount: ownPeriod.length,
@@ -712,6 +1020,7 @@ function matchCreditNotes(docs, cnByRef, invByProvider) {
         invoice: null,
         largest: null,
         candidateCount: 0,
+        eligibleCount: 0,
         ownPeriodBest: null,
         ownPeriodCount: 0,
         verdict: VERDICT.ORPHAN,
@@ -881,7 +1190,8 @@ function matrixRows(results, invTrackers) {
       invoice,
       cnRef: creditNoteRef(r),
       adId: idCell(r.doc.id),
-      // An ORPHAN has no shedul row, so no provider and no period.
+      // An ORPHAN has no shedul row, so no provider_invoices id, no provider, no period.
+      cnPiId: r.cn ? idCell(r.cn.id) : DASH,
       providerId: r.cn ? idCell(r.cn.providerId) : DASH,
       cnMonth: r.cn ? monthCell(r.cn.billingStart, r.cn.billingEnd) : DASH,
       cnStart: r.cn ? r.cn.billingStart : DASH,
@@ -917,16 +1227,20 @@ function matrixRows(results, invTrackers) {
 
 // The matrix columns, defined once. The terminal table, the Markdown report and the
 // CSV all render these same cells — three copies of this list would drift.
+// Both sides' provider_invoices ids are named for their side. A bare
+// `provider_invoice_id` meant the INVOICE's, which was fine only while the credit note's
+// was absent — with both present the bare name would be a coin toss.
 const MATRIX_HEADERS = [
   "Credit note",
   "accounting_document_id",
+  "cn_provider_invoice_id",
   "provider_id",
   "CN month",
   "cn_billing_start",
   "cn_billing_end",
   "CN total",
   "Invoice",
-  "provider_invoice_id",
+  "inv_provider_invoice_id",
   "INV month",
   "inv_billing_start",
   "inv_billing_end",
@@ -943,7 +1257,7 @@ const MATRIX_HEADERS = [
 
 // Ids and money right-align; references, dates and prose read left to right.
 const MATRIX_ALIGN = [
-  "", "r", "r", "", "", "", "r", "", "r", "", "", "", "r", "",
+  "", "r", "r", "r", "", "", "", "r", "", "r", "", "", "", "r", "",
   "", "r", "r", "", "", "", "",
 ];
 
@@ -952,6 +1266,7 @@ function matrixCells(row) {
   return [
     row.cnRef,
     row.adId,
+    row.cnPiId,
     row.providerId,
     row.cnMonth,
     row.cnStart,
@@ -985,9 +1300,26 @@ function printMatrix(rows) {
   output.write(`${renderTable(MATRIX_HEADERS, body, MATRIX_ALIGN)}\n`);
 }
 
-// Why an UNMATCHED credit note is unmatched: the largest invoice the provider has, in
-// any period, is still smaller than the credit note. One row each — listing every
-// invoice that was too small would run to dozens now that all periods are in scope.
+// The rule that produced the table above, printed under it. The four queries explain
+// themselves as they run; the match happens in Node and has no statement to hang its
+// reasoning on, so it says its piece here.
+function printMatchLogic() {
+  output.write(`\n${c.head("── How the match was made ──────────────────────────────")}\n`);
+  for (const line of WHY_MATCH.split("\n")) output.write(`  ${c.faint(line)}\n`);
+}
+
+// Why an UNMATCHED credit note is unmatched. Two different reasons now that the period is
+// a hard constraint, and they want different fixes, so both counts are shown:
+//
+//   Eligible = 0   the provider has no e-invoiced invoice at or before this period at all
+//   Eligible > 0   there are some, but the largest is still too small
+//
+// `largest` is the biggest ELIGIBLE invoice, not the provider's biggest overall. A later
+// invoice being large enough is not a near miss — it is out of scope — so quoting it here
+// would read as "we nearly matched" when nothing of the sort happened.
+//
+// The guard is on eligibleCount, not candidateCount: with the period filter in force a
+// provider can have dozens of invoices and none eligible, in which case `largest` is null.
 function unmatchedRows(results) {
   return results
     .filter((r) => r.cn && !r.invoice)
@@ -995,10 +1327,11 @@ function unmatchedRows(results) {
       creditNoteRef(r),
       idCell(r.doc.id),
       amountCell(r.cn.value),
-      r.candidateCount ? invoiceRef(r.largest) : DASH,
-      r.candidateCount ? idCell(r.largest.id) : DASH,
-      r.candidateCount ? amountCell(r.largest.total) : DASH,
-      String(r.candidateCount),
+      r.eligibleCount ? invoiceRef(r.largest) : DASH,
+      r.eligibleCount ? idCell(r.largest.id) : DASH,
+      r.eligibleCount ? amountCell(r.largest.total) : DASH,
+      String(r.eligibleCount || 0),
+      String(r.candidateCount || 0),
     ]);
 }
 
@@ -1006,13 +1339,14 @@ const UNMATCHED_HEADERS = [
   "Credit note",
   "accounting_document_id",
   "Needs ≥",
-  "Largest invoice",
+  "Largest eligible",
   "provider_invoice_id",
   "Its total",
+  "Eligible",
   "Invoices seen",
 ];
 
-const UNMATCHED_ALIGN = ["", "r", "r", "", "r", "r", "r"];
+const UNMATCHED_ALIGN = ["", "r", "r", "", "r", "r", "r", "r"];
 
 function printUnmatched(results) {
   const body = unmatchedRows(results);
@@ -1152,6 +1486,14 @@ function writeReport(namespace, env, results, rows, rejects, tally) {
     lines.push(mdTable(["accounting_documents.id", "Why"], rejects.map((r) => [r.id, r.reason])));
   }
 
+  // The statements themselves, not a description of them. A report that says what the
+  // rule is can be read charitably; one that shows the SQL can be checked.
+  lines.push("", "## SQL executed", "");
+  lines.push(`${EXECUTED.length} statement${EXECUTED.length === 1 ? "" : "s"}, in order.`, "");
+  EXECUTED.forEach((q, i) => {
+    lines.push(`### ${i + 1}. \`${q.db}\``, "", "```sql", q.sql, "```", "");
+  });
+
   lines.push(
     "",
     "## Columns",
@@ -1238,8 +1580,17 @@ async function confirmDataAccess(opts, env, count) {
   output.write(`  namespace : ${namespace}${prod ? "   ⚠  PRODUCTION" : ""}\n`);
   output.write(`  psql env  : ${env}\n`);
   output.write(`  mode      : ${opts.mode}   (read-only — cannot write)\n`);
-  output.write(`  databases : ${AD_DB}, ${SHEDUL_DB}\n`);
-  output.write(`  reading   : ${count} credit note id${count === 1 ? "" : "s"}\n`);
+  // decode never touches shedul; naming a database it does not read would be a lie in
+  // exactly the place that has to be trustworthy.
+  output.write(
+    `  databases : ${opts.mode === "decode" ? AD_DB : `${AD_DB}, ${SHEDUL_DB}`}\n`
+  );
+  output.write(`  reading   : ${count} document id${count === 1 ? "" : "s"}\n`);
+  if (opts.mode === "decode") {
+    output.write(
+      `  decode on : ${opts.pod.namespace} / ${opts.pod.component}   (a pod, no DB access)\n`
+    );
+  }
   output.write("  access    : SELECT only — this script has no write path\n");
 
   // --yes IS the approval for reads. The target is still printed above, so an
@@ -1266,9 +1617,14 @@ async function confirmDataAccess(opts, env, count) {
 
 // --- modes -------------------------------------------------------------------
 
-async function runMatrix(opts, env, ids) {
-  const namespace = opts.namespace;
-
+// Steps 1-4, shared by both modes: validate the input, resolve it through shedul, match,
+// and read the matched invoices back out of accounting_documents. Extracted so `decode`
+// can reuse the matching rather than carry a second copy of it — a divergence here would
+// put the wrong invoice reference into a tax document, which is the one kind of
+// duplication worth avoiding in this directory.
+//
+// Returns null when there is nothing left to work with; the caller exits.
+function computeMatrix(env, ids) {
   // 1. Is the input actually a set of B2B credit notes?
   const docs = fetchSuppliedDocs(env, ids);
 
@@ -1293,7 +1649,7 @@ async function runMatrix(opts, env, ids) {
 
   if (!valid.length) {
     output.write(`\n  ${c.bad("Nothing left to match.")}\n`);
-    return EXIT_DATA;
+    return null;
   }
 
   // 2. The shedul side: provider and billing period.
@@ -1329,10 +1685,120 @@ async function runMatrix(opts, env, ids) {
   ];
   const invTrackers = invRefs.length ? fetchInvoiceTrackers(env, invRefs) : new Map();
 
+  return { rejects, results, invTrackers };
+}
+
+// The reference each credit note's `previous_receipt_number` must carry: the matched
+// invoice's `accounting_documents.receipt_number`.
+//
+// Read from accounting_documents rather than from shedul's `invoice_reference`, because
+// the field is consumed by the e-invoicing side and that is where the e-invoicing side's
+// reference lives. The two agree on every production row seen so far — and a divergence
+// would be exactly the kind of thing that produces a valid-looking document citing an
+// invoice number the tax authority cannot resolve, so it is reported rather than assumed.
+//
+// A credit note with no match, or one matched to an invoice accounting_documents has no
+// reference for, is absent from the result: there is nothing to write, and inventing a
+// value is worse than leaving the row unpatched.
+function matchedReferences(results, invTrackers) {
+  const byDocId = new Map();
+  const divergent = [];
+
+  for (const r of results) {
+    if (!r.invoice) continue;
+
+    const tracker = invTrackers.get(r.invoice.einvoiceReference);
+    if (!tracker || !tracker.receiptNumber) continue;
+
+    if (r.invoice.invoiceReference && r.invoice.invoiceReference !== tracker.receiptNumber) {
+      divergent.push(
+        `${r.doc.id}: shedul ${r.invoice.invoiceReference} vs AD ${tracker.receiptNumber}`
+      );
+    }
+
+    byDocId.set(r.doc.id, {
+      previousReceiptNumber: tracker.receiptNumber,
+      invoiceDocId: tracker.docId,
+      providerInvoiceId: r.invoice.id,
+      // Named separately from previousReceiptNumber even though they hold the same string:
+      // one is "the invoice this credit note credits", the other is "the payload field being
+      // written". They coincide today; conflating them in the output would hide it if they
+      // ever stopped coinciding.
+      invoiceReference: tracker.receiptNumber,
+      // Both periods, in full. A cross-period match is legitimate here — the amount is the
+      // only hard constraint — so the reader is given the two periods rather than a verdict.
+      cnBillingStart: r.cn ? r.cn.billingStart : "",
+      cnBillingEnd: r.cn ? r.cn.billingEnd : "",
+      invBillingStart: r.invoice.billingStart,
+      invBillingEnd: r.invoice.billingEnd,
+    });
+  }
+
+  if (divergent.length) {
+    output.write(
+      `\n  ${c.warn(
+        `Note: ${divergent.length} matched invoice(s) have different references in the two ` +
+          "databases. accounting_documents wins:"
+      )}\n${divergent.map((d) => `    ${d}\n`).join("")}`
+    );
+  }
+
+  return byDocId;
+}
+
+// Mode `decode` — the matrix, then each credit note's payload with the matched invoice's
+// reference patched into it. The matrix runs first because the patch is derived from it;
+// it is printed rather than computed silently, so the reference written into each document
+// is visible beside the evidence for it.
+async function runDecode(opts, env, ids) {
+  const matrix = computeMatrix(env, ids);
+  if (!matrix) return EXIT_DATA;
+  const { rejects, results, invTrackers } = matrix;
+
+  printMatrix(matrixRows(results, invTrackers));
+  printUnmatched(results);
+  printMatchLogic();
+  const tally = printSummary(results);
+
+  const patches = matchedReferences(results, invTrackers);
+
+  // Only what the matrix accepted. Passing the full `ids` list would decode the documents
+  // step 1 just printed under "Not B2B credit notes — excluded", which is the script
+  // contradicting itself: it would report an id as excluded and then dump its payload.
+  // ORPHANs stay in — they passed validation and simply have no shedul row, so they are
+  // credit notes worth decoding, just not patchable.
+  //
+  // To decode something that is not a B2B credit note, use ./decode_payloads.js directly.
+  // That is what it is for.
+  const validIds = results.map((r) => r.doc.id);
+
+  // The matrix statements ran first, so they belong at the top of the .sql the decode side
+  // writes — otherwise that file would show the payload read and none of the matching.
+  const code = decodePayloads.runDecode(
+    { ...opts, executedSql: EXECUTED.slice() },
+    env,
+    validIds,
+    patches
+  );
+
+  // An unmatched or orphaned credit note is not a decode failure, but it is a credit note
+  // that came out of here without a reference — so it still colours the exit code.
+  const unresolved = (tally[VERDICT.UNMATCHED] || 0) + (tally[VERDICT.ORPHAN] || 0);
+  return code || (unresolved || rejects.length ? EXIT_DATA : 0);
+}
+
+async function runMatrix(opts, env, ids) {
+  const namespace = opts.namespace;
+
+  const matrix = computeMatrix(env, ids);
+  if (!matrix) return EXIT_DATA;
+  const { rejects, results, invTrackers } = matrix;
+
   // 5. Report.
   const rows = matrixRows(results, invTrackers);
   printMatrix(rows);
   printUnmatched(results);
+  printMatchLogic();
   const tally = printSummary(results);
 
   const file = writeReport(namespace, env, results, rows, rejects, tally);
@@ -1380,6 +1846,14 @@ async function main() {
             value: "matrix",
             default: true,
           },
+          {
+            label: "decode — what is inside payload_base64",
+            detail:
+              "decodes each document's stored Erlang term on a pod and writes it to a " +
+              "CSV, one record each",
+            aliases: ["decode", "d", "payload", "payloads"],
+            value: "decode",
+          },
         ])
       : MODES[0];
   }
@@ -1401,7 +1875,9 @@ async function main() {
     return EXIT_USAGE;
   }
 
-  return runMatrix(opts, env, ids);
+  // Both modes take the same three things — namespace, ids, an approved gate — so the
+  // dispatch is the only place they differ.
+  return opts.mode === "decode" ? runDecode(opts, env, ids) : runMatrix(opts, env, ids);
 }
 
 main()

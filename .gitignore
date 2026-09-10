@@ -1,8 +1,18 @@
-# Generated reports / exports
-invopop_report_*.md
-invopop_entries_*.csv
-b2b-credit-notes-*.md
+# Generated reports / exports — from each script's AGENTS.md `reports:` (ops orion docs sync)
+# ops:begin reports
 b2b-credit-notes-*.csv
+b2b-credit-notes-*.md
+decoded-payloads-*.csv
+decoded-payloads-*.sql
+invoice-payloads-*.csv
+invoice-payloads-*.sql
+invopop_entries_*.csv
+invopop_report_*.md
+it-credential-lifecycle-bugbash-*.md
+originals/
+preflight-*.md
+rollout-report-*.md
+# ops:end reports
 
 # Elixir crash dumps
 erl_crash.dump

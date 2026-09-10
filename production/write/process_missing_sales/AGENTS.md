@@ -1,3 +1,21 @@
+---
+name: process_missing_sales
+summary: "Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task"
+env: production
+access: write
+tier: prod-write
+lang: exs
+aliases: [pms]
+examples:
+  - args: ""
+    note: prompts for provider_id and sale ids
+  - args: 646845 123,456,789
+    note: prompts before each step
+  - args: 646845 123,456 --dry-run
+    note: export + upload, print the task command, don't run it
+  - args: 646845 123,456 --skip-upload
+    note: only build the CSV locally
+---
 # process_missing_sales
 
 Backfill accounting documents (invoices / credit notes) for sales that never
@@ -33,24 +51,6 @@ satisfies this.
 Bucket comes from the task's app config `:accounting_documents_bucket`
 (`AWS_S3_ACCOUNTING_DOCUMENTS_BUCKET` = `fresha-accounting-documents-production`
 in prod).
-
-## Run it
-
-```bash
-cd scripts/process_missing_sales
-
-# Interactive — prompts for provider_id, sale ids:
-./process_missing_sales.exs
-
-# Full run (args on the CLI, prompts before each step):
-./process_missing_sales.exs 646845 123,456,789
-
-# Generate + upload CSV, print the task command, but don't run it:
-./process_missing_sales.exs 646845 123,456 --dry-run
-
-# Just build the CSV locally (no S3, no task); keeps + prints the path:
-./process_missing_sales.exs 646845 123,456 --skip-upload
-```
 
 ## Flags
 

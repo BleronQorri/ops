@@ -1,7 +1,18 @@
+---
+name: confirm_sent_uat
+summary: "Process the Comarch UAT queue by confirming \"sent\" items via the edoc-online UAT REST API"
+env: staging
+access: write
+tier: sandbox
+lang: js
+aliases: [csu]
+help_flag: false
+examples:
+  - args: ""
+    note: prompts for the queue type and, unless COMARCH_UAT_JWT is set, the JWT
+env_vars: [COMARCH_UAT_JWT]
+---
 # confirm_sent_uat
-
-**Env: Comarch UAT (non-prod test environment).** Processes the Comarch UAT
-queue by confirming "sent" status via the edoc-online UAT REST API.
 
 ## What it does
 
@@ -14,12 +25,6 @@ queue by confirming "sent" status via the edoc-online UAT REST API.
 
 UAT-only: the base URL is hardcoded to the UAT host — there is no production
 path in this script.
-
-## Run it
-
-```bash
-./confirm_sent_uat.js     # prompts for queue type + JWT token
-```
 
 ## Prereqs
 
