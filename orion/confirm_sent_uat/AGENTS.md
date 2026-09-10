@@ -3,7 +3,7 @@ name: confirm_sent_uat
 summary: "Process the Comarch UAT queue by confirming \"sent\" items via the edoc-online UAT REST API"
 env: staging
 access: write
-tier: sandbox
+tier: staging
 lang: js
 aliases: [csu]
 help_flag: false

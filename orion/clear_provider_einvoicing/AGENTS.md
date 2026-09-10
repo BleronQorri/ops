@@ -3,7 +3,7 @@ name: clear_provider_einvoicing
 summary: Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction
 env: staging
 access: write
-tier: staging-destructive
+tier: staging
 lang: js
 aliases: [cpe]
 examples:

@@ -3,7 +3,7 @@ name: deregister_suppliers
 summary: Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace
 env: staging
 access: write
-tier: sandbox
+tier: staging
 lang: exs
 aliases: [ds]
 examples:

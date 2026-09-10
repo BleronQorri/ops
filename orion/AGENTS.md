@@ -47,9 +47,9 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:staging/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [clear_provider_einvoicing](clear_provider_einvoicing/) | staging-destructive | `ops run clear_provider_einvoicing` · `ops run cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
-| [confirm_sent_uat](confirm_sent_uat/) | sandbox | `ops run confirm_sent_uat` · `ops run csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
-| [deregister_suppliers](deregister_suppliers/) | sandbox | `ops run deregister_suppliers` · `ops run ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [clear_provider_einvoicing](clear_provider_einvoicing/) | staging | `ops run clear_provider_einvoicing` · `ops run cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
+| [confirm_sent_uat](confirm_sent_uat/) | staging | `ops run confirm_sent_uat` · `ops run csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
+| [deregister_suppliers](deregister_suppliers/) | staging | `ops run deregister_suppliers` · `ops run ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
 <!-- ops:end catalogue:staging/write -->
 
 ## Danger tiers
@@ -59,8 +59,7 @@ Edit the frontmatter, not the tables.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `process_missing_sales`, `retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (blocked).
 - **Prod writes, partner-visible, one step irreversible** (`prod-write-irreversible`) — at least one step cannot be undone: `it_credential_lifecycle_bugbash`.
 - **Prod writes with NO dry run** (`prod-write-no-dry-run`) — the underlying task writes on the first call: `plugin_legal_entity_updates`.
-- **Sandbox / external** (`sandbox`) — Invopop sandbox or Comarch UAT; refuses production credentials: `confirm_sent_uat`, `deregister_suppliers`.
-- **Staging destructive wipe (gated)** (`staging-destructive`) — deletes staging rows; refuses production namespaces: `clear_provider_einvoicing`.
+- **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `clear_provider_einvoicing`, `confirm_sent_uat`, `deregister_suppliers`.
 
 Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the worst thing the script can do in any mode. `ops help tiers` has the long form.
 <!-- ops:end tiers -->
@@ -95,7 +94,7 @@ name: <dir name>                 # must equal the directory
 summary: <one line, ≤ 110 chars, imperative, no trailing period>
 env: production | staging
 access: read-only | write
-tier: read-only | prod-write | prod-write-irreversible | prod-write-no-dry-run | sandbox | staging-destructive
+tier: read-only | prod-write | prod-write-irreversible | prod-write-no-dry-run | staging
 status: active | deprecated | runbook | blocked   # default active; runbook/blocked = no script
 lang: js | exs                   # active/deprecated only
 aliases: [ri]                    # optional short names for `ops orion script run`
