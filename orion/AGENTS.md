@@ -22,9 +22,9 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:production/read-only -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [account_config_legal_entity_audit](account_config_legal_entity_audit/) | read-only | `ops orion script run account_config_legal_entity_audit` · `acla` | Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field |
-| [invopop_supplier_check](invopop_supplier_check/) | read-only | `ops orion script run invopop_supplier_check` · `isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
-| [onboard_location_scripts](onboard_location_scripts/) ⚠️ **DEPRECATED** | read-only | `ops orion script run onboard_location_scripts` · `ols` | Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run |
+| [account_config_legal_entity_audit](account_config_legal_entity_audit/) | read-only | `ops run account_config_legal_entity_audit` · `ops run acla` | Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field |
+| [invopop_supplier_check](invopop_supplier_check/) | read-only | `ops run invopop_supplier_check` · `ops run isc` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
+| [onboard_location_scripts](onboard_location_scripts/) ⚠️ **DEPRECATED** | read-only | `ops run onboard_location_scripts` · `ops run ols` | Deprecated (pre Billing Profiles) onboarding check across shedul + accounting-documents; prints tasks to run |
 <!-- ops:end catalogue:production/read-only -->
 
 ## production · write
@@ -32,14 +32,14 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:production/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [b2b_credit_notes](b2b_credit_notes/) | read-only | `ops orion script run b2b_credit_notes` · `b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
+| [b2b_credit_notes](b2b_credit_notes/) | read-only | `ops run b2b_credit_notes` · `ops run b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
 | [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
 | [fix_credit_note_references](fix_credit_note_references/) ⛔ **BLOCKED** | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes **Blocked on:** app-accounting-documents change — B2BCreditNoteXMLBuilder lacks maybe_build_reference/1, so patching payload_base64 alone does nothing |
-| [fix_invoice_payloads](fix_invoice_payloads/) | read-only | `ops orion script run fix_invoice_payloads` · `fip` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
-| [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | prod-write-irreversible | `ops orion script run it_credential_lifecycle_bugbash` · `iclb` | Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB |
-| [plugin_legal_entity_updates](plugin_legal_entity_updates/) | prod-write-no-dry-run | `ops orion script run plugin_legal_entity_updates` · `ple` | Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight |
-| [process_missing_sales](process_missing_sales/) | prod-write | `ops orion script run process_missing_sales` · `pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
-| [retry_invoices](retry_invoices/) | prod-write | `ops orion script run retry_invoices` · `ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
+| [fix_invoice_payloads](fix_invoice_payloads/) | read-only | `ops run fix_invoice_payloads` · `ops run fip` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
+| [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | prod-write-irreversible | `ops run it_credential_lifecycle_bugbash` · `ops run iclb` | Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB |
+| [plugin_legal_entity_updates](plugin_legal_entity_updates/) | prod-write-no-dry-run | `ops run plugin_legal_entity_updates` · `ops run ple` | Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight |
+| [process_missing_sales](process_missing_sales/) | prod-write | `ops run process_missing_sales` · `ops run pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
+| [retry_invoices](retry_invoices/) | prod-write | `ops run retry_invoices` · `ops run ri` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
 <!-- ops:end catalogue:production/write -->
 
 ## staging · write
@@ -47,9 +47,9 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:staging/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [clear_provider_einvoicing](clear_provider_einvoicing/) | staging-destructive | `ops orion script run clear_provider_einvoicing` · `cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
-| [confirm_sent_uat](confirm_sent_uat/) | sandbox | `ops orion script run confirm_sent_uat` · `csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
-| [deregister_suppliers](deregister_suppliers/) | sandbox | `ops orion script run deregister_suppliers` · `ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [clear_provider_einvoicing](clear_provider_einvoicing/) | staging-destructive | `ops run clear_provider_einvoicing` · `ops run cpe` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
+| [confirm_sent_uat](confirm_sent_uat/) | sandbox | `ops run confirm_sent_uat` · `ops run csu` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
+| [deregister_suppliers](deregister_suppliers/) | sandbox | `ops run deregister_suppliers` · `ops run ds` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
 <!-- ops:end catalogue:staging/write -->
 
 ## Danger tiers

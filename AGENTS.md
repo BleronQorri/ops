@@ -8,12 +8,16 @@ frozen — every update happens here.
 
 ## Rules
 
-- **Never change what a script does.** `ops orion task run` spawns the entrypoint
+- **Never change what a script does.** `ops run` spawns the entrypoint
   with `stdio: "inherit"`, the caller's cwd and untouched arguments. No added
   confirmations, no removed ones, no `--yes` injected, no chdir. Output capture is
   the one thing allowed to bend: a pty via `script(1)` when stdin and stdout are
   both terminals, pipes when stdout is already piped, and nothing at all when the
   two disagree or no pty can be had — capture gives way, the run never does.
+- **Colour comes from one place.** `TIERS[tier].color` in `lib/orion/catalogue.js`
+  names a palette key in `lib/ui.js`; render it with `cat.paintTier(text, tier,
+  palette)`, passing `ui.c` for stdout or `ui.cerr` for stderr. Production writes are
+  red and also say so in words. Never hard-code a tier's colour at a call site.
 - **stdout is data, stderr is diagnostics.** Tables get headers and colour only on
   a TTY; piped output is TSV with no header. `--json` never changes field names
   based on the terminal. Colour is off under `NO_COLOR`.
@@ -41,20 +45,20 @@ command; `.enablePositionalOptions()` on every ancestor of a command that uses
 ## Verification checklist
 
 ```
-ops · ops --help · ops orion · ops orion script run --help · ops help nope (exit 2)
+ops · ops --help · ops orion · ops run --help · ops help nope (exit 2)
 ops orion script list · NO_COLOR=1 ops orion script list | cat -v · ops orion script list | cut -f1
 ops orion script list --json | jq -r '.[].name' · ops orion script list -t bogus (exit 2)
 ops orion script view retry_invoices · --raw · --path · | cat
 ops orion script view process_missing_sales      (no live --help for Elixir, pointer shown)
 ops orion script view fix_credit_note_references (status BLOCKED, blocked_on shown)
-cd /tmp && ops orion task run retry_invoices --dry-run 1   (banner + trailer on stderr, report in /tmp, exit code == direct run)
-ops orion task run ri --help  vs  ops orion task run --help
-ops orion task run edit_document_payload (exit 2, points to view)
-ops orion task run b2b_credit_notes/decode_payloads --help
-ops orion task run -p K=V <script>  (env var reaches the script; -p AFTER the name goes to the script + prints a note)
-ops orion task ls · --script · --status · --param K=V · --param K~V · --since 7d · -L · --json
-ops orion task get <id> [--json] · task logs <id> [--raw] · task rerun <id> · task cancel <id> (on a running one, and on a finished one -> exit 1)
-ops orion script run <name>  (still works: same recorded path as task run)
+cd /tmp && ops task run retry_invoices --dry-run 1   (banner + trailer on stderr, report in /tmp, exit code == direct run)
+ops task run ri --help  vs  ops task run --help
+ops task run edit_document_payload (exit 2, points to view)
+ops task run b2b_credit_notes/decode_payloads --help
+ops task run -p K=V <script>  (env var reaches the script; -p AFTER the name goes to the script + prints a note)
+ops task ls · --script · --status · --param K=V · --param K~V · --since 7d · -L · --json
+ops task get <id> [--json] · task logs <id> [--raw] · task rerun <id> · task cancel <id> (on a running one, and on a finished one -> exit 1)
+ops run <name>  (still works: same recorded path as task run)
 ops orion doctor · --json
 ops orion docs check · edit a summary → check fails → docs sync → git diff shows only marker regions
 ops orion script new zz_probe --lang js --env staging --access write  (on a scratch copy) → docs check green → run zz_probe --help

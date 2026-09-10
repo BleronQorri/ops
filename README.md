@@ -6,20 +6,19 @@ runs. The first group, `orion`, browses, documents and runs the scripts in
 history) and keeps their catalogue generated.
 
 ```
-ops <group> <command> [<subcommand>] [flags]
+ops <command> [<subcommand>] [flags]
+
+ops run <name> [args...]                  run a script; the run gets an id, a status and a log
+ops task ls                               past runs, newest first (--script --status --param --since)
+ops task get  <id>                        one run's record, with the tail of its log
+ops task logs <id>                        everything that run printed
+ops task rerun <id>                       same script, same arguments, new id
+ops task cancel <id>                      stop one that is still going
 
 ops orion script list                     catalogue: env · access · tier · status · summary
 ops orion script view <name>              doc page + the script's live --help + examples
 ops orion script pick                     interactive picker (TTY only)
 ops orion script new  <name> --lang {js|exs} --env … --access …
-
-ops orion task run  <name> [args...]      run it; the run gets an id, a status and a log
-ops orion task ls                         past runs, newest first (--script --status --param --since)
-ops orion task get  <id>                  one run's record, with the tail of its log
-ops orion task logs <id>                  everything that run printed
-ops orion task rerun <id>                 same script, same arguments, new id
-ops orion task cancel <id>                stop one that is still going
-
 ops orion doctor                          runtimes, houston, catalogue
 ops orion docs check | sync               lint the catalogue / regenerate the root tables
 ops alias set osr 'orion script run'      shortcuts, gh-style
