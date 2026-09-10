@@ -1,6 +1,6 @@
 ---
 name: b2b_credit_notes
-summary: Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 on a pod
+summary: Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally
 env: production
 access: write
 tier: read-only
@@ -13,7 +13,7 @@ examples:
   - args: "--ids 4838124,4838004 --yes --csv"
     note: matrix mode, no terminal needed
   - args: "--mode decode --ids 4836650,4762882 --yes"
-    note: decode payloads on an eng-orion pod
+    note: decode payloads in the local app-accounting-documents checkout
   - args: "-n eng-orion --ids 123 --yes --no-csv"
 reports: ["b2b-credit-notes-*.md", "b2b-credit-notes-*.csv", "decoded-payloads-*.csv", "decoded-payloads-*.sql"]
 related: [fix_credit_note_references, edit_document_payload, fix_invoice_payloads]
@@ -26,7 +26,7 @@ related: [fix_credit_note_references, edit_document_payload, fix_invoice_payload
 | `decode` | what is inside a document's `payload_base64` — and what would it look like with that invoice's reference patched into it? | [`decode_payloads.js`](#mode-decode) |
 
 `decode` lives in its own file because it shares nothing with the matching logic but the
-psql idiom — it decodes Erlang terms on a Kubernetes pod. It is a standalone executable in
+psql idiom — it decodes Erlang terms in the service's own BEAM. It is a standalone executable in
 its own right; `b2b_credit_notes.js` `require`s it, so `--mode decode` and
 `./decode_payloads.js` run the same code rather than two implementations of it.
 
@@ -219,9 +219,7 @@ Non-interactive — pass `--ids` and `--yes` and it needs no terminal at all:
 | `--ids <list>` | `accounting_documents.id` values, comma **or** space separated | both |
 | `--mode <mode>` | `matrix` \| `decode` (default `matrix`) | both |
 | `--csv` / `--no-csv` | write the CSV, or don't — either way, no prompt | `matrix` |
-| `--pod-namespace <ns>` | namespace of the pod that decodes (default `eng-orion`) | `decode` |
-| `--component <name>` | pod component (default `accounting-documents`) | `decode` |
-| `--release-bin <path>` | release entry point on the pod | `decode` |
+| `--app-dir <path>` | the `app-accounting-documents` checkout that decodes (default: the sibling checkout, `…/repos/orion/app-accounting-documents/src`; env `ACCOUNTING_DOCUMENTS_DIR`) | `decode` |
 | `-y, --yes` | approve the **reads** without prompting. Read-only modes only; it cannot approve a write. | both |
 | `-h, --help` | usage | both |
 
@@ -366,49 +364,54 @@ written once at document creation
 (`create_accounting_document_and_tracker_action.ex:235`). Every value starts `g3` — `0x83`,
 the Erlang External Term Format version byte. **Nothing but a BEAM can read it**, which is
 why inspecting one has until now meant the by-hand procedure in
-[edit_document_payload](../edit_document_payload/) §2–§3: pull the base64 with psql, open
-an IEx console on a pod, paste it in, read the `inspect` output. Fine for one document,
-useless for thirty-four. This does the same three steps for a list of ids.
+[edit_document_payload](../edit_document_payload/) §2–§3: pull the base64 with psql, start an
+IEx shell in the service's checkout, paste it in, read the `inspect` output. Fine for one
+document, useless for thirty-four. This does the same three steps for a list of ids.
 
 ### Where the decode happens, and why
 
 | | |
 |---|---|
 | payloads read from | `--namespace`, default **production** |
-| decoded on | `--pod-namespace`, default **eng-orion** |
+| decoded in | `--app-dir`, default the sibling `app-accounting-documents` checkout |
 
-That asymmetry is deliberate. Decoding is a pure function of the bytes, so the pod never
-touches a database and it does not matter whose data it is. It is also *necessary*: the
-`accounting-documents` component exists in staging only — production's console component
-is `accounting-documents-web`.
-
-The command is
+Decoding is a pure function of the bytes, so it needs a BEAM with the service's modules and
+nothing else — no cluster, no database. The service's own checkout next door is exactly
+that, so that is where it runs:
 
 ```bash
-houston console eng-orion accounting-documents -- \
-  /usr/src/accounting-documents/accounting_documents_all/bin/accounting_documents_all \
-  eval '<decoder>'
+cd ../../orion/app-accounting-documents/src && mix run --no-start -e '<decoder>'
 ```
 
-**`eval`, not `remote`.** `eval` boots a separate VM inside the container with the
-release's modules loaded but the application not started, which is all a pure decode needs.
-`houston console --help` is blunt about the alternative: code on the live node shares its
-memory, so OOMing a `remote` session OOMs the workload that pod is serving. Confirmed
-loadable under `eval`: `Decimal`, `Jason`, `Plug.Crypto`, `BillingDocument`.
+**`--no-start`, so nothing starts.** `mix run --no-start` compiles if needed and puts every
+umbrella app's modules on the code path — `Decimal`, `Jason`, `Plug.Crypto`,
+`BillingDocument` — but starts no application: no Repo, no consumers, no network. The
+production payloads on stdin are the only production data involved. It is the scripted form
+of the IEx shell the runbook opens by hand (`iex -S mix run --no-halt` in the same
+directory), without the REPL state.
 
-The release path comes from `/proc/1/cmdline` on a running pod. If a redeploy moves it,
-read the current one back and pass `--release-bin`:
+This replaces an earlier path that borrowed a staging pod through
+`houston console eng-orion accounting-documents -- <release> eval`. That needed cluster exec
+rights, a release path read out of `/proc/1/cmdline` that moved with every redeploy, and a
+`--pod-namespace` that had to be staging because the `accounting-documents` component does
+not exist in production. None of that is needed to decode bytes.
 
-```bash
-houston console eng-orion accounting-documents -- /bin/sh -c 'tr "\0" " " < /proc/1/cmdline'
-```
+For a different service, point `--app-dir` at that service's checkout instead; anything with
+the payload's modules on its code path will do.
+
+**The checkout must have its deps fetched** (`mix deps.get`). The script never fetches,
+compiles into a different profile, or writes anything there. It also does not read
+`mise.toml` if `mise` is on your PATH — mix is then run through `mise x --`. Under asdf,
+where `mise.toml` is invisible, the pinned Elixir/Erlang from that file are exported as
+`ASDF_ELIXIR_VERSION` / `ASDF_ERLANG_VERSION` (falling back to the newest installed build
+of the same line), so a bare `mix` does not fail with "No version is set". Export either
+variable yourself and it is left alone.
 
 **The payloads travel on stdin.** base64 contains `+`, `/` and `=`, and 34 payloads is
-~140 KB — argv is the wrong channel on both counts. `IO.read(:stdio, :eof)` inside `eval`
-reads a piped payload correctly; kubectl notes `Unable to use a TTY - input is not a
-terminal` on stderr, because houston always asks for one, and proceeds anyway.
+~140 KB — argv is the wrong channel on both counts. `IO.read(:stdio, :eof)` inside the
+evaluated program reads a piped payload correctly.
 
-**The pod answers in JSON, not pipe-delimited.** The *answer* is Elixir — an `inspect`ed
+**The decoder answers in JSON, not pipe-delimited.** The *answer* is Elixir — an `inspect`ed
 term, which is exactly what lands in the CSV — but it needs an envelope to travel in, and
 every obvious delimiter occurs inside the payload. Party names are free text out of provider
 records, and document 4836650's issuee is literally
@@ -419,18 +422,18 @@ Atira Beauty Lounge | اتيرا بيوتي لاونج
 
 — a pipe, inside a field. The `parseRows` convention the psql reads here use would have
 split that row silently. Addresses carry commas; a pretty-printed term is full of newlines.
-`Jason.encode!/1` escapes precisely those, so the pod emits one `ROW <json>` line per
-document and Node unwraps it. The prefix also discards the Logger deprecation warning the
-release prints at startup. No JSON reaches the CSV.
+`Jason.encode!/1` escapes precisely those, so the decoder emits one `ROW <json>` line per
+document and Node unwraps it. The prefix also discards everything else mix prints — compile
+progress, config warnings, Logger chatter. No JSON reaches the CSV.
 
 `Plug.Crypto.non_executable_binary_to_term/1` does the decoding — it refuses anonymous
 functions and other executable terms, and it is what production itself uses (`submission.ex:255`).
 These payloads come from our own database so plain `:erlang.binary_to_term/1` would do, but
 a decoder that cannot be talked into evaluating something is the better habit.
 
-Batched at **200 documents per pod invocation**, because each `houston console` is a fresh
-`kubectl exec` costing several seconds — but not unbounded, which would mean an unbounded
-term list in the pod's memory and one enormous blob of output. Decode failures are per
+Batched at **200 documents per mix invocation**, because each `mix run` boots a VM and loads
+the umbrella, several seconds a time — but not unbounded, which would mean an unbounded term
+list in memory and one enormous blob of output. Decode failures are per
 document (`try/rescue`), so one bad payload costs you that row and not the batch.
 
 ### Output
@@ -520,7 +523,7 @@ untouched field and raises on a typo'd key instead of quietly adding one.
 ⚠ **Byte length and md5 change even when nothing meaningful does**, because
 `term_to_binary` does not preserve map key order. On these 34 the payload grows by exactly
 12 bytes. **Never use length or a digest as a correctness check** — decode and compare
-terms. Three assertions run on the pod, on the same VM that produced the bytes:
+terms. Three assertions run in the same VM that produced the bytes:
 
 | Assertion | |
 |---|---|
@@ -606,7 +609,7 @@ there is. The definitive check is [ZATCA's own](#end-to-end) — below.
 #### Verified on the full cohort
 
 All 34 payloads were re-read from the CSV, paired with the originals straight out of
-production, and checked on a pod independently of the assertions above:
+production, and checked independently of the assertions above:
 
 ```
 was nil before                          PASS  (34/34)
@@ -752,7 +755,7 @@ Both modes share these.
 
 - Read-only, both modes. `SELECT`s only; there is no write path — no
   `houston psql --write`, and no Houston task, anywhere in either file.
-- Every statement and every pod command is echoed before it runs.
+- Every statement and every mix command is echoed before it runs.
 - A confirmation gate before the first query; on production a bare Enter **cancels**.
   It names the databases the chosen mode actually reads, so `decode` does not claim
   `shedul`.
@@ -760,13 +763,13 @@ Both modes share these.
   `einvoice_reference` against a uuid pattern, dates against `YYYY-MM-DD`.
 - Reads are chunked at 500 ids per statement, so a long paste doesn't produce one
   enormous unreadable query.
-- `decode` runs on a **staging** pod and uses `eval`, so it cannot reach a database and
-  cannot disturb the live node's workload.
+- `decode` runs locally with `mix run --no-start`, so it starts no application and cannot
+  reach a database or a cluster.
 
 ## Prereqs
 
 - `node` on PATH (runtimes pinned via `.tool-versions`). No dependencies.
 - VPN up and `houston` authenticated — prod reads use the `fresha-production-developer`
   profile.
-- `decode` additionally needs exec rights on the `--pod-namespace` cluster and a running
-  pod for `--component`. No local Elixir required: the BEAM it uses is the pod's.
+- `decode` additionally needs a local `app-accounting-documents` checkout with its deps
+  fetched (`mix deps.get`), and the Elixir/Erlang it pins. No cluster access.

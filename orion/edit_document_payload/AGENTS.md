@@ -1,6 +1,6 @@
 ---
 name: edit_document_payload
-summary: "Runbook: hand-edit an accounting document's payload_base64 on a pod and re-drive the send"
+summary: "Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send"
 env: production
 access: write
 tier: prod-write
@@ -171,11 +171,25 @@ cause from the DB.
 
 ## 3. Decode
 
-The `accounting-documents` component exists in **staging only**; in production the
-console component is `accounting-documents-web`.
+Decoding needs a BEAM with the service's modules on the code path, and the service's own
+checkout is one. Start an IEx shell there:
 
 ```bash
-houston console eng-orion accounting-documents
+cd ~/Desktop/repos/orion/app-accounting-documents/src
+mix deps.get                     # first time, or after a lockfile change
+iex -S mix run --no-start        # modules loaded, application NOT started
+```
+
+`--no-start` is the point: every umbrella app's modules are loadable, but no Repo, consumer
+or endpoint starts, so the shell cannot reach a database and needs no cluster access. (Drop
+it — `iex -S mix run --no-halt` — only when you actually want the app running, which payload
+surgery never does.) For a different service, use that service's checkout.
+
+The checkout pins its toolchain in `mise.toml`. With `mise` installed that is automatic;
+under asdf, which does not read it, pin explicitly first:
+
+```bash
+export ASDF_ELIXIR_VERSION=1.20.3-otp-28 ASDF_ERLANG_VERSION=28.4.2   # match mise.toml
 ```
 
 Then in `iex`, paste the base64:
@@ -188,7 +202,7 @@ doc = b64 |> Base.decode64!() |> :erlang.binary_to_term()
 IO.puts(inspect(doc, pretty: true, limit: :infinity, printable_limit: :infinity, width: 100))
 ```
 
-On the pod the modules are loaded, so this inspects as a real
+With the modules loaded this inspects as a real
 `%AccountingDocuments.Structs.BillingDocument{}` with `%Decimal{}` values. The
 app's own safe reader is there too, and is what production code uses
 (`submission.ex:255`):
@@ -201,11 +215,11 @@ doc = b64 |> Base.decode64!() |> Plug.Crypto.non_executable_binary_to_term()
 executable terms; raw `binary_to_term` on untrusted input is an RCE. This payload
 is service-generated so either works, but prefer the safe one by habit.
 
-**Locally is fine too**, and better for diffing — you get a scriptable, repeatable
-transform instead of REPL state:
+**A bare Elixir outside the checkout is fine too**, and better for diffing — you get a
+scriptable, repeatable transform instead of REPL state. It needs no app, just a BEAM:
 
 ```bash
-# needs asdf's elixir; run from a dir with a .tool-versions, or pin explicitly:
+# any installed Elixir; outside a .tool-versions dir, pin explicitly:
 export ASDF_ELIXIR_VERSION=1.17.1-otp-26 ASDF_ERLANG_VERSION=26.2.1
 ```
 
@@ -219,7 +233,7 @@ doc =
 IO.puts(inspect(doc, pretty: true, limit: :infinity, printable_limit: :infinity, width: 100))
 ```
 
-Without the app in scope the structs inspect as plain maps with a `__struct__`
+Run outside the checkout, with no app in scope, the structs inspect as plain maps with a `__struct__`
 key (`%{__struct__: AccountingDocuments.Structs.BillingDocument, …}`) and
 `Decimal`s show raw as `%{sign: 1, coef: 3279, exp: -2}` — read that as
 `sign × coef × 10^exp`, so `32.79`. Noisier, but the term is identical and
@@ -555,8 +569,11 @@ the second time round.
 - VPN up, `houston` authenticated. Reads use `fresha-production-developer`;
   the §6 `DELETE` needs `--write` (`fresha-production-admin` / `-on-call` /
   `-database-superusers`).
-- Local Elixir only if you decode/re-encode off-pod (`asdf`; pin with
-  `ASDF_ELIXIR_VERSION` / `ASDF_ERLANG_VERSION` when outside a `.tool-versions` dir).
+- A local `app-accounting-documents` checkout with its deps fetched, for the IEx shell that
+  decodes (§3). Under asdf, pin `ASDF_ELIXIR_VERSION` / `ASDF_ERLANG_VERSION` to the
+  `mise.toml` versions; with `mise` installed it is automatic.
+- No cluster exec rights are needed for the decode — [fix_invoice_payloads](../fix_invoice_payloads/)
+  automates the whole of §2–§4 the same way.
 
 ## Related
 

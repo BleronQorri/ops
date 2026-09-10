@@ -32,10 +32,10 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin catalogue:production/write -->
 | Script | Tier | Run | What it does |
 |--------|------|-----|--------------|
-| [b2b_credit_notes](b2b_credit_notes/) | read-only | `ops orion script run b2b_credit_notes` · `b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 on a pod |
-| [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 on a pod and re-drive the send |
+| [b2b_credit_notes](b2b_credit_notes/) | read-only | `ops orion script run b2b_credit_notes` · `b2b` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
+| [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
 | [fix_credit_note_references](fix_credit_note_references/) ⛔ **BLOCKED** | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of b2b_credit_notes: put the BillingReference onto the 34 rejected B2B credit notes **Blocked on:** app-accounting-documents change — B2BCreditNoteXMLBuilder lacks maybe_build_reference/1, so patching payload_base64 alone does nothing |
-| [fix_invoice_payloads](fix_invoice_payloads/) | read-only | `ops orion script run fix_invoice_payloads` · `fip` | Decode an invoice's payload_base64 on a pod, patch it with an Elixir expression, emit the remediation runbook |
+| [fix_invoice_payloads](fix_invoice_payloads/) | read-only | `ops orion script run fix_invoice_payloads` · `fip` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
 | [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | prod-write-irreversible | `ops orion script run it_credential_lifecycle_bugbash` · `iclb` | Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB |
 | [plugin_legal_entity_updates](plugin_legal_entity_updates/) | prod-write-no-dry-run | `ops orion script run plugin_legal_entity_updates` · `ple` | Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight |
 | [process_missing_sales](process_missing_sales/) | prod-write | `ops orion script run process_missing_sales` · `pms` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |

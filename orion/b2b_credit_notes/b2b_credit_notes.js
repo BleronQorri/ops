@@ -159,7 +159,8 @@
 // The other mode, `decode`, answers a different question — what is actually inside a
 // document's payload_base64 — and lives in ./decode_payloads.js, which is a standalone
 // executable this file requires. See its header; the short version is that payload_base64
-// is an Erlang term, so reading one needs a BEAM, and a pod is where the nearest one is.
+// is an Erlang term, so reading one needs a BEAM, and the service's own checkout next door
+// is where the nearest one is (`mix run --no-start`).
 //
 // SAFETY
 //   - Lives under write/ because a mutating mode is planned. Both modes that exist
@@ -192,7 +193,8 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-// The `decode` mode lives in its own file: it decodes Erlang terms on a pod and shares
+// The `decode` mode lives in its own file: it decodes Erlang terms in the service's local
+// BEAM and shares
 // nothing with the matching logic here beyond the psql idiom. It is a standalone
 // executable in its own right — this requires it rather than re-implementing it, so
 // `--mode decode` and `./decode_payloads.js` run exactly the same code.
@@ -260,9 +262,7 @@ Options:
       --csv                 also write the CSV, without asking          (matrix)
       --no-csv              never write the CSV. matrix asks without it;
                             decode always writes unless you pass this.
-      --pod-namespace <ns>  namespace of the pod that decodes           (decode)
-      --component <name>    pod component                              (decode)
-      --release-bin <path>  release entry point on the pod              (decode)
+      --app-dir <path>      app-accounting-documents checkout that decodes (decode)
       --task-service <svc>  deployment named in the emitted write command  (decode)
   -y, --yes                 approve the database reads without prompting.
                             Read-only modes only — it cannot approve a write.
@@ -282,7 +282,8 @@ wins, then the most recent invoice created at or before it. The credit note's va
 the sum of its line items, not provider_invoices.total (unreliable on credit notes).
 
 decode: payload_base64 is an Erlang term, so reading it needs a BEAM. The payloads are
-read from --namespace and decoded on a --pod-namespace pod borrowed purely as a runtime.
+read from --namespace and decoded locally in the app-accounting-documents checkout
+(--app-dir) by 'mix run --no-start', which loads the modules and starts nothing.
 
 Exit codes: 0 all resolved, 1 anything unresolved or rejected, 2 bad invocation.`);
 }
@@ -296,7 +297,7 @@ function parseArgs(argv) {
     csv: null, // null = ask, true = write, false = skip
     // Only the decode mode uses these; its own defaults are the single source of truth,
     // so they are not restated here.
-    pod: decodePayloads.podDefaults(),
+    app: decodePayloads.appDefaults(),
     yes: false,
   };
 
@@ -335,14 +336,8 @@ function parseArgs(argv) {
       case "--no-csv":
         opts.csv = false;
         break;
-      case "--pod-namespace":
-        opts.pod.namespace = value(arg, i++);
-        break;
-      case "--component":
-        opts.pod.component = value(arg, i++);
-        break;
-      case "--release-bin":
-        opts.pod.bin = value(arg, i++);
+      case "--app-dir":
+        opts.app.dir = value(arg, i++);
         break;
       case "--task-service":
         opts.taskService = value(arg, i++);
@@ -1588,7 +1583,7 @@ async function confirmDataAccess(opts, env, count) {
   output.write(`  reading   : ${count} document id${count === 1 ? "" : "s"}\n`);
   if (opts.mode === "decode") {
     output.write(
-      `  decode on : ${opts.pod.namespace} / ${opts.pod.component}   (a pod, no DB access)\n`
+      `  decode in : ${decodePayloads.resolveApp(opts.app).dir}   (local BEAM, mix run --no-start — no DB access)\n`
     );
   }
   output.write("  access    : SELECT only — this script has no write path\n");
@@ -1849,7 +1844,7 @@ async function main() {
           {
             label: "decode — what is inside payload_base64",
             detail:
-              "decodes each document's stored Erlang term on a pod and writes it to a " +
+              "decodes each document's stored Erlang term in the service's local BEAM and writes it to a " +
               "CSV, one record each",
             aliases: ["decode", "d", "payload", "payloads"],
             value: "decode",

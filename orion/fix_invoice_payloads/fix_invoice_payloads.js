@@ -9,13 +9,13 @@
 // written once at document creation (create_accounting_document_and_tracker_action.ex:235).
 // Every value starts `g3` — 0x83, the Erlang External Term Format version byte — so nothing
 // but a BEAM can read it. ../edit_document_payload/AGENTS.md is the by-hand runbook: pull the
-// base64 with psql, open IEx on a pod, paste it in, read the inspect output, edit, re-encode,
+// base64 with psql, open an IEx shell, paste it in, read the inspect output, edit, re-encode,
 // then work out which of four Houston tasks the document actually needs. Fine once. Tedious
 // and error-prone the second time, and the errors are silent ones.
 //
 // This automates both halves for `document_type = 'invoice'` documents:
 //
-//   --mode decode   read the payloads, decode them on a pod, write a CSV. No fix needed yet.
+//   --mode decode   read the payloads, decode them in the service's own BEAM, write a CSV.
 //   --mode patch    apply an Elixir patch expression, verify the bytes, and emit the exact
 //                   remediation sequence this document needs — conditional on its country,
 //                   its persisted line items and its tracker's current state.
@@ -27,33 +27,33 @@
 // copied from it rather than imported, which is the house convention: one directory, one
 // entrypoint, no shared library to drift under either caller.
 //
-// WHY THE POD IS A STAGING POD. The payloads come from production; the decode happens on
-// eng-orion. Deliberate: decoding is a pure function of the bytes, so the pod never sees a
-// database and it does not matter whose data it is. It is also necessary — the
-// `accounting-documents` component exists in staging only, and production's console
-// component is `accounting-documents-web`.
+// WHY LOCALLY, IN THE SERVICE'S CHECKOUT. Decoding is a pure function of the bytes, so it
+// needs a BEAM with the app's modules and nothing else. The app-accounting-documents checkout
+// next door has exactly that: `mix run --no-start` compiles if needed, loads every umbrella
+// app's modules and starts none of them — no Repo, no database, no network. It replaces the
+// earlier approach of borrowing a staging pod through `houston console … eval`, which needed
+// cluster exec rights and a release path that moved with every redeploy.
 //
-// WHY `eval` AND NOT `remote`. `eval` boots a separate VM inside the container with the
-// release's modules loaded but the application not started, which is all a pure decode and
-// re-encode needs. Code run via `remote` shares the live node's memory, so OOMing a `remote`
-// session OOMs the workload that pod is serving.
+// WHY `--no-start`. Starting the application would connect Repos and consumers; a decode has
+// no use for any of it, and a script that reads production payloads should not also be
+// pointing a local application at anything.
 //
 // WHY THE PAYLOADS GO IN ON STDIN. base64 contains `+`, `/` and `=`, and a payload is
-// multiple KB — argv is the wrong channel on both counts. `IO.read(:stdio, :eof)` inside
-// `eval` reads a piped payload correctly. kubectl notes `Unable to use a TTY - input is not a
-// terminal` on stderr because houston always asks for one, and proceeds anyway.
+// multiple KB — argv is the wrong channel on both counts. `IO.read(:stdio, :eof)` inside the
+// evaluated program reads a piped payload correctly.
 //
-// WHY THE POD ANSWERS IN JSON. The answer itself is Elixir — an `inspect`ed term — but it
+// WHY THE BEAM ANSWERS IN JSON. The answer itself is Elixir — an `inspect`ed term — but it
 // needs an envelope, and every obvious delimiter appears inside the payload. Party names are
 // free text from provider records and contain literal pipes; addresses carry commas; a
-// pretty-printed term is full of newlines. JSON escapes exactly those, so the pod emits one
-// `ROW <json>` line per document and Node unwraps it. The prefix also discards the Logger
-// deprecation warning the release prints at startup.
+// pretty-printed term is full of newlines. JSON escapes exactly those, so the decoder emits
+// one `ROW <json>` line per document and Node unwraps it. The prefix also discards everything
+// else mix prints — compile progress, config warnings, Logger chatter.
 //
 // SAFETY
-//   - Read-only. SELECTs, a pure-function decode on a pod with no database access, and files
-//     in the working directory. No `houston psql --write`, no `houston task run`, ever.
-//   - Every statement, every pod command, and the whole patch expression are echoed before
+//   - Read-only. SELECTs, a pure-function decode in a local BEAM that starts no application,
+//     and files in the working directory. No `houston psql --write`, no `houston task run`,
+//     ever.
+//   - Every statement, every mix command, and the whole patch expression are echoed before
 //     anything runs.
 //   - A confirmation gate before the first read; production defaults to Cancel.
 //   - Ids are validated as integers and base64 against RFC 4648 before either reaches a
@@ -66,8 +66,8 @@
 //   ./fix_invoice_payloads.js --ids 4687595,4762930 --yes         decode only
 //   ./fix_invoice_payloads.js --ids 4687595 --patch-file fix.exs --yes
 //
-// Prereqs: VPN up, `houston` authenticated (prod reads use fresha-production-developer).
-// Node only, no dependencies.
+// Prereqs: VPN up, `houston` authenticated (prod reads use fresha-production-developer); a
+// local app-accounting-documents checkout with deps fetched. Node only, no dependencies.
 
 "use strict";
 
@@ -84,18 +84,6 @@ const AD_DB = "accounting_documents";
 const DEFAULT_NAMESPACE = "production";
 const PROD_NAMESPACES = new Set(["production", "prod"]);
 
-// The pod is only borrowed as a BEAM, so it defaults to staging regardless of where the
-// payloads came from. See the header.
-const DEFAULT_POD_NAMESPACE = "eng-orion";
-const DEFAULT_COMPONENT = "accounting-documents";
-
-// From /proc/1/cmdline on a running accounting-documents pod: the release root is
-// /usr/src/accounting-documents/accounting_documents_all, so this is its bin/ entry point. If
-// a redeploy ever moves it, `houston console <ns> <component> -- /bin/sh -c
-// 'tr "\0" " " < /proc/1/cmdline'` prints the current one.
-const DEFAULT_RELEASE_BIN =
-  "/usr/src/accounting-documents/accounting_documents_all/bin/accounting_documents_all";
-
 const MODES = ["decode", "patch"];
 
 // Both modes are read-only. The set is the enforcement mechanism, not a description: a mode
@@ -106,10 +94,10 @@ const READ_ONLY_MODES = new Set(["decode", "patch"]);
 // An IN(...) list of thousands of ids makes for an unwieldy statement and an unreadable echo.
 const CHUNK = 500;
 
-// Documents per pod invocation. Each `houston console` is a fresh kubectl exec costing
-// several seconds, so batching is the point — but an unbounded batch means an unbounded term
-// list in the pod's memory and one enormous blob of output.
-const POD_CHUNK = 200;
+// Documents per mix invocation. Each `mix run` boots a VM and loads the umbrella, several
+// seconds a time, so batching is the point — but an unbounded batch means an unbounded term
+// list in memory and one enormous blob of output.
+const BEAM_CHUNK = 200;
 
 const ROW_PREFIX = "ROW ";
 
@@ -148,8 +136,7 @@ const TASK_TRACKER = "update_einvoice_trackers_status";
 const TASK_RETRY = "retry_sending_failed_accounting_documents";
 
 // The deployment that carries the tasks. Production runs the web component; other namespaces
-// have the plain one. Same split as the console component, and overridable because a redeploy
-// is likelier than a change to this script.
+// have the plain one. Overridable because a redeploy is likelier than a change to this script.
 function taskService(namespace) {
   return isProd(namespace) ? "accounting-documents-web" : "accounting-documents";
 }
@@ -165,9 +152,9 @@ class UsageError extends Error {
   }
 }
 
-// --- the decoder that runs on the pod ----------------------------------------
+// --- the decoder that runs in the BEAM ---------------------------------------
 //
-// Elixir, evaluated by the release. Reads `id|base64` lines from stdin and writes one
+// Elixir, evaluated by `mix run --no-start -e` in the service's checkout. Reads `id|base64` lines from stdin and writes one
 // `ROW <json>` line per document to stdout.
 //
 // `Plug.Crypto.non_executable_binary_to_term/1` rather than `:erlang.binary_to_term/1`: it
@@ -179,7 +166,7 @@ class UsageError extends Error {
 // `pretty: true` is the only rendering, because it is the one anyone actually reads. The cost
 // is that the term spans lines, so the CSV has more physical lines than records and cannot be
 // grepped line-by-line — use a real CSV reader. On the wire that costs nothing: JSON escapes
-// the newlines, so the pod's own output stays one line per document.
+// the newlines, so the decoder's own output stays one line per document.
 //
 // try/rescue is per document: one undecodable payload should cost you that row, not the other.
 
@@ -261,11 +248,10 @@ IO.read(:stdio, :eof)
 end)
 `;
 
-// Assemble the pod program. The patch expression is a local file's contents, so it is joined
+// Assemble the program. The patch expression is a local file's contents, so it is joined
 // by CONCATENATION and never interpolated into a template literal — a `${` or a backtick in
 // the file would otherwise be read by JavaScript instead of Elixir. The finished string
-// reaches houston through spawnSync's argv array, so there is no shell to quote against
-// either.
+// reaches mix through spawnSync's argv array, so there is no shell to quote against either.
 //
 // `_ = {doc, id}` suppresses Elixir's unused-variable warning when a patch expression
 // mentions only one of them, which is the common case.
@@ -310,20 +296,116 @@ function echoSql(label, sql) {
   for (const line of shown.split("\n")) output.write(`    ${c.sql(line)}\n`);
 }
 
-// The pod command, echoed with the Elixir elided — the decoder is constant, so printing it
+// --- the local BEAM ----------------------------------------------------------
+//
+// The decode runs in the service's own checkout: `mix run --no-start -e '<decoder>'` with the
+// app-accounting-documents umbrella as cwd. `--no-start` compiles if needed and puts every
+// app's modules on the code path — BillingDocument, Decimal, Plug.Crypto, Jason — but starts
+// nothing: no Repo, no database, no network. The payloads are the only production data it
+// ever sees, and they arrive on stdin.
+//
+// The checkout is found through ACCOUNTING_DOCUMENTS_DIR, then --app-dir, then the sibling
+// repo next to ops/ (…/repos/orion/app-accounting-documents/src). It must have its deps
+// fetched (`mix deps.get`) — this script never fetches or writes anything there.
+const DEFAULT_APP_DIR =
+  process.env.ACCOUNTING_DOCUMENTS_DIR ||
+  path.resolve(__dirname, "..", "..", "..", "orion", "app-accounting-documents", "src");
+
+function appDefaults() {
+  return { dir: DEFAULT_APP_DIR };
+}
+
+function onPath(cmd) {
+  return spawnSync("sh", ["-c", `command -v ${cmd}`], { encoding: "utf8" }).status === 0;
+}
+
+function findUp(start, file) {
+  let dir = path.resolve(start);
+  for (;;) {
+    const p = path.join(dir, file);
+    if (fs.existsSync(p)) return p;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function asdfList(tool) {
+  const r = spawnSync("asdf", ["list", tool], { encoding: "utf8" });
+  if (r.status !== 0) return [];
+  return r.stdout.split("\n").map((l) => l.replace(/[\s*]/g, "")).filter(Boolean);
+}
+
+// The checkout pins its toolchain in mise.toml, which asdf does not read, so under asdf a
+// bare `mix` in that directory fails with "No version is set". When `mise` is absent and no
+// ASDF_*_VERSION is already exported, pin from mise.toml: the exact version if it is
+// installed, else the newest installed build of the same line (major.minor for Elixir,
+// major for Erlang). With `mise` on PATH, mix is run through `mise x --` and mise decides.
+function toolchainEnv(dir) {
+  const env = { ...process.env };
+  if (onPath("mise")) return env;
+  const toml = findUp(dir, "mise.toml");
+  if (!toml) return env;
+  const text = fs.readFileSync(toml, "utf8");
+  for (const [tool, key, depth] of [["elixir", "ASDF_ELIXIR_VERSION", 2], ["erlang", "ASDF_ERLANG_VERSION", 1]]) {
+    if (env[key]) continue;
+    const m = new RegExp(`^${tool}\\s*=\\s*"([^"]+)"`, "m").exec(text);
+    if (!m) continue;
+    const want = m[1];
+    const installed = asdfList(tool);
+    if (installed.includes(want)) {
+      env[key] = want;
+      continue;
+    }
+    const line = want.split(".").slice(0, depth).join(".");
+    const candidates = installed
+      .filter((v) => v.split(".").slice(0, depth).join(".") === line)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (candidates.length) env[key] = candidates[candidates.length - 1];
+  }
+  return env;
+}
+
+// Resolve --app-dir to the mix project (the umbrella lives in src/) and the environment mix
+// needs. Refuses, with the flag to fix it, when there is no mix.exs to be found.
+function resolveApp(app) {
+  let dir = path.resolve(app.dir);
+  if (!fs.existsSync(path.join(dir, "mix.exs")) && fs.existsSync(path.join(dir, "src", "mix.exs"))) {
+    dir = path.join(dir, "src");
+  }
+  if (!fs.existsSync(path.join(dir, "mix.exs"))) {
+    throw new UsageError(
+      `No mix.exs at ${dir}. Point --app-dir (or ACCOUNTING_DOCUMENTS_DIR) at the app-accounting-documents checkout.`
+    );
+  }
+  const mix = onPath("mise") ? ["mise", "x", "--", "mix"] : ["mix"];
+  return { dir, mix, env: toolchainEnv(dir) };
+}
+
+// The mix command, echoed with the Elixir elided — the decoder is constant, so printing it
 // every batch buries the part that varies. The patch expression is NOT elided; it is printed
 // in full at the gate, before any of this runs.
-function echoPod(pod, count, patching) {
+function echoBeam(app, count, patching) {
   output.write(
     `  ${c.faint(
-      `${patching ? "patching" : "decoding"} ${count} payload${count === 1 ? "" : "s"} on a pod`
+      `${patching ? "patching" : "decoding"} ${count} payload${count === 1 ? "" : "s"} in the service's own BEAM`
     )}\n` +
-      `    ${c.cmd(
-        `houston console ${pod.namespace} ${pod.component} -- ${pod.bin} eval '<decoder>'`
-      )}\n` +
+      `    ${c.cmd(`cd ${app.dir} && ${app.mix.join(" ")} run --no-start -e '<decoder>'`)}\n` +
       `    ${c.faint("payloads on stdin; one ROW <json> line back per document")}\n`
   );
 }
+
+// Run one batch through the local BEAM. Returns the ROW lines; everything else mix prints
+// (compile progress, config warnings, Logger chatter) is discarded.
+function runBeam(app, program, stdin) {
+  const out = runCapture(app.mix[0], [...app.mix.slice(1), "run", "--no-start", "-e", program], {
+    input: stdin,
+    cwd: app.dir,
+    env: app.env,
+  });
+  return out.split("\n").filter((line) => line.startsWith(ROW_PREFIX));
+}
+
 
 // --- prompting ---------------------------------------------------------------
 //
@@ -467,7 +549,7 @@ function psqlRead(env, db, sql) {
 // This is only safe because every column either query selects is machine-generated — an id,
 // an enum, a uuid, an ISO timestamp, or a reference of the form `INV/21396`. None can contain
 // the pipe. Party names, which DO contain literal pipes, are deliberately not selected here;
-// they arrive from the pod inside a JSON envelope instead.
+// they arrive from the decoder inside a JSON envelope instead.
 function parseRows(out, fieldCount) {
   return out
     .split("\n")
@@ -521,7 +603,7 @@ function guardBase64(value, what) {
 // `line_item_id`, never on name or position: it is the only stable key, and it is what the
 // refund path uses to correlate lines later.
 //
-// This is arbitrary Elixir, evaluated on a pod. That pod has no database access — it is
+// This is arbitrary Elixir, evaluated in the local BEAM. That VM has no database access — it is
 // borrowed purely as a runtime — but the expression is still printed in full at the
 // confirmation gate, because approving it is the point of the gate.
 function readPatchFile(file) {
@@ -636,32 +718,25 @@ function fetchLineItems(env, ids, byId) {
   }
 }
 
-// Step 3 — decode (and optionally patch) on the pod, in batches.
-function decodeOnPod(pod, docs, patchExpr) {
+// Step 3 — decode (and optionally patch) in the local BEAM, in batches.
+function decodeLocally(app, docs, patchExpr) {
   const byId = new Map();
   const decoder = buildDecoder(patchExpr);
 
-  for (const batch of chunked(docs, POD_CHUNK)) {
-    echoPod(pod, batch.length, Boolean(patchExpr));
+  for (const batch of chunked(docs, BEAM_CHUNK)) {
+    echoBeam(app, batch.length, Boolean(patchExpr));
 
-    // `id|base64`, one per line. base64 contains no pipe, so the pod's split into two is
+    // `id|base64`, one per line. base64 contains no pipe, so the decoder's split into two is
     // unambiguous — and unlike the credit-note script there is no free-text field riding
     // along, because the patch travels in the program rather than in the data.
     const stdin = `${batch.map((d) => `${d.id}|${d.payloadBase64}`).join("\n")}\n`;
 
-    const out = runCapture(
-      "houston",
-      ["console", pod.namespace, pod.component, "--", pod.bin, "eval", decoder],
-      { input: stdin }
-    );
-
-    for (const line of out.split("\n")) {
-      if (!line.startsWith(ROW_PREFIX)) continue; // houston/Logger chatter
+    for (const line of runBeam(app, decoder, stdin)) {
       let row;
       try {
         row = JSON.parse(line.slice(ROW_PREFIX.length));
       } catch (err) {
-        throw new Error(`Could not parse a decoded row from the pod: ${err.message}\n${line}`);
+        throw new Error(`Could not parse a decoded row from the decoder: ${err.message}\n${line}`);
       }
       byId.set(String(row.id), row);
     }
@@ -1239,8 +1314,8 @@ async function askDocumentIds() {
 
 // The gate, before ANY data access. Read-only throughout, but it is still real production
 // data, and on a patching run it is also the moment the patch expression gets approved — so
-// that is printed here in full, before the pod ever sees it.
-async function confirmDataAccess(opts, env, pod, count, patchExpr) {
+// that is printed here in full, before the BEAM ever sees it.
+async function confirmDataAccess(opts, env, app, count, patchExpr) {
   const namespace = opts.namespace;
   const prod = isProd(namespace);
 
@@ -1250,11 +1325,11 @@ async function confirmDataAccess(opts, env, pod, count, patchExpr) {
   output.write(`  database  : ${AD_DB}\n`);
   output.write(`  mode      : ${opts.mode}\n`);
   output.write(`  reading   : ${count} document id${count === 1 ? "" : "s"}\n`);
-  output.write(`  decode on : ${pod.namespace} / ${pod.component}   (a pod, no DB access)\n`);
+  output.write(`  decode in : ${app.dir}   (local BEAM, mix run --no-start — no DB access)\n`);
   output.write("  access    : SELECT only — this script has no write path\n");
 
   if (patchExpr) {
-    output.write(`\n  ${c.head(`patch (${opts.patchFile}) — evaluated on the pod:`)}\n`);
+    output.write(`\n  ${c.head(`patch (${opts.patchFile}) — evaluated in the local BEAM:`)}\n`);
     output.write("    patch = fn doc, id ->\n");
     for (const line of patchExpr.split("\n")) output.write(`    ${c.cmd(line)}\n`);
     output.write("    end\n");
@@ -1283,7 +1358,7 @@ async function confirmDataAccess(opts, env, pod, count, patchExpr) {
 // --- the run -----------------------------------------------------------------
 
 function run(opts, env, ids, patchExpr) {
-  const pod = opts.pod || podDefaults();
+  const app = resolveApp(opts.app || appDefaults());
 
   // 1. The documents, and the line-item rows that do not follow their payloads.
   const docs = fetchDocuments(env, ids);
@@ -1322,13 +1397,13 @@ function run(opts, env, ids, patchExpr) {
   }
 
   // 2. Decode, and patch if there is a patch.
-  const decoded = decodeOnPod(pod, decodable, patchExpr);
+  const decoded = decodeLocally(app, decodable, patchExpr);
 
   const rows = [];
   for (const doc of decodable) {
     const result = decoded.get(doc.id);
     if (!result) {
-      rejects.push({ id: doc.id, reason: "NO ANSWER — the pod returned no row for this id" });
+      rejects.push({ id: doc.id, reason: "NO ANSWER — the decoder returned no row for this id" });
       continue;
     }
     if (result.error) {
@@ -1338,7 +1413,7 @@ function run(opts, env, ids, patchExpr) {
 
     // A patched row that fails any structural assertion is DROPPED rather than reported with
     // a caveat: its base64 is a candidate for a production write, and half-verified bytes are
-    // worse than none. Every check runs on the pod, on the VM that produced the bytes.
+    // worse than none. Every check runs in the VM that produced the bytes.
     //
     // These replace the credit-note script's `only_field_changed`, which cannot survive a fix
     // whose fields are not known in advance. What moved is reported instead — see
@@ -1418,14 +1493,6 @@ function firstAssertionFailure(result) {
   return null;
 }
 
-function podDefaults() {
-  return {
-    namespace: DEFAULT_POD_NAMESPACE,
-    component: DEFAULT_COMPONENT,
-    bin: DEFAULT_RELEASE_BIN,
-  };
-}
-
 // --- entry point -------------------------------------------------------------
 
 function usage() {
@@ -1440,9 +1507,8 @@ Options:
       --ids <list>          accounting_documents.id values, comma or space separated
       --patch-file <path>   Elixir expression over doc/id, returning the patched document
       --any-type            allow document_type other than '${WANTED_DOCUMENT_TYPE}'
-      --pod-namespace <ns>  namespace of the pod that DECODES (default ${DEFAULT_POD_NAMESPACE})
-      --component <name>    pod component (default ${DEFAULT_COMPONENT})
-      --release-bin <path>  release entry point on the pod
+      --app-dir <path>      app-accounting-documents checkout that DECODES
+                            (default ${DEFAULT_APP_DIR}; env ACCOUNTING_DOCUMENTS_DIR)
       --task-service <svc>  deployment named in the emitted Houston commands
                             (default accounting-documents-web on production)
       --no-csv              don't write the CSV (the originals are written regardless)
@@ -1455,7 +1521,8 @@ Anything not passed is prompted for. For a fully non-interactive run supply --id
   ./fix_invoice_payloads.js --ids 4687595 --patch-file fix.exs --yes
 
 payload_base64 is an Erlang term, so reading it needs a BEAM: the payloads are read from
-production and decoded on a staging pod, which is only borrowed as a runtime and never sees a
+production and decoded locally by 'mix run --no-start' in the app-accounting-documents
+checkout, which loads the app's modules but starts nothing and never sees a
 database.
 
 THE PATCH FILE is an Elixir expression over two bound variables — \`doc\`, the decoded
@@ -1470,7 +1537,7 @@ document. One file can carry several documents' edits:
 Use %{doc | …} rather than rebuilding the struct: it preserves untouched fields and raises on
 a typo'd key. Match items on line_item_id, never on name or position.
 
-Five assertions run on the pod, and a document failing any of them is dropped rather than
+Five assertions run in that same VM, and a document failing any of them is dropped rather than
 reported with a caveat: still a BillingDocument, same key set, re-encode round-trips,
 all_lines/1 non-empty, and the patch actually changed something. Which fields changed is
 reported, not constrained. Never use byte length or md5 as a check — term_to_binary does not
@@ -1492,7 +1559,7 @@ function parseArgs(argv) {
     ids: null,
     patchFile: null,
     anyType: false,
-    pod: podDefaults(),
+    app: appDefaults(),
     csv: true,
     yes: false,
   };
@@ -1535,14 +1602,8 @@ function parseArgs(argv) {
       case "--any-type":
         opts.anyType = true;
         break;
-      case "--pod-namespace":
-        opts.pod.namespace = value(arg, i++);
-        break;
-      case "--component":
-        opts.pod.component = value(arg, i++);
-        break;
-      case "--release-bin":
-        opts.pod.bin = value(arg, i++);
+      case "--app-dir":
+        opts.app.dir = value(arg, i++);
         break;
       case "--task-service":
         opts.taskService = value(arg, i++);
@@ -1601,7 +1662,7 @@ async function main() {
   }
   const ids = opts.ids || (await askDocumentIds());
 
-  if (!(await confirmDataAccess(opts, env, opts.pod, ids.length, patchExpr))) {
+  if (!(await confirmDataAccess(opts, env, resolveApp(opts.app), ids.length, patchExpr))) {
     output.write("\n  Cancelled. Nothing was read.\n");
     return EXIT_USAGE;
   }
