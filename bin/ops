@@ -2,15 +2,14 @@
 "use strict";
 
 const { CommanderError } = require("commander");
-const { buildProgram, reservedWords, shortHelp } = require("../lib/program");
-const config = require("../lib/config");
+const { buildProgram, shortHelp } = require("../lib/program");
 const ui = require("../lib/ui");
 
 async function main() {
   const program = buildProgram();
   require("../lib/orion").register(program);
 
-  const argv = config.expandAlias(process.argv.slice(2), reservedWords(program));
+  const argv = process.argv.slice(2);
   if (argv.length === 0) {
     // Bare `ops`: short help, exit 0 (like `gh`).
     process.stdout.write(shortHelp(program));

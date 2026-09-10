@@ -9,8 +9,6 @@ history) and keeps their catalogue generated.
 ops <command> [<subcommand>] [flags]
 
 ops run <name> [args...]                  run a script; the run gets an id, a status and a log
-                                          (names are the whole surface — no per-script aliases;
-                                           `ops alias set ri 'run resend_stuck_invoices'` if you want one)
 ops task ls                               past runs, newest first (--script --status --param --since)
 ops task get  <id>                        one run's record, with the tail of its log
 ops task logs <id>                        everything that run printed
@@ -24,7 +22,6 @@ ops orion script pick                     interactive picker (TTY only)
 ops orion script new  <name> --lang {js|exs} --env … --access …
 ops orion doctor                          runtimes, houston, catalogue
 ops orion docs check | sync               lint the catalogue / regenerate the root tables
-ops alias set osr 'orion script run'      shortcuts, gh-style
 ops help tiers | environment | exit-codes | conventions
 ```
 
@@ -65,7 +62,7 @@ resend_stuck_invoices                   production  write   prod-write          
 $ ops orion script view ri          # the page: summary, tier, key AGENTS.md sections, live --help, examples
 
 $ ops orion task run ri --dry-run 123,456
-ops ▸ run 42  resend_stuck_invoices (alias ri)  production · write · prod-write — Prod writes (gated, reversible-ish)
+ops ▸ run 42  resend_stuck_invoices  ⚠ PRODUCTION WRITE  production · write · prod-write — …
 …the script's own prompts, gates and output…
 ops ▸ run 42 completed in 18s (exit 0)  · ops orion task logs 42
 
@@ -96,12 +93,12 @@ The one line on stderr before a run is the script's environment, access and tier
 
 ```
 orion/                  the scripts: one <name>/ per script with an AGENTS.md each; .tool-versions
-bin/ops                 entry: builds the commander program, expands aliases, maps errors to exit codes
-lib/program.js          root program, gh-style help formatter, help topics, config / alias / completion
+bin/ops                 entry: builds the commander program and maps errors to exit codes
+lib/program.js          root program, gh-style help formatter, help topics, config / completion
 lib/ui.js               colour (NO_COLOR), TTY vs TSV tables, JSON, wrap, pager, error classes
 lib/config.js           ~/.config/ops/config.json
 lib/orion/index.js      registers `ops orion`
-lib/orion/catalogue.js  frontmatter parser (strict YAML subset), dir walk, validation, name/alias resolution
+lib/orion/catalogue.js  frontmatter parser (strict YAML subset), dir walk, validation, name resolution
 lib/orion/{list,view,run,pick,new,doctor,docs}.js
 lib/orion/task.js       the run lifecycle: run / ls / get / logs / rerun / cancel
 lib/orion/runs.js       the run store under $OPS_STATE_DIR (record + log per run)

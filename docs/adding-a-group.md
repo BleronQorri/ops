@@ -43,6 +43,4 @@ Then in `bin/ops`, after the orion line: `require("../lib/<group>").register(pro
   `OPS_<GROUP>_<KEY>` documented in the `environment` help topic.
 - Sub-groups (`ops <group> <noun> <verb>`) follow `orion script`: the noun is a
   command with `.helpGroup("<NOUN> COMMANDS")` on the group page.
-- Any word a user might type as the first token is reserved for aliases:
-  `reservedWords(program)` picks up new commands automatically.
 - Add the group's verification lines to `AGENTS.md`.

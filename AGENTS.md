@@ -34,9 +34,9 @@ frozen — every update happens here.
 - **Help pages follow gh.** Read `docs/help-text-style.md` before writing a
   `summary()`, `description()` or example. Attach USAGE / EXAMPLES / LEARN MORE
   through `gh(cmd, {...})` from `lib/program.js`, never with raw `addHelpText`.
-- **Scripts have no aliases.** The name is the whole surface, which is why it has to
-  be a good one. A personal shortcut is `ops alias set ri 'run resend_stuck_invoices'`,
-  which lives in the user's config, not in the repo.
+- **Nothing has aliases.** Neither the scripts nor the commands, and there is no
+  `ops alias` to make one. A name is typed in full, which is why it has to be a good
+  one. Do not reintroduce a shortcut mechanism.
 - **A script is named for what it does**: verb first, then the object, snake_case,
   and name the external system when more than one exists (Invopop, Comarch). Avoid
   `check`/`fix` where a specific verb exists (audit, patch, resend, wipe, backfill,
@@ -83,7 +83,6 @@ ops run <name>  (still works: same recorded path as task run)
 ops orion doctor · --json
 ops orion docs check · edit a summary → check fails → docs sync → git diff shows only marker regions
 ops orion script new zz_probe --lang js --env staging --access write  (on a scratch copy) → docs check green → run zz_probe --help
-ops alias set osr 'orion script run' && ops osr ri --help
 ops completion zsh > /tmp/_ops && zsh -n /tmp/_ops
 ops orion script pick (TTY) · ops orion script pick | cat (exit 2)
 ```

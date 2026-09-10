@@ -25,9 +25,6 @@ or `<ISSUE_NUMBER>`.
 USAGE
   ops orion script run <script> [<script-args>...]
 
-ALIASES
-  ops orion script ls
-
 FLAGS
   -e, --env <env>   filter by environment; repeatable
 
