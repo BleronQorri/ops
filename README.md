@@ -10,9 +10,16 @@ ops <group> <command> [<subcommand>] [flags]
 
 ops orion script list                     catalogue: env · access · tier · status · summary
 ops orion script view <name>              doc page + the script's live --help + examples
-ops orion script run  <name> [args...]    runs the file exactly as if you typed its path
 ops orion script pick                     interactive picker (TTY only)
 ops orion script new  <name> --lang {js|exs} --env … --access …
+
+ops orion task run  <name> [args...]      run it; the run gets an id, a status and a log
+ops orion task ls                         past runs, newest first (--script --status --param --since)
+ops orion task get  <id>                  one run's record, with the tail of its log
+ops orion task logs <id>                  everything that run printed
+ops orion task rerun <id>                 same script, same arguments, new id
+ops orion task cancel <id>                stop one that is still going
+
 ops orion doctor                          runtimes, houston, catalogue
 ops orion docs check | sync               lint the catalogue / regenerate the root tables
 ops alias set osr 'orion script run'      shortcuts, gh-style
@@ -54,10 +61,22 @@ fix_credit_note_references       production  write   prod-write               bl
 retry_invoices                   production  write   prod-write               active   Re-drive stuck KSA e-invoices: flip trackers retry-eligible, …
 
 $ ops orion script view ri          # the page: summary, tier, key AGENTS.md sections, live --help, examples
-$ ops orion script run ri --dry-run 123,456
-ops ▸ retry_invoices (alias ri)  production · write · prod-write — Prod writes (gated, reversible-ish)
+
+$ ops orion task run ri --dry-run 123,456
+ops ▸ run 42  retry_invoices (alias ri)  production · write · prod-write — Prod writes (gated, reversible-ish)
 …the script's own prompts, gates and output…
+ops ▸ run 42 completed in 18s (exit 0)  · ops orion task logs 42
+
+$ ops orion task ls --script ri
+ID  STATUS     SCRIPT          STARTED    DURATION  ARGS
+42  completed  retry_invoices  2m ago     18s       --dry-run 123,456
+41  failed     retry_invoices  yesterday  4s        999
 ```
+
+Runs are modelled on `houston task`: `run`, `ls`, `get`, `logs`, `rerun`, `cancel`,
+`-p KEY=VALUE` parameters, newest-first listings and the same `KEY=VALUE` /
+`KEY~VALUE` parameter filters. `ops orion script run` is the older spelling of
+`ops orion task run` and goes through the same path.
 
 `ops` never adds or removes a confirmation: the scripts own their safety gates.
 The one line on stderr before a run is the script's environment, access and tier.
@@ -82,6 +101,8 @@ lib/config.js           ~/.config/ops/config.json
 lib/orion/index.js      registers `ops orion`
 lib/orion/catalogue.js  frontmatter parser (strict YAML subset), dir walk, validation, name/alias resolution
 lib/orion/{list,view,run,pick,new,doctor,docs}.js
+lib/orion/task.js       the run lifecycle: run / ls / get / logs / rerun / cancel
+lib/orion/runs.js       the run store under $OPS_STATE_DIR (record + log per run)
 lib/orion/templates.js  scaffold strings for `script new`
 docs/help-text-style.md the gh conventions every help page and summary follows
 docs/adding-a-group.md  how to add `ops <group>`
