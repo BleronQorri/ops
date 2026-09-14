@@ -1,6 +1,10 @@
 ---
 name: check_invopop_suppliers
 summary: List Invopop supplier silo entries and flag the ones stuck in error or void states
+domain: e-invoicing
+country: ES
+integration: verifactu
+integrator: invopop
 env: production
 access: read-only
 tier: read-only

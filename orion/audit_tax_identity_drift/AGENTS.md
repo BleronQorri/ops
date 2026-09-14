@@ -1,6 +1,7 @@
 ---
 name: audit_tax_identity_drift
 summary: "Audit every account_configuration's tax identity against the legal entity its plugins point at, field by field"
+domain: e-invoicing
 env: production
 access: read-only
 tier: read-only

@@ -1,6 +1,10 @@
 ---
 name: match_credit_notes_to_invoices
 summary: Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally
+domain: e-invoicing
+country: SA
+integration: zatca
+integrator: comarch
 env: production
 access: write
 tier: read-only

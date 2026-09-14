@@ -1,6 +1,7 @@
 ---
 name: backfill_missing_documents
 summary: "Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task"
+domain: accounting-documents
 env: production
 access: write
 tier: prod-write

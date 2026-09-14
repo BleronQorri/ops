@@ -1,6 +1,7 @@
 ---
 name: onboard_location_scripts
 summary: "Pre Billing Profiles onboarding check across shedul + accounting-documents; printed the Houston tasks to run"
+domain: accounting-documents
 env: production
 access: read-only
 tier: read-only

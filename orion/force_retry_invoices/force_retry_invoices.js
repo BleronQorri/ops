@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// resend_stuck_invoices — re-drive stuck KSA e-invoices via Houston.
+// force_retry_invoices — force-retry stuck e-invoices via Houston.
 //
 // Given a list of e_invoice_tracker IDs, this:
 //   1. Pulls those trackers from the accounting_documents DB (read-only psql)
@@ -22,9 +22,9 @@
 // step 2 runs first — it puts the trackers into that eligible state.
 //
 // Usage:
-//   ./resend_stuck_invoices.js 123,456
-//   ./resend_stuck_invoices.js --namespace eng-orion 123,456
-//   ./resend_stuck_invoices.js --dry-run 123,456
+//   ./force_retry_invoices.js 123,456
+//   ./force_retry_invoices.js --namespace eng-orion 123,456
+//   ./force_retry_invoices.js --dry-run 123,456
 
 const readline = require("readline/promises");
 const { stdin: input, stdout: output } = require("process");
@@ -72,10 +72,10 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  console.log(`resend_stuck_invoices — re-drive stuck KSA e-invoices via Houston
+  console.log(`force_retry_invoices — force-retry stuck e-invoices via Houston
 
 Usage:
-  ri [flags] <TRACKER_IDS>
+  force_retry_invoices [flags] <TRACKER_IDS>
 
 Arguments:
   TRACKER_IDS            Comma-separated e_invoice_tracker IDs (e.g. 123,456)

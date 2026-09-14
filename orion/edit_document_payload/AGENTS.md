@@ -1,6 +1,7 @@
 ---
 name: edit_document_payload
 summary: "Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send"
+domain: e-invoicing
 env: production
 access: write
 tier: prod-write
@@ -460,7 +461,7 @@ reports success. Check the tracker first, every time.
 
 4687595's tracker is `{upload_status: :sent, review_status: :rejected}` — already
 eligible, so **skip the status flip**. Only reach for
-`update_einvoice_trackers_status` (what `resend_stuck_invoices.js` does) when the tracker
+`update_einvoice_trackers_status` (what `force_retry_invoices.js` does) when the tracker
 is in neither state:
 
 ```bash
@@ -577,6 +578,6 @@ the second time round.
 
 ## Related
 
-- [resend_stuck_invoices](../resend_stuck_invoices/) — bulk version of §7 (status flip + force
+- [force_retry_invoices](../force_retry_invoices/) — bulk version of §7 (status flip + force
   retry) for KSA trackers. Note it targets `accounting-documents-web` and does not
   pass `OBAN_STORER_ENABLED`, relying on the component's own `"1"`.

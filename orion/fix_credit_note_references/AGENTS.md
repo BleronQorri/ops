@@ -1,6 +1,10 @@
 ---
 name: fix_credit_note_references
 summary: "Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes"
+domain: e-invoicing
+country: SA
+integration: zatca
+integrator: comarch
 env: production
 access: write
 tier: prod-write

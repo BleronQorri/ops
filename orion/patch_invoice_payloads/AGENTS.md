@@ -1,6 +1,7 @@
 ---
 name: patch_invoice_payloads
 summary: Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook
+domain: e-invoicing
 env: production
 access: write
 tier: read-only

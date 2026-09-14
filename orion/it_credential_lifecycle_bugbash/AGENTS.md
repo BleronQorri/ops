@@ -1,6 +1,10 @@
 ---
 name: it_credential_lifecycle_bugbash
 summary: Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB
+domain: e-invoicing
+country: IT
+integration: smart_receipts
+integrator: invopop
 env: production
 access: write
 tier: prod-write-irreversible

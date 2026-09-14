@@ -16,7 +16,8 @@ ops task logs <id>                        everything that run printed
 ops task rerun <id>                       same script, same arguments, new id
 ops task cancel <id>                      stop one that is still going
 
-ops orion script list                     catalogue, a table per environment (--flat for one)
+ops orion script list                     catalogue: a section per domain, a table per environment
+ops orion script list --country SA        one tax authority's tools (--integration, --integrator, --domain)
 ops orion script list --status retired    the decommissioned ones, hidden by default
 ops orion script view <name>              doc page + the script's live --help + examples
 ops orion script pick                     pick one script and leave (TTY only)
@@ -65,12 +66,12 @@ ops config set interactive.bare true
 ## A session
 
 ```
-$ ops interactive                  # ↑↓ move · enter view · r run · tab runs · / filter · ? keys
-ops ▸ scripts  ↑↓ move · enter view · r run · d doc · t retired · tab runs · / filter · ? keys · q quit
+$ ops interactive                  # ↑↓ move · enter run · v view · tab runs · / filter · ? keys
+ops ▸ scripts  ↑↓ move · enter run · v view · d doc · t show retired · tab runs · / filter · ? keys · q quit
 / to filter
   PRODUCTION  7 scripts
 ❯ check_invopop_suppliers          read-only    List Invopop supplier silo entries and flag …
-  resend_stuck_invoices            prod-write   Re-drive stuck KSA e-invoices: flip trackers …
+  force_retry_invoices            prod-write   Re-drive stuck KSA e-invoices: flip trackers …
   STAGING  3 scripts
   wipe_provider_einvoicing         staging      Wipe all of a provider's e-invoicing rows …
 
@@ -78,28 +79,48 @@ $ ops orion script list --env production --access write
 NAME                             ENV         ACCESS  TIER                     STATUS   SUMMARY
 match_credit_notes_to_invoices                 production  write   read-only                active   Map each B2B credit note to the invoice it credits, …
 fix_credit_note_references       production  write   prod-write               blocked  Phase 2 of match_credit_notes_to_invoices: put the BillingReference …
-resend_stuck_invoices                   production  write   prod-write               active   Re-drive stuck KSA e-invoices: flip trackers retry-eligible, …
+force_retry_invoices                   production  write   prod-write               active   Re-drive stuck KSA e-invoices: flip trackers retry-eligible, …
 
-$ ops orion script view ri          # the page: summary, tier, key AGENTS.md sections, live --help, examples
+$ ops orion script view force_retry_invoices          # the page: summary, tier, key AGENTS.md sections, live --help, examples
 
-$ ops orion task run ri --dry-run 123,456
-ops ▸ run 42  resend_stuck_invoices  ⚠ PRODUCTION WRITE  production · write · prod-write — …
+$ ops task run force_retry_invoices --dry-run 123,456
+ops ▸ run 42  force_retry_invoices  ⚠ PRODUCTION WRITE  production · write · prod-write — …
 …the script's own prompts, gates and output…
-ops ▸ run 42 completed in 18s (exit 0)  · ops orion task logs 42
+ops ▸ run 42 completed in 18s (exit 0)  · ops task logs 42
 
-$ ops orion task ls --script ri
+$ ops task ls --script force_retry_invoices
 ID  STATUS     SCRIPT          STARTED    DURATION  ARGS
-42  completed  resend_stuck_invoices  2m ago     18s       --dry-run 123,456
-41  failed     resend_stuck_invoices  yesterday  4s        999
+42  completed  force_retry_invoices  2m ago     18s       --dry-run 123,456
+41  failed     force_retry_invoices  yesterday  4s        999
 ```
 
 Runs are modelled on `houston task`: `run`, `ls`, `get`, `logs`, `rerun`, `cancel`,
 `-p KEY=VALUE` parameters, newest-first listings and the same `KEY=VALUE` /
-`KEY~VALUE` parameter filters. `ops orion script run` is the older spelling of
-`ops orion task run` and goes through the same path.
+`KEY~VALUE` parameter filters. `ops run <script>` and `ops task run <script>` are
+the same command registered twice, and go through the same path.
 
 `ops` never adds or removes a confirmation: the scripts own their safety gates.
 The one line on stderr before a run is the script's environment, access and tier.
+
+## Domains and countries
+
+The catalogue groups by `domain` before environment: `e-invoicing` for anything
+that talks to a tax authority or to the documents on their way to one, and
+`accounting-documents` for the documents themselves. An e-invoicing script also
+names the country it serves, the scheme that country runs and the vendor Fresha
+reaches it through:
+
+| country | integration | integrator |
+|---|---|---|
+| `SA` (KSA) | `zatca` | `comarch` |
+| `ES` | `verifactu`, `ticketbai` | `invopop` |
+| `IT` | `smart_receipts` | `invopop` |
+
+All three are one value or none — a tool that branches on whatever country the
+document turns out to be leaves them out rather than naming one it does not mean.
+`ops orion script list --country SA`, `--integration zatca`, `--integrator
+invopop` and `--domain` filter on them, and typing any of them into
+`ops interactive` narrows the screen the same way.
 
 ## Credentials
 
@@ -132,7 +153,7 @@ prompt back to the script at any time. What your shell exported always wins, so
 
 | Shown by `ops` | Source of truth |
 |---|---|
-| summary, env, access, tier, status (incl. `retired`), examples, report globs, secrets | frontmatter at the top of the script's `AGENTS.md` |
+| summary, domain, country, integration, integrator, env, access, tier, status (incl. `retired`), examples, report globs, secrets | frontmatter at the top of the script's `AGENTS.md` |
 | DESCRIPTION | the `What it does` / `Pipeline` / `Safety` / `Prereqs` / `Output` sections of that `AGENTS.md` |
 | SCRIPT HELP (flags) | the script's own `--help`, run live for Node scripts |
 | `orion/AGENTS.md` tables, `orion/.gitignore` report globs | generated between `ops:begin` / `ops:end` markers by `ops orion docs sync` |
@@ -159,4 +180,4 @@ docs/adding-a-group.md  how to add `ops <group>`
 ```
 
 Exit codes: 0 fine, 1 problems found (doctor, docs check), 2 the call was wrong.
-`ops orion script run` passes the script's exit code through verbatim.
+`ops run` passes the script's exit code through verbatim.

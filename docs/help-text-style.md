@@ -8,7 +8,7 @@ Adopted from the GitHub CLI's `docs/command-line-syntax.md` and
 
 | Form | Meaning | Example |
 |---|---|---|
-| plain text | literal, required | `ops orion script run` |
+| plain text | literal, required | `ops run` |
 | `<dash-case>` | a value the user supplies | `<script>`, `<provider-id>` |
 | `[...]` | optional | `[flags]`, `[<script-args>...]` |
 | `{a \| b}` | required, pick one | `--lang {js \| exs}` |
@@ -23,7 +23,7 @@ or `<ISSUE_NUMBER>`.
 <long description: full sentences, why before how>
 
 USAGE
-  ops orion script run <script> [<script-args>...]
+  ops run <script> [<script-args>...]
 
 FLAGS
   -e, --env <env>   filter by environment; repeatable
@@ -33,7 +33,7 @@ INHERITED FLAGS
 
 EXAMPLES
   # one comment line when the intent is not obvious
-  $ ops orion script run ri --dry-run 123,456
+  $ ops run force_retry_invoices --dry-run 123,456
 
 LEARN MORE
   Use `ops orion script <command> --help` for more information about a command.

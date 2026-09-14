@@ -10,7 +10,7 @@ more: it never changes a script's arguments, prompts or gates.
 
 **How to recall a script:** `ops orion script list`, then
 `ops orion script view <name>` (its doc page, live `--help` and examples), then
-`ops orion script run <name> …`. Without `ops`: skim the tables below, then run
+`ops run <name> …`. Without `ops`: skim the tables below, then run
 `./<name>/<name>.js --help` or read the script's own `AGENTS.md`.
 
 The tables and the tier list below are **generated** from each script's
@@ -20,39 +20,39 @@ Edit the frontmatter, not the tables.
 ## production · read-only
 
 <!-- ops:begin catalogue:production/read-only -->
-| Script | Tier | Run | What it does |
-|--------|------|-----|--------------|
-| [check_invopop_suppliers](check_invopop_suppliers/) | read-only | `ops run check_invopop_suppliers` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
+| Script | For | Tier | Run | What it does |
+|--------|-----|------|-----|--------------|
+| [check_invopop_suppliers](check_invopop_suppliers/) | ES · verifactu | read-only | `ops run check_invopop_suppliers` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
 <!-- ops:end catalogue:production/read-only -->
 
 ## production · write
 
 <!-- ops:begin catalogue:production/write -->
-| Script | Tier | Run | What it does |
-|--------|------|-----|--------------|
-| [backfill_missing_documents](backfill_missing_documents/) | prod-write | `ops run backfill_missing_documents` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
-| [edit_document_payload](edit_document_payload/) 📄 *runbook* | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
-| [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes |
-| [match_credit_notes_to_invoices](match_credit_notes_to_invoices/) | read-only | `ops run match_credit_notes_to_invoices` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
-| [patch_invoice_payloads](patch_invoice_payloads/) | read-only | `ops run patch_invoice_payloads` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
-| [resend_stuck_invoices](resend_stuck_invoices/) | prod-write | `ops run resend_stuck_invoices` | Re-drive stuck KSA e-invoices: flip trackers retry-eligible, then force-retry sending via Houston |
+| Script | For | Tier | Run | What it does |
+|--------|-----|------|-----|--------------|
+| [backfill_missing_documents](backfill_missing_documents/) | — | prod-write | `ops run backfill_missing_documents` | Backfill invoices and credit notes for sales that never produced one: export CSV, upload to S3, run the task |
+| [edit_document_payload](edit_document_payload/) 📄 *runbook* | — | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
+| [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | SA · zatca | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes |
+| [force_retry_invoices](force_retry_invoices/) | — | prod-write | `ops run force_retry_invoices` | Force-retry stuck e-invoices: flip their trackers retry-eligible, then re-drive sending via Houston |
+| [match_credit_notes_to_invoices](match_credit_notes_to_invoices/) | SA · zatca | read-only | `ops run match_credit_notes_to_invoices` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
+| [patch_invoice_payloads](patch_invoice_payloads/) | — | read-only | `ops run patch_invoice_payloads` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
 <!-- ops:end catalogue:production/write -->
 
 ## staging · write
 
 <!-- ops:begin catalogue:staging/write -->
-| Script | Tier | Run | What it does |
-|--------|------|-----|--------------|
-| [confirm_comarch_uat_queue](confirm_comarch_uat_queue/) | staging | `ops run confirm_comarch_uat_queue` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
-| [deregister_invopop_suppliers](deregister_invopop_suppliers/) | staging | `ops run deregister_invopop_suppliers` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
-| [wipe_provider_einvoicing](wipe_provider_einvoicing/) | staging | `ops run wipe_provider_einvoicing` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
+| Script | For | Tier | Run | What it does |
+|--------|-----|------|-----|--------------|
+| [confirm_comarch_uat_queue](confirm_comarch_uat_queue/) | SA · zatca | staging | `ops run confirm_comarch_uat_queue` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
+| [deregister_invopop_suppliers](deregister_invopop_suppliers/) | — | staging | `ops run deregister_invopop_suppliers` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [wipe_provider_einvoicing](wipe_provider_einvoicing/) | — | staging | `ops run wipe_provider_einvoicing` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
 <!-- ops:end catalogue:staging/write -->
 
 ## Danger tiers
 
 <!-- ops:begin tiers -->
 - **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `check_invopop_suppliers`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
-- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `resend_stuck_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
+- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
 - **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
 
 Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the worst thing the script can do in any mode. `ops help tiers` has the long form.
@@ -87,6 +87,33 @@ ever need them.
   once and passes them in from its git-ignored `.env` (`ops help credentials`).
 - `ops orion doctor` checks the runtimes and the catalogue.
 
+## Domains, countries and integrations
+
+Every script declares a `domain`. It is what `ops orion script list` groups by,
+above the environment, because which tax authority a tool talks to matters more
+than which database it points at.
+
+| domain | what belongs in it |
+|---|---|
+| `e-invoicing` | anything that talks to a tax authority, or to the documents on their way to one |
+| `accounting-documents` | the documents themselves: generating them, backfilling them, onboarding for them |
+
+An e-invoicing script also names the country it serves and how it gets there. The
+`integration` is the scheme the country runs; the `integrator` is the vendor
+Fresha reaches it through:
+
+| country | integration | integrator |
+|---|---|---|
+| `SA` (KSA) | `zatca` | `comarch` |
+| `ES` | `verifactu`, `ticketbai` | `invopop` |
+| `IT` | `smart_receipts` | `invopop` |
+
+All three are one value or none. A tool that is country-blind by design — payload
+surgery that branches on whatever the document's country turns out to be, a
+staging wipe that deletes rows whatever they are — leaves them out rather than
+naming a country it does not actually mean. A tool that serves several countries
+today is a tool waiting to be split into granular ones.
+
 ## Adding a new script
 
 `ops orion script new <name> --lang {js|exs} --env {production|staging} --access {read-only|write}`
@@ -107,6 +134,10 @@ directory, and an `AGENTS.md` shaped like this:
 ---
 name: <dir name>                 # must equal the directory
 summary: <one line, ≤ 110 chars, imperative, no trailing period>
+domain: e-invoicing | accounting-documents        # required; the section it lands in
+country: ES                      # ISO 3166-1 alpha-2, when the script is for one country
+integration: verifactu           # the scheme that country runs (see the table below)
+integrator: invopop              # who Fresha reaches it through
 env: production | staging
 access: read-only | write
 tier: read-only | prod-write | prod-write-irreversible | prod-write-no-dry-run | staging

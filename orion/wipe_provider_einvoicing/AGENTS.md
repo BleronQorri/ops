@@ -1,6 +1,7 @@
 ---
 name: wipe_provider_einvoicing
 summary: Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction
+domain: e-invoicing
 env: staging
 access: write
 tier: staging

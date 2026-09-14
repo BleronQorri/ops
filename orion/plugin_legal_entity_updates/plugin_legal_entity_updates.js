@@ -1208,7 +1208,7 @@ function parseProviderIds(raw) {
 }
 
 // The psql database environment for a given deploy namespace. Mirrors
-// resend_stuck_invoices.js: "production" is its own env, anything else is the namespace.
+// force_retry_invoices.js: "production" is its own env, anything else is the namespace.
 function psqlEnv(namespace) {
   return namespace === "production" ? "production" : namespace;
 }

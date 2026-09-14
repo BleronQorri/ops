@@ -1,6 +1,7 @@
 ---
 name: plugin_legal_entity_updates
 summary: "Link e-invoicing plugins to their primary legal entity: report, migrate, pre-flight, link, post-flight"
+domain: e-invoicing
 env: production
 access: write
 tier: prod-write-no-dry-run

@@ -1,6 +1,10 @@
 ---
 name: confirm_comarch_uat_queue
 summary: "Process the Comarch UAT queue by confirming \"sent\" items via the edoc-online UAT REST API"
+domain: e-invoicing
+country: SA
+integration: zatca
+integrator: comarch
 env: staging
 access: write
 tier: staging

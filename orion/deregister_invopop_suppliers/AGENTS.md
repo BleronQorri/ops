@@ -1,6 +1,8 @@
 ---
 name: deregister_invopop_suppliers
 summary: Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace
+domain: e-invoicing
+integrator: invopop
 env: staging
 access: write
 tier: staging
