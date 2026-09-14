@@ -64,7 +64,9 @@ two-space indented bodies.
   colour. `NO_COLOR` disables colour everywhere.
 - `--json` field names and types never depend on the terminal.
 - Every prompt has a non-interactive path (a flag). `ops` itself only prompts in
-  `pick`; the scripts keep their own rules.
+  `pick` and `interactive`, both of which refuse to start without a terminal and
+  have a flag-driven equivalent (`script list`, `task ls`); the scripts keep
+  their own rules.
 - Errors are one line on stderr: `error: <what>` then an optional hint line
   naming the command that fixes it.
 - Exit codes: 0 fine · 1 problems found · 2 the call was wrong.

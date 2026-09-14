@@ -5,6 +5,7 @@ env: production
 access: read-only
 tier: read-only
 lang: exs
+secrets: [INVOPOP_API_TOKEN]
 help_flag: false
 examples:
   - args: ""

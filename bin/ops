@@ -3,6 +3,7 @@
 
 const { CommanderError } = require("commander");
 const { buildProgram, shortHelp } = require("../lib/program");
+const config = require("../lib/config");
 const ui = require("../lib/ui");
 
 async function main() {
@@ -11,7 +12,12 @@ async function main() {
 
   const argv = process.argv.slice(2);
   if (argv.length === 0) {
-    // Bare `ops`: short help, exit 0 (like `gh`).
+    // Bare `ops`: short help, exit 0 (like `gh`). `interactive.bare` opts out of
+    // that and opens the screen instead, but only on a terminal — a bare `ops`
+    // in a pipe or a script still prints the help it has always printed.
+    if (opensOnBare() && process.stdin.isTTY && process.stdout.isTTY) {
+      return await require("../lib/orion/interactive").open();
+    }
     process.stdout.write(shortHelp(program));
     return 0;
   }
@@ -37,6 +43,13 @@ async function main() {
     ui.eprint(`${ui.cerr.bad("error:")} ${err.stack || err.message}`);
     return 1;
   }
+}
+
+// `ops config set interactive.bare true` writes the string, the JSON file may hold
+// the boolean; both mean the same thing here.
+function opensOnBare() {
+  const v = config.get("interactive.bare");
+  return v === true || v === "true";
 }
 
 main().then((code) => process.exit(code));

@@ -5,6 +5,7 @@ env: staging
 access: write
 tier: staging
 lang: exs
+secrets: [INVOPOP_SANDBOX_API_TOKEN]
 examples:
   - args: "--dry-run"
     note: walk the whole flow, POST nothing

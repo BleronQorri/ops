@@ -82,7 +82,9 @@ ever need them.
   Elixir scripts that need deps auto-install them via `Mix.install` (e.g. `Req`);
   `backfill_missing_documents` and the Node scripts are dependency-free.
 - Tokens (`INVOPOP_API_TOKEN`, `INVOPOP_SANDBOX_API_TOKEN`, `COMARCH_UAT_JWT`) come
-  from your shell environment; the scripts prompt when one is unset.
+  from the environment; the scripts prompt when one is unset. A script lists the
+  ones it reads as `secrets:` in its frontmatter, and `ops run` asks for those
+  once and passes them in from its git-ignored `.env` (`ops help credentials`).
 - `ops orion doctor` checks the runtimes and the catalogue.
 
 ## Adding a new script
@@ -108,10 +110,10 @@ summary: <one line, ≤ 110 chars, imperative, no trailing period>
 env: production | staging
 access: read-only | write
 tier: read-only | prod-write | prod-write-irreversible | prod-write-no-dry-run | staging
-status: active | deprecated | runbook | blocked   # default active; runbook/blocked = no script
+status: active | deprecated | retired | runbook | blocked   # default active; runbook/blocked = no script
 lang: js | exs                   # active/deprecated only
-aliases: [ri]                    # optional short names for `ops orion script run`
 also: [other_entrypoint.js]      # optional secondary executables in the directory
+secrets: [SOME_TOKEN]            # env vars holding a credential: ops asks once and passes them in
 help_flag: false                 # only if the script has no --help
 examples:                        # ≥ 1 for an active script; args as typed after the script
   - args: "--dry-run 123"
@@ -119,6 +121,7 @@ examples:                        # ≥ 1 for an active script; args as typed aft
 reports: [name-*.md]             # globs it writes to the cwd (feeds .gitignore)
 related: [other_script]
 blocked_on: <one line>           # status blocked only
+retired_reason: <one line>       # status retired only, with retired_on: YYYY-MM-DD
 ---
 # <name>
 

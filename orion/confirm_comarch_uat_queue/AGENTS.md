@@ -5,6 +5,7 @@ env: staging
 access: write
 tier: staging
 lang: js
+secrets: [COMARCH_UAT_JWT]
 help_flag: false
 examples:
   - args: ""

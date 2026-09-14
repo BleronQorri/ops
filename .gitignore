@@ -1,2 +1,6 @@
 node_modules/
 .DS_Store
+
+# credentials ops holds for the scripts (`ops secrets`, mode 0600)
+.env
+.env.*
