@@ -56,8 +56,9 @@ frozen — every update happens here.
   and `ops interactive` group the same way, with headings the cursor skips.
   Which tax authority a tool talks to outranks which database it points at.
 - **The environment is a column, not a heading.** It lost the heading to the
-  integration, so rows sort production before staging inside a subsection and a
-  staging row says so in warn colour. On the interactive screen the column only
+  integration, so rows sort production before staging inside a subsection and the
+  column is never faint: production red, staging warn, the same two colours the
+  tiers use for the same two worlds. On the interactive screen the column only
   appears once the rows on view actually mix the two.
 - **A country is named only when it is meant.** `country`, `integration` and
   `integrator` are one value or none: `SA`/`zatca`/`comarch`, `ES`/`verifactu` and
