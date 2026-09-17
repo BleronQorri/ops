@@ -1,6 +1,6 @@
 ---
 name: it_credential_lifecycle_bugbash
-summary: Walk one IT Smart Receipts plugin through the credential email ladder in ten cases and judge each from the DB
+summary: Walk one IT Smart Receipts plugin through the credential email ladder in twelve cases and judge each from the DB
 domain: e-invoicing
 country: IT
 integration: smart_receipts
@@ -16,7 +16,7 @@ secrets: [ORION_COMMERCIAL_DOCUMENTS_IT_CREDENTIAL]
 examples:
   - args: ""
     note: asks for everything
-  - args: "--plugin-id 541 --cases 1-6"
+  - args: "--plugin-id 541 --cases 1-8"
     note: a slice of the ladder
   - args: "--plugin-id 541 --dry-run"
     note: plan only, asks nothing
@@ -27,7 +27,7 @@ reports: ["it-credential-lifecycle-bugbash-*.md"]
 # it_credential_lifecycle_bugbash
 
 Walks one IT Smart Receipts plugin through the whole credential email ladder —
-**14 / 7 / 1** days before the credentials expire, the **pause**, **5 / 1** days
+**14 / 7 / 3 / 1** days before the credentials expire, the **pause**, **5 / 1** days
 of grace, then the **disable** — and verifies each step from the database.
 
 **Fully interactive.** It prompts for the environment and the target, prints the
@@ -41,8 +41,9 @@ Two documents sit beside the script:
 
 - **[TEST_PLAN.md](TEST_PLAN.md)** — the manual walk-through this automates, kept as the reference
   run: production, 2026-09-04, provider 3086946 / plugin 541, ten cases green. Every case carries the
-  exact anchor and stamp it used and the counts it expected, so a disagreement between the script and
-  that table is a real change in behaviour. It also holds the `psql` snippets for the three stamps and
+  exact anchor and stamp it used and the counts it expected. That run predates the 3-day email
+  (cases 6 and 7 here); apart from that, a disagreement between the script and that table is a real
+  change in behaviour. It also holds the `psql` snippets for the three stamps and
   for the outbox row, and cases 12 and 13, which stay manual.
 - **[RENEWAL_EMAIL_GAP.md](RENEWAL_EMAIL_GAP.md)** — why the `renewed` and `reactivated` emails are
   not in the ladder: the job renders both, but nothing enqueues them (team-orion#575 / #577). Read it
@@ -67,8 +68,9 @@ was not.
 
 So every case here writes **the anchor and the stamp together**, the stamp landing
 where that case's previous email fell on the new timeline: expiry −14d before the
-7-day email, expiry −7d before the 1-day one, the pause day itself before the
-1-day grace email. The two "no repeat" cases deliberately leave the stamp alone.
+7-day email, expiry −7d before the 3-day one, expiry −3d before the 1-day one, the
+pause day itself before the 1-day grace email. The three expiry "no repeat" cases
+deliberately leave the stamp alone.
 
 Passing `LAST_EMAIL_SENT_AT=null` everywhere would also make every email arrive,
 but it re-arms the schedule instead of testing it — the no-repeat cases would
@@ -130,8 +132,8 @@ to case N".
 
 ## Cases
 
-Ten automatic cases. Cases 12 and 13 in `TEST_PLAN.md` are outside the script because no code path
-produces those emails.
+Twelve automatic cases. The renewal emails (cases 12 and 13 in `TEST_PLAN.md`) are outside the
+script because no code path produces them.
 
 | # | phase | case | clock | expects |
 |---|-------|------|-------|---------|
@@ -139,21 +141,23 @@ produces those emails.
 | 2 | expiry | 14-day email | 14 days left, stamp cleared | `expiring/14` |
 | 3 | expiry | a day later, no repeat | 13 days left, stamp untouched | nothing (covers any day 13–8) |
 | 4 | expiry | 7-day email | 7 days left, stamp at expiry −14d | `expiring/7` |
-| 5 | expiry | no repeat after the 7-day email | 5 days left, stamp untouched | nothing (covers 6–2) |
-| 6 | expiry | 1-day email | 1 day left, stamp at expiry −7d | `expiring/1` |
-| 7 | expiry | pause on the expiry date | 0 days left | `paused/5`, plugin paused, anchor cleared |
-| 8 | grace | no repeat of the grace email | 3 days of grace, stamp at the pause | nothing |
-| 9 | grace | 1-day grace email | 1 day of grace, stamp at the pause | `paused/1` |
-| 10 | grace | disable at the end of the grace | 0 days of grace | `disabled/5`, held documents rejected/failed |
+| 5 | expiry | no repeat after the 7-day email | 5 days left, stamp untouched | nothing (covers 6–4) |
+| 6 | expiry | 3-day email | 3 days left, stamp at expiry −7d | `expiring/3` |
+| 7 | expiry | no repeat after the 3-day email | 2 days left, stamp untouched | nothing |
+| 8 | expiry | 1-day email | 1 day left, stamp at expiry −3d | `expiring/1` |
+| 9 | expiry | pause on the expiry date | 0 days left | `paused/5`, plugin paused, anchor cleared |
+| 10 | grace | no repeat of the grace email | 3 days of grace, stamp at the pause | nothing |
+| 11 | grace | 1-day grace email | 1 day of grace, stamp at the pause | `paused/1` |
+| 12 | grace | disable at the end of the grace | 0 days of grace | `disabled/5`, held documents rejected/failed |
 
 Dates are derived from the day you run it, in UTC calendar days — the same
 arithmetic as `Verdict.days_between/2`. Run each case and its pass on the same
-UTC day: crossing midnight shifts every number by one and turns case 6 into a
+UTC day: crossing midnight shifts every number by one and turns case 8 into a
 pause.
 
 ## Danger
 
-- **Case 10 is one-way.** It calls Invopop to deregister the supplier, marks every
+- **Case 12 is one-way.** It calls Invopop to deregister the supplier, marks every
   held document `rejected` / `failed`, and afterwards `SubmitCredentials` refuses a
   re-submission (`:smart_receipts_integration_not_recoverable`). The plugin needs a
   fresh onboarding, and re-onboarding the same partita IVA may hit the
@@ -170,13 +174,13 @@ pause.
   Production carried exactly that on 2026-09-04: `flag_off_count: 0` over ten
   plugins. If the roster is long and nothing is ever skipped for the flag, check
   the strategies before running anything.
-- Cases 7 to 10 write real partner-visible state. Everything writes production by
+- Cases 9 to 12 write real partner-visible state. Everything writes production by
   default, so the script **refuses to run without a TTY**; `--yes` lifts that for
   `--dry-run` only, which touches nothing.
 
 ## Sales while paused
 
-After case 7 the plugin holds documents instead of filing them: `submit_or_hold/2`
+After case 9 the plugin holds documents instead of filing them: `submit_or_hold/2`
 persists the accounting document and tracker and returns `{:ok, :persisted_not_sent}`
 with the tracker at `not_started` and no `web_doc_id`. Handy for exercising the hold,
 with two caveats — a credit note whose original was never recorded is refused before

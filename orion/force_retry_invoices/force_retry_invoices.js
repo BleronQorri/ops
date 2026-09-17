@@ -45,6 +45,14 @@ const REVIEW_STATUSES = [
 ];
 const TARGET_UPLOAD_STATUS = "failed_to_send";
 
+// Flipping upload_status to failed_to_send is what makes a tracker retry-eligible,
+// which is the whole point — except when you are closing a document out rather than
+// re-arming it. A document the provider parsed and refused (a malformed corrective,
+// say) will fail identically forever, and `upload_status = failed_to_send` is one
+// half of what the retry task selects on, so marking it that way quietly queues it
+// for the next sweep. --review-only leaves upload_status as it is and writes the
+// review status alone.
+
 // --- arg parsing -----------------------------------------------------------
 
 function parseArgs(argv) {
@@ -54,6 +62,7 @@ function parseArgs(argv) {
     dryRun: false,
     skipUpdate: false,
     skipRetry: false,
+    reviewOnly: false,
     ids: null,
   };
   const rest = [];
@@ -64,6 +73,7 @@ function parseArgs(argv) {
     else if (a === "--dry-run") opts.dryRun = true;
     else if (a === "--skip-update") opts.skipUpdate = true;
     else if (a === "--skip-retry") opts.skipRetry = true;
+    else if (a === "--review-only") { opts.reviewOnly = true; opts.skipRetry = true; }
     else if (a === "--help" || a === "-h") opts.help = true;
     else rest.push(a);
   }
@@ -276,9 +286,10 @@ async function main() {
 
     console.log("\n── Planned tracker updates ─────────────────────────────");
     console.log(
-      `  review_status=${reviewStatus}, upload_status=${TARGET_UPLOAD_STATUS}  →  ` +
+      `  review_status=${reviewStatus}${opts.reviewOnly ? c.faint(", upload_status left as it is") : `, upload_status=${TARGET_UPLOAD_STATUS}`}  →  ` +
         `${trackerIds.length} tracker(s): ${trackerIds.join(", ")}`
     );
+    if (opts.reviewOnly) console.log(c.faint("  (--review-only: not re-arming these for retry)"));
 
     // Houston shows its own plan + "Continue? (y/yes)" prompt for this run.
     // Run the update task once for the whole list.
@@ -293,8 +304,9 @@ async function main() {
       `E_INVOICE_TRACKER_IDS=${trackerIds.join(",")}`,
       "-p",
       `REVIEW_STATUS=${reviewStatus}`,
-      "-p",
-      `UPLOAD_STATUS=${TARGET_UPLOAD_STATUS}`,
+      // Omitted entirely under --review-only, so the task leaves it alone rather
+      // than being handed the value it already has.
+      ...(opts.reviewOnly ? [] : ["-p", `UPLOAD_STATUS=${TARGET_UPLOAD_STATUS}`]),
       "--no-tui",
       "-w",
     ];

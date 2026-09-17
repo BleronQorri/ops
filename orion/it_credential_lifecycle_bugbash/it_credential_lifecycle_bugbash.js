@@ -3,8 +3,8 @@
 // it_credential_lifecycle_bugbash — walk the IT Smart Receipts credential
 // email ladder end to end against one plugin, and verify every step.
 //
-// The ladder is: 14 / 7 / 1 days before the credentials expire, then the pause,
-// then 5 / 1 days of grace, then the disable. Waiting 90 real days is not an
+// The ladder is: 14 / 7 / 3 / 1 days before the credentials expire, then the
+// pause, then 5 / 1 days of grace, then the disable. Waiting 90 real days is not an
 // option, so each case moves the plugin's clock and triggers one pass.
 //
 // THE ONE RULE THIS SCRIPT EXISTS TO ENFORCE
@@ -19,7 +19,8 @@
 //
 //   Every case below therefore moves the anchor AND the stamp together, the
 //   stamp landing where that case's previous email fell on the new timeline
-//   (expiry −14d before the 7-day email, expiry −7d before the 1-day one).
+//   (expiry −14d before the 7-day email, expiry −7d before the 3-day one,
+//   expiry −3d before the 1-day one).
 //
 // Verification is the database, not the mailbox. `Reminders.record/4` stamps
 // `last_email_sent_at` and inserts `SendCredentialLifecycleEmailJob` in one
@@ -31,7 +32,7 @@
 // Usage:
 //   ./it_credential_lifecycle_bugbash.js --plugin-id 541 --dry-run
 //   ./it_credential_lifecycle_bugbash.js --provider-id 3086946 --enable
-//   ./it_credential_lifecycle_bugbash.js --plugin-id 541 --cases 1-6
+//   ./it_credential_lifecycle_bugbash.js --plugin-id 541 --cases 1-8
 //   ./it_credential_lifecycle_bugbash.js --plugin-id 541 --reset
 
 const readline = require("readline/promises");
@@ -116,24 +117,42 @@ const CASES = [
   },
   {
     id: 5,
-    key: "expiry-no-repeat-late",
+    key: "expiry-no-repeat-mid",
     phase: "expiry",
-    name: "no repeat after the 7-day email (covers 6-2)",
+    name: "no repeat after the 7-day email (covers 6-4)",
     daysLeft: 5,
     stamp: "keep",
     expect: null,
   },
   {
     id: 6,
+    key: "expiry-3",
+    phase: "expiry",
+    name: "3-day email",
+    daysLeft: 3,
+    stamp: { expiryMinus: 7 },
+    expect: { state: "expiring", days: 3 },
+  },
+  {
+    id: 7,
+    key: "expiry-no-repeat-late",
+    phase: "expiry",
+    name: "no repeat after the 3-day email (covers 2)",
+    daysLeft: 2,
+    stamp: "keep",
+    expect: null,
+  },
+  {
+    id: 8,
     key: "expiry-1",
     phase: "expiry",
     name: "1-day email",
     daysLeft: 1,
-    stamp: { expiryMinus: 7 },
+    stamp: { expiryMinus: 3 },
     expect: { state: "expiring", days: 1 },
   },
   {
-    id: 7,
+    id: 9,
     key: "pause",
     phase: "expiry",
     name: "pause on the expiry date, opening the grace period",
@@ -143,7 +162,7 @@ const CASES = [
     pauses: true,
   },
   {
-    id: 8,
+    id: 10,
     key: "grace-no-repeat",
     phase: "grace",
     name: "no repeat of the grace email",
@@ -152,7 +171,7 @@ const CASES = [
     expect: null,
   },
   {
-    id: 9,
+    id: 11,
     key: "grace-1",
     phase: "grace",
     name: "1-day grace email",
@@ -161,7 +180,7 @@ const CASES = [
     expect: { state: "paused", days: 1 },
   },
   {
-    id: 10,
+    id: 12,
     key: "disable",
     phase: "grace",
     name: "disable at the end of the grace period",
@@ -211,7 +230,7 @@ function usage() {
 
 Usage:
   ./it_credential_lifecycle_bugbash.js            fully interactive, asks for everything
-  ./it_credential_lifecycle_bugbash.js --plugin-id 541 --cases 1-6
+  ./it_credential_lifecycle_bugbash.js --plugin-id 541 --cases 1-8
 
 Fully interactive: it prompts for the environment and the target, shows the
 state and the blast radius, and then asks before every single step. Any answer
@@ -225,7 +244,7 @@ Flags:
   -e, --env NAME         Houston env (default: production)
   -s, --service NAME     Houston service (default: accounting-documents-web)
   -c, --cases LIST       Which cases to run, by number or name:
-                         "4", "1,2,4", "1-6", "expiry-7", "pause,disable" (default: all)
+                         "4", "1,2,4", "1-8", "expiry-3", "pause,disable" (default: all)
       --enable           Offer the enable step up front (a fresh onboarding sits
                          at pending, which the pass ignores)
       --reset            Offer the reset step (anchor = now, both stamps cleared)
@@ -242,7 +261,7 @@ ${CASES.map((c) => `  ${String(c.id).padStart(2)}  ${c.key.padEnd(22)} ${c.phase
 Every case is one Houston run that writes the stamps and schedules the pass
 (RUN_LIFECYCLE=true), followed by a wait for the pass to complete and a read of
 the Oban job it did or did not insert. Between cases it stops and asks again, so
-you can check the mailbox and the front end before moving on. Case 10 is
+you can check the mailbox and the front end before moving on. Case 12 is
 one-way: it deregisters the supplier at Invopop, marks every held document
 rejected/failed, and blocks a credential re-submission on that plugin.
 
@@ -894,7 +913,7 @@ function writeReport(env, state, results) {
 
 // --- main ------------------------------------------------------------------
 
-// Accepts numbers, ranges and names: "4", "1-6", "expiry-7", "pause,disable".
+// Accepts numbers, ranges and names: "4", "1-8", "expiry-3", "pause,disable".
 function selectCases(spec) {
   if (!spec) return CASES;
   const wanted = new Set();
@@ -932,7 +951,7 @@ async function main() {
 
   console.log(
     "\nit_credential_lifecycle_bugbash — the IT Smart Receipts credential email ladder\n" +
-      "  14 / 7 / 1 days to expiry, the pause, 5 / 1 days of grace, the disable.\n" +
+      "  14 / 7 / 3 / 1 days to expiry, the pause, 5 / 1 days of grace, the disable.\n" +
       "  Each case moves the anchor AND the stamp together: moving the anchor alone makes\n" +
       "  the last email re-derive as the one under test, and nothing sends.\n" +
       (planOnly ? "  --dry-run: nothing is written and nothing is asked.\n" : "")
