@@ -23,6 +23,7 @@ Edit the frontmatter, not the tables.
 | Script | For | Tier | Run | What it does |
 |--------|-----|------|-----|--------------|
 | [check_invopop_suppliers](check_invopop_suppliers/) | ES · verifactu | read-only | `ops run check_invopop_suppliers` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
+| [lookup_invopop_receipt](lookup_invopop_receipt/) | IT · smart_receipts | read-only | `ops run lookup_invopop_receipt` | Find one IT Smart Receipt in Invopop by its number and report its state, faults and links |
 <!-- ops:end catalogue:production/read-only -->
 
 ## production · write
@@ -51,7 +52,7 @@ Edit the frontmatter, not the tables.
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `check_invopop_suppliers`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `check_invopop_suppliers`, `lookup_invopop_receipt`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
 - **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
 
@@ -89,9 +90,13 @@ ever need them.
 
 ## Domains, countries and integrations
 
-Every script declares a `domain`. It is what `ops orion script list` groups by,
-above the environment, because which tax authority a tool talks to matters more
-than which database it points at.
+Every script declares a `domain`. It is what `ops orion script list` groups by
+first, because which tax authority a tool talks to matters more than which
+database it points at. Inside a domain the subsections are the `integration`: the
+scheme, or failing that the `integrator`, or failing both `Any integration`, which
+comes last and is not a gap to fix — a tool that serves every scheme says so by
+leaving the field out. The environment is a column inside those tables, not a
+heading of its own.
 
 | domain | what belongs in it |
 |---|---|

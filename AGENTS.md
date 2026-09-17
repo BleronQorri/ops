@@ -39,23 +39,34 @@ frozen — every update happens here.
   through `lib/secrets.js`) and passes it in. Values never reach a run record, a
   table, `--json` or a log — a record keeps names only. Precedence is .env, then
   the shell, then `-p`. Skipping a prompt is always allowed and the run goes ahead.
-- **A saved credential is assumed stale until it proves otherwise.** A set
-  variable silences the script's own prompt, so ops checks a JWT against its
-  `exp` and withholds an expired one, and offers a replacement after a run that
-  had one and failed. It never decides on its own that a token is bad: only the
-  script knows why it failed, so ops asks.
-- **Domain first, then environment.** `ops orion script list` on a terminal prints
+- **A credential is only doubted on evidence.** A set variable silences the
+  script's own prompt, so ops checks a JWT against its `exp` — but an `exp` of
+  zero, negative, or before 2000 is how "this one does not expire" is written, and
+  a token is never called expired before the day it was saved. A replacement is
+  offered after a failed run only when the run's own output implicates the
+  credential (401, 403, "token refused"), or when nothing was captured and the exit
+  code is 2. Exit 1 means the data is wrong — a receipt that is not there is not a
+  dead token — and a false alarm there teaches people to ignore the real one.
+- **Domain first, then integration.** `ops orion script list` on a terminal prints
   a section per domain (`e-invoicing`, `accounting-documents`) and, inside it, a
-  table per environment, read-only before write. A pipe still gets one flat TSV
-  keeping the DOMAIN and ENV columns, so nothing downstream breaks. The picker and
-  `ops interactive` group the same way, with headings the cursor skips. Which tax
-  authority a tool talks to outranks which database it points at.
+  table per integration — the scheme the script talks to, or the integrator it
+  reaches one through, or `Any integration` for the tools that serve them all,
+  the general after the specific. A pipe still gets one flat TSV keeping the
+  DOMAIN, INTEGRATION and ENV columns, so nothing downstream breaks. The picker
+  and `ops interactive` group the same way, with headings the cursor skips.
+  Which tax authority a tool talks to outranks which database it points at.
+- **The environment is a column, not a heading.** It lost the heading to the
+  integration, so rows sort production before staging inside a subsection and a
+  staging row says so in warn colour. On the interactive screen the column only
+  appears once the rows on view actually mix the two.
 - **A country is named only when it is meant.** `country`, `integration` and
   `integrator` are one value or none: `SA`/`zatca`/`comarch`, `ES`/`verifactu` and
   `IT`/`smart_receipts` go through `invopop`. A script that branches on whatever
   country the document turns out to be leaves all three out rather than naming one
   it does not mean, and a script that serves several is one waiting to be split.
-  A section where every row is empty drops those columns instead of printing dashes.
+  A section where every row is empty drops those columns instead of printing
+  dashes — and so does one where the heading has already given the answer, which
+  is why the ZATCA table has no COUNTRY or INTEGRATION column.
 - **Truncate with `ui.clip`, never `slice`; measure with `ui.displayWidth`, never
   `.length`.** A rendered line changes colour several times, and slicing the plain
   text throws every escape away. Both helpers walk the string by grapheme, copying
@@ -108,9 +119,10 @@ command; `.enablePositionalOptions()` on every ancestor of a command that uses
 
 ```
 ops · ops --help · ops orion · ops run --help · ops help nope (exit 2)
-ops orion script list (two sections on a tty) · --flat · NO_COLOR=1 … | cat -v · … | cut -f1 (flat, ENV kept)
+ops orion script list (a section per domain, a table per integration on a tty) · --flat · NO_COLOR=1 … | cat -v · … | cut -f1 (flat, ENV kept)
 ops orion script list --json | jq -r '.[].name'  ·  --status retired  ·  --include-retired · ops orion script list -t bogus (exit 2)
-ops orion script list --domain accounting-documents (no COUNTRY/INTEGRATION columns) · --country sa (case-insensitive) · --integration zatca · --integrator invopop
+ops orion script list --domain accounting-documents (no COUNTRY/INTEGRATION columns) · --country sa (case-insensitive) · --integration zatca (one table) · --integrator invopop
+ops orion script list (ZATCA/Verifactu/Smart Receipts tables carry no COUNTRY column; "Invopop · any scheme" and "Any integration" catch the rest)
 ops orion script list -d bogus (exit 2) · ops orion script view force_retry_invoices (Domain/Country/Integration rows) · view patch_invoice_payloads (no country rows)
 ops orion script new zz --lang js --domain e-invoicing --country IT --integration smart_receipts --integrator invopop --env staging --access write
 ops orion script new zz --lang js --domain accounting-documents --country IT … (exit 2) · --country italy (exit 2)
@@ -139,6 +151,7 @@ ops interactive (TTY): ↑↓ jk pgup pgdn home end · / filter · ONE enter aft
 ops interactive: enter on a script RUNS it (banner, output, ↵ back, the run in the runs pane) · v its page · d its raw doc
 ops interactive: enter on a runbook (refused, footer says so) · the footer names the command for the highlighted row
 ops interactive: a script with no domain still appears, under UNCLASSIFIED (a grouped view never drops a row)
+ops interactive: a script with no integration still appears, under "Any integration" — an absent scheme is the truth, not a gap
 ops interactive: enter on a run · l (and on one with captured: none) · r · x (on a finished one)
 ops interactive | cat (exit 2) · ops config set interactive.bare true → bare `ops` opens it, `ops | cat` still prints the short help
 ```

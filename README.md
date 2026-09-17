@@ -16,7 +16,7 @@ ops task logs <id>                        everything that run printed
 ops task rerun <id>                       same script, same arguments, new id
 ops task cancel <id>                      stop one that is still going
 
-ops orion script list                     catalogue: a section per domain, a table per environment
+ops orion script list                     catalogue: a section per domain, a table per integration
 ops orion script list --country SA        one tax authority's tools (--integration, --integrator, --domain)
 ops orion script list --status retired    the decommissioned ones, hidden by default
 ops orion script view <name>              doc page + the script's live --help + examples
@@ -104,11 +104,11 @@ The one line on stderr before a run is the script's environment, access and tier
 
 ## Domains and countries
 
-The catalogue groups by `domain` before environment: `e-invoicing` for anything
-that talks to a tax authority or to the documents on their way to one, and
-`accounting-documents` for the documents themselves. An e-invoicing script also
-names the country it serves, the scheme that country runs and the vendor Fresha
-reaches it through:
+The catalogue groups by `domain`, then by `integration`: `e-invoicing` for
+anything that talks to a tax authority or to the documents on their way to one,
+and `accounting-documents` for the documents themselves. An e-invoicing script
+also names the country it serves, the scheme that country runs and the vendor
+Fresha reaches it through:
 
 | country | integration | integrator |
 |---|---|---|
@@ -121,6 +121,13 @@ document turns out to be leaves them out rather than naming one it does not mean
 `ops orion script list --country SA`, `--integration zatca`, `--integrator
 invopop` and `--domain` filter on them, and typing any of them into
 `ops interactive` narrows the screen the same way.
+
+Those values are the subsection headings too. A script with an `integration` sits
+under its scheme (`ZATCA · SA · comarch`); one with only an `integrator` sits
+under `Invopop · any scheme`; one with neither sits under `Any integration`, last,
+because a payload editor that works whatever scheme the document is bound for is
+telling the truth by leaving the field out. A heading that names the country and
+the integrator for every row under it takes those columns off the rows.
 
 ## Credentials
 
