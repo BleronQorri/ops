@@ -23,7 +23,7 @@ Edit the frontmatter, not the tables.
 | Script | For | Tier | Run | What it does |
 |--------|-----|------|-----|--------------|
 | [check_invopop_suppliers](check_invopop_suppliers/) | ES · verifactu | read-only | `ops run check_invopop_suppliers` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
-| [lookup_invopop_receipt](lookup_invopop_receipt/) | IT · smart_receipts | read-only | `ops run lookup_invopop_receipt` | Find one IT Smart Receipt in Invopop by its number and report its state, faults and links |
+| [lookup_it_smart_receipt](lookup_it_smart_receipt/) | IT · smart_receipts | read-only | `ops run lookup_it_smart_receipt` | Find one IT Smart Receipt in Invopop by its number and report its state, faults and links |
 <!-- ops:end catalogue:production/read-only -->
 
 ## production · write
@@ -52,7 +52,7 @@ Edit the frontmatter, not the tables.
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `check_invopop_suppliers`, `lookup_invopop_receipt`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `check_invopop_suppliers`, `lookup_it_smart_receipt`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
 - **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
 

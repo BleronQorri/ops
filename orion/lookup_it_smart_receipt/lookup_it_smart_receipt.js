@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-// lookup_invopop_receipt — find one IT Smart Receipt in Invopop and say what state it is in.
+// lookup_it_smart_receipt — find one IT Smart Receipt in Invopop and say what state it is in.
 //
 // Self-contained on purpose: one directory, one entrypoint, no shared library.
 // Copy helpers from a sibling script rather than importing them.
@@ -142,10 +142,10 @@ function ui_warn(message) {
 }
 
 function usage() {
-  return `lookup_invopop_receipt — find an IT Smart Receipt in Invopop and report its status
+  return `lookup_it_smart_receipt — find an IT Smart Receipt in Invopop and report its status
 
 Usage:
-  lookup_invopop_receipt [flags] <RECEIPT>
+  lookup_it_smart_receipt [flags] <RECEIPT>
 
 Arguments:
   RECEIPT                the receipt number as printed on it, or an Invopop entry UUID.

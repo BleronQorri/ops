@@ -1,5 +1,5 @@
 ---
-name: lookup_invopop_receipt
+name: lookup_it_smart_receipt
 summary: Find one IT Smart Receipt in Invopop by its number and report its state, faults and links
 domain: e-invoicing
 country: IT
@@ -27,7 +27,7 @@ examples:
     note: for a script; never prompts
 ---
 
-# lookup_invopop_receipt
+# lookup_it_smart_receipt
 
 Answers one question: *what happened to this receipt?* Give it the number printed
 on an Italian Smart Receipt and it finds the document in Invopop and says what
@@ -131,7 +131,7 @@ there is exit 2, not a question no one can answer.
 ## Safety
 
 Read-only, structurally: two GETs and no other HTTP verb anywhere in the file.
-`grep -nE "method:|POST|PUT|PATCH|DELETE" lookup_invopop_receipt.js` is the test.
+`grep -nE "method:|POST|PUT|PATCH|DELETE" lookup_it_smart_receipt.js` is the test.
 There is nothing to dry-run and nothing to confirm.
 
 ## Prereqs
