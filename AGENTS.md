@@ -154,5 +154,5 @@ ops interactive: enter on a runbook (refused, footer says so) · the footer name
 ops interactive: a script with no domain still appears, under UNCLASSIFIED (a grouped view never drops a row)
 ops interactive: a script with no integration still appears, under "Any integration" — an absent scheme is the truth, not a gap
 ops interactive: enter on a run · l (and on one with captured: none) · r · x (on a finished one)
-ops interactive | cat (exit 2) · ops config set interactive.bare true → bare `ops` opens it, `ops | cat` still prints the short help
+ops interactive | cat (exit 2) · bare `ops` opens it, `ops | cat` still prints the short help · ops config set interactive.bare false → bare `ops` prints the short help
 ```

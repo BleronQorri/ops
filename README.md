@@ -56,11 +56,11 @@ mkdir -p ~/.zfunc && ops completion zsh > ~/.zfunc/_ops
 # in ~/.zshrc, before compinit:  fpath=(~/.zfunc $fpath)
 ```
 
-A bare `ops` prints the short help, the way `gh` does. To have it open the
-interactive screen on a terminal instead:
+A bare `ops` on a terminal opens the interactive screen; in a pipe it prints the
+short help, the way `gh` does. To get the short help on a terminal too:
 
 ```sh
-ops config set interactive.bare true
+ops config set interactive.bare false
 ```
 
 ## A session

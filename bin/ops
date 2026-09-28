@@ -12,9 +12,9 @@ async function main() {
 
   const argv = process.argv.slice(2);
   if (argv.length === 0) {
-    // Bare `ops`: short help, exit 0 (like `gh`). `interactive.bare` opts out of
-    // that and opens the screen instead, but only on a terminal — a bare `ops`
-    // in a pipe or a script still prints the help it has always printed.
+    // Bare `ops` on a terminal opens the interactive screen; in a pipe or a
+    // script it prints the short help and exits 0 (like `gh`), as it always has.
+    // `interactive.bare false` keeps the short help on a terminal too.
     if (opensOnBare() && process.stdin.isTTY && process.stdout.isTTY) {
       return await require("../lib/orion/interactive").open();
     }
@@ -45,11 +45,11 @@ async function main() {
   }
 }
 
-// `ops config set interactive.bare true` writes the string, the JSON file may hold
-// the boolean; both mean the same thing here.
+// On unless turned off. `ops config set interactive.bare false` writes the string,
+// the JSON file may hold the boolean; both mean the same thing here.
 function opensOnBare() {
   const v = config.get("interactive.bare");
-  return v === true || v === "true";
+  return !(v === false || v === "false");
 }
 
 main().then((code) => process.exit(code));
