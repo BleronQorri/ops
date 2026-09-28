@@ -37,6 +37,7 @@ Edit the frontmatter, not the tables.
 | [edit_document_payload](edit_document_payload/) 📄 *runbook* | — | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
 | [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | SA · zatca | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes |
 | [force_retry_invoices](force_retry_invoices/) | — | prod-write | `ops run force_retry_invoices` | Force-retry stuck e-invoices: flip their trackers retry-eligible, then re-drive sending via Houston |
+| [ksa_fresha_vendor_switch](ksa_fresha_vendor_switch/) | SA · zatca | prod-write | `ops run ksa_fresha_vendor_switch` | Move Fresha's Saudi entity between Comarch and Invopop, one checked houston step at a time |
 | [match_credit_notes_to_invoices](match_credit_notes_to_invoices/) | SA · zatca | read-only | `ops run match_credit_notes_to_invoices` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
 | [patch_invoice_payloads](patch_invoice_payloads/) | — | read-only | `ops run patch_invoice_payloads` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
 <!-- ops:end catalogue:production/write -->
@@ -55,7 +56,7 @@ Edit the frontmatter, not the tables.
 
 <!-- ops:begin tiers -->
 - **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `audit_it_smart_receipt_errors`, `check_invopop_suppliers`, `lookup_it_smart_receipt`, `lookup_sa_zatca_document`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
-- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
+- **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `ksa_fresha_vendor_switch`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
 - **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
 
 Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the worst thing the script can do in any mode. `ops help tiers` has the long form.
