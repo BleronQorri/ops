@@ -11,6 +11,8 @@ invoice-payloads-*.sql
 invopop_entries_*.csv
 invopop_report_*.md
 it-credential-lifecycle-bugbash-*.md
+it-receipt-errors-*.csv
+it-receipt-errors-*.md
 originals/
 preflight-*.md
 rollout-report-*.md
