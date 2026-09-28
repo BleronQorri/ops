@@ -30,6 +30,10 @@ const readline = require("readline/promises");
 const { stdin: input, stdout: output } = require("process");
 const { spawnSync } = require("child_process");
 
+const COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const c = { faint: sgr("2") };
+
 // --- constants -------------------------------------------------------------
 
 const DB = "accounting_documents";
