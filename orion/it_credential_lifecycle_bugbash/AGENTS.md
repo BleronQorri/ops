@@ -1,6 +1,6 @@
 ---
 name: it_credential_lifecycle_bugbash
-summary: Walk one IT Smart Receipts plugin through the credential email ladder in twelve cases and judge each from the DB
+summary: Walk one IT Smart Receipts plugin through the credential email ladder in twelve cases, each judged from the DB
 domain: e-invoicing
 country: IT
 integration: smart_receipts
