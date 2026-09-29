@@ -4,6 +4,7 @@ summary: Move Fresha's Saudi entity between Comarch and Invopop, one checked hou
 domain: e-invoicing
 country: SA
 integration: zatca
+kind: runbook
 env: production
 access: write
 tier: prod-write

@@ -37,7 +37,7 @@ Edit the frontmatter, not the tables.
 | [edit_document_payload](edit_document_payload/) 📄 *runbook* | — | prod-write | `ops orion script view edit_document_payload` | Runbook: hand-edit an accounting document's payload_base64 in an IEx shell and re-drive the send |
 | [fix_credit_note_references](fix_credit_note_references/) 📄 *runbook* | SA · zatca | prod-write | `ops orion script view fix_credit_note_references` | Phase 2 of match_credit_notes_to_invoices: put the BillingReference onto the 34 rejected B2B credit notes |
 | [force_retry_invoices](force_retry_invoices/) | — | prod-write | `ops run force_retry_invoices` | Force-retry stuck e-invoices: flip their trackers retry-eligible, then re-drive sending via Houston |
-| [ksa_fresha_vendor_switch](ksa_fresha_vendor_switch/) | SA · zatca | prod-write | `ops run ksa_fresha_vendor_switch` | Move Fresha's Saudi entity between Comarch and Invopop, one checked houston step at a time |
+| [ksa_fresha_vendor_switch](ksa_fresha_vendor_switch/) 🧭 *runbook, scripted* | SA · zatca | prod-write | `ops run ksa_fresha_vendor_switch` | Move Fresha's Saudi entity between Comarch and Invopop, one checked houston step at a time |
 | [match_credit_notes_to_invoices](match_credit_notes_to_invoices/) | SA · zatca | read-only | `ops run match_credit_notes_to_invoices` | Map each B2B credit note to the invoice it credits, or decode a document's payload_base64 locally |
 | [patch_invoice_payloads](patch_invoice_payloads/) | — | read-only | `ops run patch_invoice_payloads` | Decode an invoice's payload_base64 locally, patch it with an Elixir expression, emit the remediation runbook |
 <!-- ops:end catalogue:production/write -->
@@ -101,6 +101,13 @@ comes last and is not a gap to fix — a tool that serves every scheme says so b
 leaving the field out. The environment is a column inside those tables, not a
 heading of its own.
 
+A runbook is an operation's fixed order of steps. It is either prose an operator
+follows by hand (`status: runbook`, no script) or a script that walks the steps
+itself — reads, checks and houston tasks, stopping on the first check that fails
+(`kind: runbook`). Both sit in a subsection of their own after their integration's
+tools, headed `<integration> · runbooks`: a runbook is where an operation starts,
+not one more row among the lookups it is made of.
+
 | domain | what belongs in it |
 |---|---|
 | `e-invoicing` | anything that talks to a tax authority, or to the documents on their way to one |
@@ -150,6 +157,7 @@ env: production | staging
 access: read-only | write
 tier: read-only | prod-write | prod-write-irreversible | prod-write-no-dry-run | staging
 status: active | deprecated | retired | runbook | blocked   # default active; runbook/blocked = no script
+kind: tool | runbook             # default tool (runbook for status runbook); runbook = a script that walks an operation step by step
 lang: js | exs                   # active/deprecated only
 also: [other_entrypoint.js]      # optional secondary executables in the directory
 secrets: [SOME_TOKEN]            # env vars holding a credential: ops asks once and passes them in
