@@ -7,12 +7,14 @@ access: write
 tier: staging
 lang: js
 examples:
-  - args: 646845
-    note: preview the counts, type the id back, then yes
-  - args: "--dry-run 646845"
-    note: preview + print the SQL, write nothing
-  - args: "-n eng-pierogi 646845"
-    note: "another staging namespace; production is refused"
+  - args: ""
+    note: asks for the provider_id and whether to dry run
+  - args: 12345
+    note: asks only whether to dry run (true is preselected)
+  - args: "--dry-run true 12345"
+    note: preview the counts + print the SQL, write nothing
+  - args: "--namespace eng-devex --dry-run false 12345"
+    note: "another staging namespace; wipes after a typed yes. Production is refused"
 ---
 # wipe_provider_einvoicing
 
@@ -21,12 +23,19 @@ Wipe **all of a provider's e-invoicing data** in the `accounting_documents` DB,
 
 ## What it does
 
+On a terminal it asks for what the flags left out: the `provider_id` (typed), then
+whether to dry run (a picker, `true` preselected). It never asks for the
+environment — it runs on staging only, and its banner names staging and the
+namespace. Without a terminal it asks nothing: the `provider_id` must be given and
+the run is a dry run.
+
 1. **Preview (read-only):** one `houston psql <ns> accounting_documents` query
-   counts the rows that would be deleted, per table, and prints the total.
-2. **Confirm:** you type the `provider_id` back, then `yes`.
+   counts the rows that would be deleted, per table, and prints the total. A dry
+   run prints the delete SQL and stops here.
+2. **Confirm:** with dry run `false`, you type `yes`.
 3. **Wipe (`--write`):** runs the deletes as a **single transaction**
-   (`psql -1 -v ON_ERROR_STOP=1 -f <tmp.sql>`) — any error rolls back everything,
-   so there are no partial deletes.
+   (`BEGIN`/`COMMIT` in the SQL file, `psql -v ON_ERROR_STOP=1 -f <tmp.sql>`) — any
+   error rolls back everything, so there are no partial deletes.
 
 Everything is driven off `provider_id` via subqueries; no id plumbing between
 steps. Documents are matched by `provider_id` **or** their
@@ -61,10 +70,11 @@ account_configurations                      (by provider_id)
 ## Safety
 
 - **Staging only.** Refuses `--namespace production` / `prod`.
-- Per-table count preview before any prompt.
-- Requires typing the `provider_id` back, then `yes`.
+- Per-table count preview before the confirmation.
+- Dry run unless you pick `false` (or pass `--dry-run false`); the wipe then
+  needs a typed `yes`. Without a terminal it is always a dry run, and
+  `--dry-run false` exits 2.
 - Single transaction — atomic; a mid-run error rolls back all deletes.
-- `--dry-run` writes nothing.
 
 ## Prereqs
 

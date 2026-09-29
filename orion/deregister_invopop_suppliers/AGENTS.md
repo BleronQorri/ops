@@ -9,12 +9,14 @@ tier: staging
 lang: exs
 secrets: [INVOPOP_SANDBOX_API_TOKEN]
 examples:
-  - args: "--dry-run"
-    note: walk the whole flow, POST nothing
   - args: ""
-    note: "real run: type the workspace slug, pick the workflow, final yes"
-  - args: "--latest-only --wait 30"
-    note: one job per supplier, block up to 30 s each
+    note: asks whether to dry run, then for the workflow (and the token, when it is unset)
+  - args: "--dry-run true"
+    note: walk the whole flow, POST nothing
+  - args: "--latest-only --dry-run false"
+    note: one job per supplier, fired after a typed yes
+  - args: "--latest-only --wait 30 --dry-run false"
+    note: the same, blocking up to 30 s on each job
 ---
 # deregister_invopop_suppliers
 
@@ -39,18 +41,28 @@ token points at a **sandbox** workspace. The script **refuses to run unless
 - `elixir` (already pinned via `../.tool-versions`; deps are auto-installed by `Mix.install`).
 - An Invopop API token for a **sandbox** workspace.
 
-## Interactive prompts
+## Asking and confirming
 
-1. **Workspace confirmation** — type the printed workspace slug to continue.
-2. **Workflow pick** — `1`/`2`/`3` for the known staging deregister IDs (suggested by
-   country), or paste a UUID.
-3. **Final `yes`** — real run only.
+Sandbox only, so it never asks for an environment; its banner says SANDBOX.
+
+1. **Dry run** — a picker, `true` preselected, unless `--dry-run true|false` says
+   (a bare `--dry-run` is `true`). `true` lists the jobs and POSTs nothing.
+2. **Token** — a typed line, only when `INVOPOP_SANDBOX_API_TOKEN` is unset.
+3. **Workflow** — a picker over the configured staging deregister workflows, the
+   one suggested by the workspace's country highlighted, plus "another" to paste
+   a UUID. Skipped with `--workflow-id`.
+4. **`yes`** — typed once before the jobs are fired (`--dry-run false` only); the
+   line names the workspace. Anything else stops the run, exit 1.
+
+Without a terminal nothing is asked: the token must be set (exit 2 otherwise),
+the workflow is `--workflow-id` or the one suggested for the country (exit 2 when
+there is none), the run is a dry run, and `--dry-run false` exits 2.
 
 ## Flags
 
 | Flag | Effect |
 |------|--------|
-| `--dry-run` | Plan only; POST nothing. |
+| `--dry-run true\|false` | `true` (the default, and what a bare `--dry-run` means): plan only, POST nothing. `false`: fire the jobs after a typed `yes`. |
 | `--latest-only` | One job per supplier (latest entry). **Default: one job per silo entry** (invalidate everything). |
 | `--skip-void` | Skip entries already void/cancelled. **Default: they are INCLUDED** (invalidate everything). |
 | `--wait N` | Pass `?wait=N` — block up to N seconds per job. |
@@ -64,13 +76,13 @@ Anything already in your shell env overrides `.env`.
 
 | Var | Purpose |
 |-----|---------|
-| `INVOPOP_SANDBOX_API_TOKEN` | **Required** sandbox Bearer token (or you're prompted). |
+| `INVOPOP_SANDBOX_API_TOKEN` | **Required** sandbox Bearer token (or you're asked, on a terminal). |
 | `INVOPOP_SANDBOX_API_BASE_URL` | Optional, default `https://api.invopop.com`. |
 | `INVOPOP_DEREGISTER_WORKFLOW_ES_VERIFACTU` | Workflow UUID (staging). |
 | `INVOPOP_DEREGISTER_WORKFLOW_ES_TICKETBAI` | Workflow UUID (staging). |
 | `INVOPOP_DEREGISTER_WORKFLOW_IT_SMARTRECEIPTS` | Workflow UUID (staging). |
 
-The workflow UUIDs populate the numbered picker. Any unset one just drops out of the
+The workflow UUIDs populate the workflow picker. Any unset one just drops out of the
 list — pass `--workflow-id <uuid>` to use one that isn't configured.
 
 **Origin / drift:** the workflow UUIDs originate from

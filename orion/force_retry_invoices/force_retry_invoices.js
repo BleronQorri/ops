@@ -1,6 +1,10 @@
 #!/usr/bin/env node
+"use strict";
 
 // force_retry_invoices — force-retry stuck e-invoices via Houston.
+//
+// Self-contained on purpose: one directory, one entrypoint, no shared library.
+// Copy helpers from a sibling script rather than importing them.
 //
 // Given a list of e_invoice_tracker IDs, this:
 //   1. Pulls those trackers from the accounting_documents DB (read-only psql)
@@ -8,7 +12,7 @@
 //   2. Updates the trackers so they become eligible for retry, via the
 //      `update_einvoice_trackers_status` Houston task:
 //        upload_status -> failed_to_send   (always)
-//        review_status -> prompted          (you pick ONE value from
+//        review_status -> picked            (you pick ONE value from
 //                                            REVIEW_STATUSES; it is applied
 //                                            uniformly to every pulled tracker,
 //                                            regardless of each one's current
@@ -21,18 +25,21 @@
 // `upload_status = failed_to_send` OR `review_status = rejected`, which is why
 // step 2 runs first — it puts the trackers into that eligible state.
 //
+// On a terminal it asks for what the flags left out: the environment, whether to
+// dry run, the tracker ids and the review_status. Each write is confirmed with a
+// typed "yes", and in production a second time by typing "production".
+//
 // Usage:
-//   ./force_retry_invoices.js 123,456
-//   ./force_retry_invoices.js --namespace eng-orion 123,456
-//   ./force_retry_invoices.js --dry-run 123,456
+//   ./force_retry_invoices.js
+//   ./force_retry_invoices.js --env staging 123,456
+//   ./force_retry_invoices.js --env production --dry-run false 123,456
 
 const readline = require("readline/promises");
-const { stdin: input, stdout: output } = require("process");
 const { spawnSync } = require("child_process");
 
 const COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
 const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
-const c = { faint: sgr("2") };
+const c = { header: sgr("1;37"), cmd: sgr("33"), faint: sgr("2"), bad: sgr("31"), warn: sgr("1;33") };
 
 // --- constants -------------------------------------------------------------
 
@@ -59,51 +66,211 @@ const TARGET_UPLOAD_STATUS = "failed_to_send";
 
 // --- arg parsing -----------------------------------------------------------
 
+function usage() {
+  return `force_retry_invoices — force-retry stuck e-invoices via Houston
+
+Usage:
+  force_retry_invoices [flags] [TRACKER_IDS]
+
+On a terminal it asks for what is left out: the environment, whether to dry run,
+the tracker ids and the review_status to set. Nothing else is needed to start.
+
+Arguments:
+  TRACKER_IDS            Comma-separated e_invoice_tracker IDs (e.g. 123,456)
+
+Flags:
+  -e, --env ENV          production or staging (prod / stg also work). Staging runs
+                         against the eng-orion namespace unless --namespace says otherwise
+      --dry-run BOOL     true (the default): pull the trackers and print the Houston
+                         commands, run nothing. false: run them, each after a typed
+                         confirmation — two in production. A bare --dry-run is true
+      --review-status S  the review_status to set on every tracker, one of
+                         ${REVIEW_STATUSES.join(", ")}
+                         (asked for on a terminal when left out)
+  -n, --namespace NAME   override the namespace (default: production, or eng-orion for
+                         staging); the psql pull reads the same namespace
+  -s, --service NAME     Houston service name (default: accounting-documents-web)
+      --skip-update      Skip the tracker status update; only force-retry
+      --skip-retry       Skip the force retry; only update tracker statuses
+      --review-only      Write review_status alone, leave upload_status as it is, and
+                         skip the retry (for closing a document out, not re-arming it)
+  -h, --help             Show this help
+
+Without a terminal nothing is asked: TRACKER_IDS and --env must be given, the run
+is a dry run, and --dry-run false is refused.
+
+Exit codes: 0 done, 1 a task failed or the operator stopped it, 2 the call was wrong.
+`;
+}
+
+function fail(message, code) {
+  process.stderr.write(`${c.bad("error:")} ${message}\n`);
+  process.exit(code);
+}
+
 function parseArgs(argv) {
   const opts = {
-    namespace: "production",
+    env: null,
+    dryRun: null,
+    namespace: null,
     service: "accounting-documents-web",
-    dryRun: false,
+    reviewStatus: null,
     skipUpdate: false,
     skipRetry: false,
     reviewOnly: false,
     ids: null,
   };
+  const val = (flag, v) => {
+    if (v === undefined || v.startsWith("-")) fail(`${flag} takes a value`, 2);
+    return v;
+  };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--namespace" || a === "-n") opts.namespace = argv[++i];
-    else if (a === "--service" || a === "-s") opts.service = argv[++i];
-    else if (a === "--dry-run") opts.dryRun = true;
+    if (a === "-h" || a === "--help") { process.stdout.write(usage()); process.exit(0); }
+    else if (a === "-e" || a === "--env") opts.env = envOf(val(a, argv[++i]));
+    else if (a === "--dry-run") {
+      // A bare --dry-run means true; a value after it says which.
+      const next = argv[i + 1];
+      if (next === "true" || next === "false") opts.dryRun = argv[++i] === "true";
+      else opts.dryRun = true;
+    }
+    else if (a.startsWith("--dry-run=")) opts.dryRun = boolOf(a.slice("--dry-run=".length));
+    else if (a === "-n" || a === "--namespace") opts.namespace = val(a, argv[++i]);
+    else if (a === "-s" || a === "--service") opts.service = val(a, argv[++i]);
+    else if (a === "--review-status") opts.reviewStatus = reviewStatusOf(val(a, argv[++i]));
     else if (a === "--skip-update") opts.skipUpdate = true;
     else if (a === "--skip-retry") opts.skipRetry = true;
     else if (a === "--review-only") { opts.reviewOnly = true; opts.skipRetry = true; }
-    else if (a === "--help" || a === "-h") opts.help = true;
+    else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
     else rest.push(a);
   }
   if (rest.length) opts.ids = rest.join(",");
   return opts;
 }
 
-function usage() {
-  console.log(`force_retry_invoices — force-retry stuck e-invoices via Houston
+function envOf(v) {
+  const e = { production: "production", prod: "production", staging: "staging", stg: "staging" }[String(v).toLowerCase()];
+  if (!e) fail(`--env takes production or staging, got ${JSON.stringify(v)}`, 2);
+  return e;
+}
 
-Usage:
-  force_retry_invoices [flags] <TRACKER_IDS>
+function boolOf(v) {
+  if (v !== "true" && v !== "false") fail(`--dry-run takes true or false, got ${JSON.stringify(v)}`, 2);
+  return v === "true";
+}
 
-Arguments:
-  TRACKER_IDS            Comma-separated e_invoice_tracker IDs (e.g. 123,456)
+function reviewStatusOf(v) {
+  const s = String(v).toLowerCase();
+  if (!REVIEW_STATUSES.includes(s)) fail(`--review-status takes one of ${REVIEW_STATUSES.join(", ")}, got ${JSON.stringify(v)}`, 2);
+  return s;
+}
 
-Flags:
-  -n, --namespace NAME   Kubernetes namespace / env (default: production)
-  -s, --service NAME     Houston service name (default: accounting-documents-web)
-      --dry-run          Pull + plan only; print Houston commands without running them
-      --skip-update      Skip the tracker status update; only force-retry
-      --skip-retry       Skip the force retry; only update tracker statuses
-  -h, --help             Show this help
+// --- asking ----------------------------------------------------------------
 
-For --namespace production the psql pull uses "houston psql production ${DB}".
-Other namespaces are treated as staging ("houston psql eng-orion ${DB}").`);
+const TERMINAL = process.stdin.isTTY && process.stdout.isTTY;
+// A picker hides the cursor while it draws; whatever ends the run, it comes back.
+if (TERMINAL) process.on("exit", () => process.stdout.write("\x1b[?25h"));
+
+const say = (s = "") => process.stdout.write(`  ${s}\n`);
+
+// Stops the run: the operator said no, and nothing after it runs.
+class Stop extends Error {}
+function stop(message) {
+  throw new Stop(message);
+}
+
+// Pick one of a few with the arrow keys (or j/k, or the option's number); enter
+// takes the highlighted one, esc or Ctrl+C stops. The first is highlighted to
+// begin with. Each keystroke repaints the options in place — the cursor goes back
+// up and every line clears only its own tail — so the list never blanks between
+// frames, and the terminal gets its cursor back however the choice ends.
+function choose(question, options) {
+  closeRl();
+  const out = process.stdout;
+  const line = (o, i, at) => (i === at ? `  ${c.cmd("❯")} ${c.header(o.label)}` : `    ${o.label}`) + (o.note ? c.faint(`  · ${o.note}`) : "");
+  const draw = (at, first) => {
+    const frame = options.map((o, i) => `${line(o, i, at)}\x1b[K`).join("\n") + "\n";
+    out.write((first ? "" : `\x1b[${options.length}A\r`) + frame);
+  };
+  say(`${c.header(question)}  ${c.faint("↑↓ move · enter picks · esc stops")}`);
+  out.write("\x1b[?25l");
+  let at = 0;
+  draw(at, true);
+  return new Promise((resolve, reject) => {
+    const done = (fn) => {
+      process.stdin.off("data", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1b[?25h");
+      fn();
+    };
+    // One read can carry several keys (a held arrow, a paste), so it is split into
+    // them first: an escape sequence, a lone esc, or one character.
+    const onKey = (buf) => {
+      const before = at;
+      for (const k of buf.toString().match(/\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|[\s\S]/g) || []) {
+        if (k === "\x1b[A" || k === "\x1bOA" || k === "k") at = (at + options.length - 1) % options.length;
+        else if (k === "\x1b[B" || k === "\x1bOB" || k === "j") at = (at + 1) % options.length;
+        else if (/^[1-9]$/.test(k) && Number(k) <= options.length) at = Number(k) - 1;
+        else if (k === "\r" || k === "\n") {
+          if (at !== before) draw(at, false);
+          return done(() => resolve(options[at].value));
+        } else if (k === "\x1b" || k === "\x03" || k === "\x04" || k === "q") return done(() => reject(new Stop("stopped at a prompt")));
+      }
+      // A key that changes nothing on screen writes nothing.
+      if (at !== before) draw(at, false);
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", onKey);
+  });
+}
+
+// Asks for whatever the flags left out. Without a terminal nothing is asked: the
+// tracker ids and the environment must be given, and the run is a dry run.
+async function askMissing(o) {
+  if (!TERMINAL) {
+    if (!o.ids) fail("no tracker ids given — pass them comma-separated, e.g. 123,456", 2);
+    if (!o.env) fail("no environment given — --env production or --env staging", 2);
+    if (o.dryRun === false) fail("--dry-run false needs a terminal: every write is confirmed by hand", 2);
+    o.dryRun = true;
+  } else {
+    if (!o.env) {
+      o.env = await choose("Which environment?", [
+        { value: "staging", label: "staging", note: o.namespace || "eng-orion" },
+        { value: "production", label: "production" },
+      ]);
+    }
+    if (o.dryRun === null) {
+      o.dryRun = await choose("Dry run?", [
+        { value: true, label: "true", note: "pull the trackers and print the Houston commands; write nothing" },
+        { value: false, label: "false", note: "run the Houston tasks, each after a confirmation" },
+      ]);
+    }
+  }
+  if (!o.namespace) o.namespace = o.env === "production" ? "production" : "eng-orion";
+  if (o.env === "staging" && o.namespace === "production") fail("--env staging cannot run against the production namespace", 2);
+  if (o.env === "production" && o.namespace !== "production") fail(`--env production runs against the production namespace, not ${o.namespace}`, 2);
+}
+
+// One readline interface at a time, closed before a picker takes stdin and before
+// houston runs, so nothing else is reading the terminal when houston asks its own
+// questions.
+let RL = null;
+async function ask(q) {
+  if (!RL) RL = readline.createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return (await RL.question(q)).trim();
+  } catch (err) {
+    // Ctrl+C / Ctrl+D at a prompt is the operator saying no.
+    if (err.name === "AbortError") stop("stopped at a prompt");
+    throw err;
+  }
+}
+function closeRl() {
+  if (RL) RL.close();
+  RL = null;
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -114,10 +281,8 @@ function parseTrackerIds(raw) {
     .map((s) => s.trim())
     .filter(Boolean);
   const invalid = ids.filter((s) => !/^\d+$/.test(s));
-  if (invalid.length) {
-    throw new Error(`Invalid tracker IDs (must be integers): ${invalid.join(", ")}`);
-  }
-  if (!ids.length) throw new Error("No tracker IDs provided.");
+  if (invalid.length) fail(`invalid tracker IDs (must be integers): ${invalid.join(", ")}`, 2);
+  if (!ids.length) fail("no tracker IDs provided", 2);
   // dedupe, preserve as numbers-as-strings
   return [...new Set(ids)];
 }
@@ -140,11 +305,14 @@ function runCapture(cmd, args) {
 
 function runInherit(cmd, args) {
   console.log(`\n$ ${cmd} ${args.join(" ")}\n`);
+  // No readline may hold stdin while houston runs: its own "Continue? (y/yes)"
+  // prompt reads the terminal.
+  closeRl();
   // Ensure the terminal is in cooked (line) mode so the child process's own
-  // interactive prompts (e.g. Houston's "Continue? (y/yes)") can read input.
-  if (input.isTTY) {
+  // interactive prompts can read input.
+  if (process.stdin.isTTY) {
     try {
-      input.setRawMode(false);
+      process.stdin.setRawMode(false);
     } catch {
       // not fatal — best effort
     }
@@ -189,47 +357,39 @@ function fetchTrackers(env, ids) {
     });
 }
 
-// Ask a single question with a fresh readline that is fully closed before we
-// return — so no readline is holding stdin when we later spawn Houston (whose
-// own prompt needs the terminal).
-async function ask(question) {
-  const rl = readline.createInterface({ input, output });
-  try {
-    return await rl.question(question);
-  } finally {
-    rl.close();
-  }
-}
-
-// Show the exact command and ask before running it. Returns true to proceed.
-async function confirmRun(label, cmd, args) {
-  console.log(`\nAbout to run ${label}:`);
-  console.log(`  ${cmd} ${args.join(" ")}`);
-  const ans = (await ask('Run this task? (type "yes" to proceed): ')).trim().toLowerCase();
-  return ans === "yes" || ans === "y";
-}
-
-// Run a houston task, or under --dry-run just print it. Confirms before running.
+// A write: only printed in a dry run; otherwise confirmed by a typed "yes", and in
+// production a second time by typing "production". A wrong answer stops the run
+// before this write (and so before any write after it). Houston still shows its
+// own plan and "Continue?" prompt once it runs.
 async function runOrPlan(label, args, opts) {
   if (opts.dryRun) {
     console.log(`\n[dry-run] houston ${args.join(" ")}`);
-  } else if (await confirmRun(label, "houston", args)) {
-    runInherit("houston", args);
-  } else {
-    console.log(`Skipped ${label}.`);
+    return;
   }
+  const where = opts.env === "production" ? c.bad("PRODUCTION") : c.warn(opts.namespace);
+  console.log(`\n${c.warn("About to run")} ${label} in ${where}:`);
+  console.log(`  ${c.cmd(`houston ${args.join(" ")}`)}`);
+  const answer = (await ask(`  Type "yes" to run it: `)).toLowerCase();
+  if (answer !== "yes") stop(`stopped before ${label} — it was not run`);
+  if (opts.env === "production") {
+    const again = await ask(`  This writes ${c.bad("PRODUCTION")}. Type "production" to confirm: `);
+    if (again !== "production") stop(`stopped before ${label} — it was not run`);
+  }
+  runInherit("houston", args);
 }
 
-// Always prompt for a single review_status applied to the whole list.
-async function promptReviewStatus() {
-  console.log("\nWhat review_status should be set for ALL of the trackers above?");
-  console.log(`  Options: ${REVIEW_STATUSES.join(", ")}`);
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const raw = (await ask("  review_status> ")).trim().toLowerCase();
-    if (REVIEW_STATUSES.includes(raw)) return raw;
-    console.error(`  Invalid status "${raw}". Expected one of: ${REVIEW_STATUSES.join(", ")}`);
-  }
-  throw new Error("Too many invalid review_status attempts.");
+// One review_status applied to the whole list: the flag, or a picker on a
+// terminal. Without either (a dry run with no terminal) the plan shows a
+// placeholder where the value goes.
+async function pickReviewStatus(opts) {
+  if (opts.reviewStatus) return opts.reviewStatus;
+  if (!TERMINAL) return null;
+  console.log("");
+  return choose("What review_status should be set for ALL of the trackers above?", REVIEW_STATUSES.map((s) => ({
+    value: s,
+    label: s,
+    note: s === "rejected" ? "makes them retry-eligible" : undefined,
+  })));
 }
 
 function fmtTable(rows) {
@@ -246,19 +406,18 @@ function fmtTable(rows) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  if (opts.help) return usage();
-  if (opts.skipUpdate && opts.skipRetry) {
-    console.error("--skip-update and --skip-retry together leave nothing to do.");
-    process.exit(1);
-  }
+  if (opts.skipUpdate && opts.skipRetry) fail("--skip-update and --skip-retry together leave nothing to do", 2);
+  if (opts.ids) parseTrackerIds(opts.ids); // a malformed list is refused before anything is asked
+  await askMissing(opts);
 
   const requestedIds = opts.ids
     ? parseTrackerIds(opts.ids)
     : parseTrackerIds(await ask("Comma-separated e_invoice_tracker IDs: "));
 
+  const where = opts.env === "production" ? c.bad("production") : c.warn(`staging (${opts.namespace})`);
   console.log(
-    `\nTarget: namespace=${opts.namespace} service=${opts.service}` +
-      (opts.dryRun ? "  [DRY RUN]" : "")
+    `\nTarget: ${where} namespace=${opts.namespace} service=${opts.service}` +
+      (opts.dryRun ? "  [DRY RUN]" : `  ${c.warn(`writes on confirmation${opts.env === "production" ? ", twice each" : ""}`)}`)
   );
   console.log(`Requested ${requestedIds.length} tracker ID(s): ${requestedIds.join(", ")}`);
 
@@ -280,20 +439,22 @@ async function main() {
   console.log(fmtTable(trackers));
 
   // 2. Update tracker statuses ----------------------------------------------
-  // upload_status is always failed_to_send; review_status is always prompted
-  // and applied uniformly to every pulled tracker.
+  // upload_status is always failed_to_send; review_status is picked once and
+  // applied uniformly to every pulled tracker.
   if (opts.skipUpdate) {
     console.log("\n(Skipping tracker status update — --skip-update)");
   } else {
-    const reviewStatus = await promptReviewStatus();
+    const reviewStatus = await pickReviewStatus(opts);
+    const shownStatus = reviewStatus ?? "<review_status>";
     const trackerIds = trackers.map((t) => t.id);
 
     console.log("\n── Planned tracker updates ─────────────────────────────");
     console.log(
-      `  review_status=${reviewStatus}${opts.reviewOnly ? c.faint(", upload_status left as it is") : `, upload_status=${TARGET_UPLOAD_STATUS}`}  →  ` +
+      `  review_status=${shownStatus}${opts.reviewOnly ? c.faint(", upload_status left as it is") : `, upload_status=${TARGET_UPLOAD_STATUS}`}  →  ` +
         `${trackerIds.length} tracker(s): ${trackerIds.join(", ")}`
     );
     if (opts.reviewOnly) console.log(c.faint("  (--review-only: not re-arming these for retry)"));
+    if (!reviewStatus) console.log(c.faint("  (no terminal and no --review-status: the value is left as a placeholder)"));
 
     // Houston shows its own plan + "Continue? (y/yes)" prompt for this run.
     // Run the update task once for the whole list.
@@ -307,7 +468,7 @@ async function main() {
       "-p",
       `E_INVOICE_TRACKER_IDS=${trackerIds.join(",")}`,
       "-p",
-      `REVIEW_STATUS=${reviewStatus}`,
+      `REVIEW_STATUS=${shownStatus}`,
       // Omitted entirely under --review-only, so the task leaves it alone rather
       // than being handed the value it already has.
       ...(opts.reviewOnly ? [] : ["-p", `UPLOAD_STATUS=${TARGET_UPLOAD_STATUS}`]),
@@ -320,6 +481,7 @@ async function main() {
   // 3. Force retry ----------------------------------------------------------
   if (opts.skipRetry) {
     console.log("\n(Skipping force retry — --skip-retry)");
+    if (opts.dryRun) console.log(`\n${c.faint("Dry run: nothing was written. --dry-run false runs the tasks, each after a confirmation.")}`);
     console.log("\n✓ Done.");
     return;
   }
@@ -346,10 +508,18 @@ async function main() {
   ];
   await runOrPlan("the FORCE retry", retryArgs, opts);
 
+  if (opts.dryRun) console.log(`\n${c.faint("Dry run: nothing was written. --dry-run false runs the tasks, each after a confirmation.")}`);
   console.log("\n✓ Done.");
 }
 
-main().catch((err) => {
-  console.error(`\nError: ${err.message}`);
-  process.exit(1);
-});
+main()
+  .then(() => { closeRl(); process.exit(0); })
+  .catch((err) => {
+    closeRl();
+    if (err instanceof Stop) {
+      console.log(`\n${c.bad("✗ stopped:")} ${err.message}`);
+      process.exit(1);
+    }
+    console.error(`\nError: ${err.message}`);
+    process.exit(1);
+  });

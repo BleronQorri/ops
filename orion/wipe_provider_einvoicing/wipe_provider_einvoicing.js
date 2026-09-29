@@ -1,7 +1,11 @@
 #!/usr/bin/env node
+"use strict";
 
 // wipe_provider_einvoicing — wipe ALL of a provider's e-invoicing data in the
 // accounting-documents DB, on STAGING only.
+//
+// Self-contained on purpose: one directory, one entrypoint, no shared library.
+// The picker and the prompts are copied from ksa_fresha_vendor_switch.
 //
 // Scope: the e-invoicing domain rooted at `account_configurations` (keyed by
 // `provider_id`). It clears — in FK order, inside ONE transaction:
@@ -31,24 +35,30 @@
 // preview, `--write` for the wipe. No app-side Houston task is involved.
 //
 // SAFETY:
-//   * STAGING ONLY. Refuses --namespace production (or anything prod-looking).
+//   * STAGING ONLY. Refuses --namespace production (or anything prod-looking),
+//     so it never asks which environment: the banner names staging and the
+//     namespace.
 //   * Prints a per-table row-count preview before doing anything.
-//   * Requires you to type the provider_id back, then a final "yes".
-//   * The whole wipe runs as a single transaction (-1, ON_ERROR_STOP=1): any
-//     error rolls the whole thing back — no partial deletes.
-//   * --dry-run prints the SQL and exits without writing.
+//   * Dry run unless the operator picks (or passes) --dry-run false; the wipe is
+//     then confirmed with a typed "yes". Without a terminal it is always a dry run.
+//   * The whole wipe runs as a single transaction (BEGIN/COMMIT, ON_ERROR_STOP=1):
+//     any error rolls the whole thing back — no partial deletes.
 //
 // Usage:
+//   ./wipe_provider_einvoicing.js
 //   ./wipe_provider_einvoicing.js 12345
-//   ./wipe_provider_einvoicing.js --namespace eng-orion 12345
-//   ./wipe_provider_einvoicing.js --dry-run 12345
+//   ./wipe_provider_einvoicing.js --dry-run true 12345
+//   ./wipe_provider_einvoicing.js --namespace eng-devex --dry-run false 12345
 
 const readline = require("readline/promises");
-const { stdin: input, stdout: output } = require("process");
 const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+
+const COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const c = { header: sgr("1;37"), cmd: sgr("33"), faint: sgr("2"), ok: sgr("32"), bad: sgr("31"), warn: sgr("1;33") };
 
 // --- constants -------------------------------------------------------------
 
@@ -61,39 +71,69 @@ const PROD_NAMESPACES = new Set(["production", "prod"]);
 
 // --- arg parsing -----------------------------------------------------------
 
+function fail(message, code) {
+  process.stderr.write(`${c.bad("error:")} ${message}\n`);
+  process.exit(code);
+}
+
 function parseArgs(argv) {
   const opts = {
     namespace: DEFAULT_NAMESPACE,
-    dryRun: false,
+    dryRun: null,
     providerId: null,
-    help: false,
+  };
+  const val = (flag, v) => {
+    if (v === undefined || v.startsWith("-")) fail(`${flag} takes a value`, 2);
+    return v;
   };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--namespace" || a === "-n") opts.namespace = argv[++i];
-    else if (a === "--dry-run") opts.dryRun = true;
-    else if (a === "--help" || a === "-h") opts.help = true;
+    if (a === "--help" || a === "-h") { usage(); process.exit(0); }
+    else if (a === "--namespace" || a === "-n") opts.namespace = val(a, argv[++i]);
+    else if (a === "--dry-run") {
+      // A bare --dry-run means true; a value after it says which.
+      const next = argv[i + 1];
+      if (next === "true" || next === "false") opts.dryRun = argv[++i] === "true";
+      else opts.dryRun = true;
+    }
+    else if (a.startsWith("--dry-run=")) opts.dryRun = boolOf(a.slice("--dry-run=".length));
+    else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
     else rest.push(a);
   }
-  if (rest.length) opts.providerId = rest[0];
+  if (rest.length > 1) fail(`expected one PROVIDER_ID, got ${rest.join(" ")}`, 2);
+  if (rest.length) opts.providerId = validateProviderId(rest[0]);
   return opts;
+}
+
+function boolOf(v) {
+  if (v !== "true" && v !== "false") fail(`--dry-run takes true or false, got ${JSON.stringify(v)}`, 2);
+  return v === "true";
 }
 
 function usage() {
   console.log(`wipe_provider_einvoicing — wipe a provider's e-invoicing data (STAGING only)
 
 Usage:
-  ./wipe_provider_einvoicing.js [flags] <PROVIDER_ID>
+  ./wipe_provider_einvoicing.js [flags] [PROVIDER_ID]
+
+On a terminal it asks for what is left out: the provider_id and whether to dry
+run. It never asks for the environment: it runs on staging only.
 
 Arguments:
-  PROVIDER_ID            The integer provider_id to clear.
+  PROVIDER_ID            The integer provider_id to clear (asked for on a
+                         terminal when left out; required without one).
 
 Flags:
   -n, --namespace NAME   Staging namespace (default: ${DEFAULT_NAMESPACE}).
                          Production namespaces are refused.
-      --dry-run          Preview + print the SQL; write nothing.
+      --dry-run BOOL     true (preselected; a bare --dry-run means true):
+                         preview the counts and print the SQL, write nothing.
+                         false: run the wipe after a typed "yes".
   -h, --help             Show this help.
+
+Without a terminal nothing is asked: PROVIDER_ID must be given, the run is a
+dry run, and --dry-run false exits 2.
 
 Clears (FK order, one transaction): line items, compliance records, error &
 document logs, e_invoice_trackers, accounting_documents, integration issues &
@@ -101,7 +141,110 @@ application requests, smart-receipts config, plugins, config logs, addresses,
 and finally account_configurations — everything keyed off the given provider_id.
 
 Does NOT touch the invoicing/ domain (invoice_parties/invoices) or rows keyed
-only by invoice_entity_id.`);
+only by invoice_entity_id.
+
+Exit codes: 0 done, 1 refused, stopped or failed, 2 the call was wrong.`);
+}
+
+// --- asking the operator ---------------------------------------------------
+
+const TERMINAL = process.stdin.isTTY && process.stdout.isTTY;
+// A picker hides the cursor while it draws; whatever ends the run, it comes back.
+if (TERMINAL) process.on("exit", () => process.stdout.write("\x1b[?25h"));
+
+// Stops the run: the operator said no. Exit 1, nothing after it runs.
+class Stop extends Error {}
+function stop(message) {
+  throw new Stop(message);
+}
+
+const say = (s = "") => process.stdout.write(`  ${s}\n`);
+
+// Pick one of a few with the arrow keys (or j/k, or the option's number); enter
+// takes the highlighted one, esc or Ctrl+C stops. The first is highlighted to
+// begin with. Each keystroke repaints the options in place — the cursor goes back
+// up and every line clears only its own tail — so the list never blanks between
+// frames, and the terminal gets its cursor back however the choice ends.
+function choose(question, options) {
+  closeRl();
+  const out = process.stdout;
+  const line = (o, i, at) => (i === at ? `  ${c.cmd("❯")} ${c.header(o.label)}` : `    ${o.label}`) + (o.note ? c.faint(`  · ${o.note}`) : "");
+  const draw = (at, first) => {
+    const frame = options.map((o, i) => `${line(o, i, at)}\x1b[K`).join("\n") + "\n";
+    out.write((first ? "" : `\x1b[${options.length}A\r`) + frame);
+  };
+  say(`${c.header(question)}  ${c.faint("↑↓ move · enter picks · esc stops")}`);
+  out.write("\x1b[?25l");
+  let at = 0;
+  draw(at, true);
+  return new Promise((resolve, reject) => {
+    const done = (fn) => {
+      process.stdin.off("data", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1b[?25h");
+      fn();
+    };
+    // One read can carry several keys (a held arrow, a paste), so it is split into
+    // them first: an escape sequence, a lone esc, or one character.
+    const onKey = (buf) => {
+      const before = at;
+      for (const k of buf.toString().match(/\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|[\s\S]/g) || []) {
+        if (k === "\x1b[A" || k === "\x1bOA" || k === "k") at = (at + options.length - 1) % options.length;
+        else if (k === "\x1b[B" || k === "\x1bOB" || k === "j") at = (at + 1) % options.length;
+        else if (/^[1-9]$/.test(k) && Number(k) <= options.length) at = Number(k) - 1;
+        else if (k === "\r" || k === "\n") {
+          if (at !== before) draw(at, false);
+          return done(() => resolve(options[at].value));
+        } else if (k === "\x1b" || k === "\x03" || k === "\x04" || k === "q") return done(() => reject(new Stop("stopped at a prompt")));
+      }
+      // A key that changes nothing on screen writes nothing.
+      if (at !== before) draw(at, false);
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", onKey);
+  });
+}
+
+// Asks for whatever the flags left out. Without a terminal nothing is asked: the
+// provider_id must be given, and the run is a dry run.
+async function askMissing(o) {
+  if (!TERMINAL) {
+    if (!o.providerId) fail("no PROVIDER_ID given — pass it as the argument", 2);
+    if (o.dryRun === false) fail("--dry-run false needs a terminal: the wipe is confirmed by hand", 2);
+    o.dryRun = true;
+    return;
+  }
+  if (!o.providerId) {
+    const raw = await ask("provider_id to clear: ");
+    if (!raw) stop("no provider_id given");
+    o.providerId = validateProviderId(raw);
+  }
+  if (o.dryRun === null) {
+    o.dryRun = await choose("Dry run?", [
+      { value: true, label: "true", note: "preview the counts and print the SQL; write nothing" },
+      { value: false, label: "false", note: "wipe the rows, after a typed yes" },
+    ]);
+  }
+}
+
+// One readline interface at a time, closed before a picker or houston takes the
+// terminal, so nothing else is reading it.
+let RL = null;
+async function ask(q) {
+  if (!RL) RL = readline.createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return (await RL.question(q)).trim();
+  } catch (err) {
+    // Ctrl+C / Ctrl+D at a prompt is the operator saying no.
+    if (err.name === "AbortError") stop("stopped at a prompt");
+    throw err;
+  }
+}
+function closeRl() {
+  if (RL) RL.close();
+  RL = null;
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -109,7 +252,7 @@ only by invoice_entity_id.`);
 function validateProviderId(raw) {
   const s = String(raw).trim();
   if (!/^\d+$/.test(s)) {
-    throw new Error(`Invalid provider_id (must be a positive integer): "${raw}"`);
+    fail(`invalid provider_id (must be a positive integer): ${JSON.stringify(String(raw))}`, 2);
   }
   return s;
 }
@@ -127,9 +270,10 @@ function runCapture(cmd, args) {
 
 function runInherit(cmd, args) {
   console.log(`\n$ ${cmd} ${args.join(" ")}\n`);
-  if (input.isTTY) {
+  closeRl();
+  if (process.stdin.isTTY) {
     try {
-      input.setRawMode(false);
+      process.stdin.setRawMode(false);
     } catch {
       // best effort
     }
@@ -138,15 +282,6 @@ function runInherit(cmd, args) {
   if (res.error) throw res.error;
   if (res.status !== 0) {
     throw new Error(`${cmd} exited with status ${res.status}`);
-  }
-}
-
-async function ask(question) {
-  const rl = readline.createInterface({ input, output });
-  try {
-    return await rl.question(question);
-  } finally {
-    rl.close();
   }
 }
 
@@ -273,7 +408,6 @@ function parseCounts(out) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  if (opts.help) return usage();
 
   // Hard staging guard.
   if (PROD_NAMESPACES.has(opts.namespace.toLowerCase())) {
@@ -284,13 +418,13 @@ async function main() {
     process.exit(1);
   }
 
-  const providerId = opts.providerId
-    ? validateProviderId(opts.providerId)
-    : validateProviderId(await ask("provider_id to clear: "));
+  await askMissing(opts);
+  const providerId = opts.providerId;
 
   console.log(
-    `\nTarget: namespace=${opts.namespace} db=${DB} provider_id=${providerId}` +
-      (opts.dryRun ? "  [DRY RUN]" : "")
+    `\n${c.header("wipe_provider_einvoicing")} — ${c.warn(`staging (${opts.namespace})`)}, ` +
+      `db=${DB} provider_id=${providerId}, DRY_RUN=${opts.dryRun} — ` +
+      (opts.dryRun ? "preview and SQL only" : c.warn('wipes after a typed "yes"'))
   );
 
   // 1. Preview -------------------------------------------------------------
@@ -314,24 +448,17 @@ async function main() {
   if (opts.dryRun) {
     console.log("\n── SQL (dry-run, not executed) ─────────────────────────");
     console.log(deleteSql);
-    console.log("[dry-run] Nothing was written.");
+    console.log("[dry-run] Nothing was written. --dry-run false runs the wipe, after a typed \"yes\".");
     return;
   }
 
   // 2. Confirm -------------------------------------------------------------
   console.log(
-    "\n⚠  This permanently deletes the rows above in a single transaction."
+    `\n⚠  This permanently deletes the rows above for provider_id=${providerId} ` +
+      `in ${c.warn(`staging (${opts.namespace})`)}, in a single transaction.`
   );
-  const echo = (await ask(`Type the provider_id (${providerId}) to confirm: `)).trim();
-  if (echo !== providerId) {
-    console.error("provider_id mismatch. Aborting.");
-    process.exit(1);
-  }
-  const final = (await ask('Proceed? (type "yes"): ')).trim().toLowerCase();
-  if (final !== "yes") {
-    console.log("Aborted. Nothing was written.");
-    return;
-  }
+  const final = (await ask('Type "yes" to wipe them: ')).toLowerCase();
+  if (final !== "yes") stop("stopped before the wipe — nothing was written");
 
   // 3. Execute -------------------------------------------------------------
   // Write the SQL to a temp file and run it. The SQL wraps itself in
@@ -361,10 +488,17 @@ async function main() {
     }
   }
 
-  console.log(`\n✓ Cleared e-invoicing data for provider_id=${providerId}.`);
+  console.log(`\n${c.ok("✓")} Cleared e-invoicing data for provider_id=${providerId}.`);
 }
 
-main().catch((err) => {
-  console.error(`\nError: ${err.message}`);
-  process.exit(1);
-});
+main()
+  .then(() => { closeRl(); process.exit(0); })
+  .catch((err) => {
+    closeRl();
+    if (err instanceof Stop) {
+      console.log(`\n${c.bad("✗ stopped:")} ${err.message}`);
+      process.exit(1);
+    }
+    console.error(`\nError: ${err.message}`);
+    process.exit(1);
+  });

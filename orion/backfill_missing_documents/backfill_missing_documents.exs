@@ -1,17 +1,22 @@
 #!/usr/bin/env elixir
 
 # backfill_missing_documents — backfill accounting documents for sales that never
-# produced an invoice / credit note.
+# produced an invoice / credit note. PRODUCTION only: the production shedul
+# database, the production S3 bucket and the production task.
 #
-# Pipeline (production), each step gated by a confirmation:
+# Pipeline:
 #   1. Export the given sales to a CSV via `houston psql production shedul` (\copy),
-#      filtered by provider_id + an explicit list of sale ids.
+#      filtered by provider_id + an explicit list of sale ids. A read.
 #   2. Upload the CSV to
 #      s3://fresha-accounting-documents-production/process_missing_sales_events_backfill/
-#      via `houston aws-shell <profile> -- aws s3 cp`.
+#      via `houston aws-shell <profile> -- aws s3 cp`. A production write, and
+#      made in a dry run too.
 #   3. Run the `process_missing_sales_events` houston task against
-#      `accounting-documents-web`, passing PROVIDER_ID + S3_KEY. GATED behind a
-#      typed "yes".
+#      `accounting-documents-web`, passing PROVIDER_ID + S3_KEY. Only with
+#      --dry-run false.
+#
+# Each write (the upload, the task) is confirmed by typing "yes", then again by
+# typing "production"; either answer wrong and the run stops before that write.
 #
 # The CSV column order is dictated by the task's parser
 # (ProcessMissingSalesEventsTask.parse_row/1) — do NOT reorder the SELECT.
@@ -20,15 +25,24 @@
 # skipped by the task (InvoiceProcessingRouter).
 #
 # Usage:
-#   ./backfill_missing_documents.exs <provider_id> <sale_id1,sale_id2,...> [flags]
+#   ./backfill_missing_documents.exs [provider_id] [sale_id1,sale_id2,...] [flags]
+#
+# On a terminal it asks for what is left out: whether to dry run (a picker:
+# ↑↓ or j/k, enter picks, esc stops), then the provider_id and the sale ids
+# (typed). Without a terminal it asks nothing: both must be given, the run is a
+# dry run, and it stops before the upload, because a production write is
+# confirmed by hand.
 #
 # Flags:
+#   --dry-run BOOL     true (the default; a bare --dry-run means true): export,
+#                      upload the CSV, print the exact task command, do NOT run
+#                      the task. false: export, upload, then run the task.
 #   --profile <name>   AWS profile for the S3 upload (default: fresha-production-team-orion).
 #   --keep-csv         Keep the generated CSV on disk (prints the path).
-#   --dry-run          Do everything up to (and including) the S3 upload, print the
-#                      exact task command, but do NOT run the task.
-#   --skip-upload      Only generate the CSV (implies --dry-run, --keep-csv).
+#   --skip-upload      Only generate the CSV (implies --dry-run true, --keep-csv).
 #   -h, --help         Show this help.
+#
+# Exit codes: 0 done, 1 a step failed or the operator stopped it, 2 the call was wrong.
 
 defmodule ProcessMissingSales do
   @moduledoc false
@@ -50,6 +64,8 @@ defmodule ProcessMissingSales do
     if "--help" in argv or "-h" in argv, do: (usage(); System.halt(0))
 
     opts = parse_args(argv)
+    Process.put(:terminal, terminal_device())
+    opts = ask_missing(opts)
 
     provider_id = resolve_provider_id(opts.provider_id)
     sale_ids = resolve_sale_ids(opts.sale_ids_raw)
@@ -73,7 +89,7 @@ defmodule ProcessMissingSales do
     try do
       write_copy_sql(sql_path, csv_path, provider_id, in_list)
 
-      banner(provider_id, length(sale_ids), s3_uri, opts.dry_run?)
+      banner(provider_id, length(sale_ids), s3_uri, opts)
 
       # --- step 1: export CSV -------------------------------------------------
       IO.puts(hl("### Step 1 — export sales to CSV (read-only) ###"))
@@ -81,7 +97,8 @@ defmodule ProcessMissingSales do
       IO.puts("SQL to run:")
       File.read!(sql_path) |> indent() |> IO.puts()
       IO.puts("")
-      confirm!("Run the export now?")
+      # A read: asked on a terminal as it always was, run without asking otherwise.
+      if terminal(), do: confirm!("Run the export now?")
 
       houston!(["psql", @db_env, @db_name, "--", "-f", sql_path])
 
@@ -106,16 +123,23 @@ defmodule ProcessMissingSales do
         halt(0)
       end
 
-      # --- step 2: upload to S3 ----------------------------------------------
-      IO.puts(hl("### Step 2 — upload CSV to S3 ###"))
+      # --- step 2: upload to S3 (a production write) -------------------------
+      IO.puts(hl("### Step 2 — upload CSV to S3 (production write) ###"))
       IO.puts("Will run: houston aws-shell #{opts.profile} -- aws s3 cp <csv> #{s3_uri}")
-      confirm!("Upload the CSV to S3 now?")
+
+      unless terminal() do
+        IO.puts(warn("[DRY RUN] No terminal: the upload writes to the production bucket and is confirmed by hand, so the run stops here."))
+        IO.puts("Would upload to: #{s3_uri}")
+        halt(0)
+      end
+
+      confirm_write!("upload the CSV to #{s3_uri}", "Aborted. Nothing was uploaded.")
 
       houston!(["aws-shell", opts.profile, "--", "aws", "s3", "cp", csv_path, s3_uri])
       IO.puts("Uploaded: #{s3_uri}")
       IO.puts("")
 
-      # --- step 3: run the task (gated) --------------------------------------
+      # --- step 3: run the task (a production write) -------------------------
       task_args = [
         "task", "run", @service, @task,
         "-p", "PROVIDER_ID=#{provider_id}",
@@ -123,27 +147,25 @@ defmodule ProcessMissingSales do
         "-w"
       ]
 
-      IO.puts(hl("### Step 3 — run the backfill task ###"))
+      IO.puts(hl("### Step 3 — run the backfill task (production write) ###"))
       IO.puts("Exact command:")
       IO.puts(indent("houston " <> Enum.join(task_args, " ")))
       IO.puts("")
 
       if opts.dry_run? do
-        IO.puts(warn("[DRY RUN] Not running the task. Re-run without --dry-run to execute."))
+        IO.puts(warn("[DRY RUN] Not running the task. Re-run with --dry-run false to execute."))
         IO.puts("CSV S3_KEY: #{s3_key}")
         halt(0)
       end
 
-      case prompt_value("Run this PRODUCTION task now? Type 'yes' to proceed: ") do
-        "yes" ->
-          houston!(task_args)
-          IO.puts("")
-          IO.puts(ok("#{@check} backfill_missing_documents complete (provider #{provider_id}, #{length(sale_ids)} sale(s))."))
+      confirm_write!(
+        "run this PRODUCTION task",
+        "Aborted. CSV already uploaded at #{s3_uri} (S3_KEY: #{s3_key})."
+      )
 
-        _ ->
-          IO.puts("Aborted. CSV already uploaded at #{s3_uri} (S3_KEY: #{s3_key}).")
-          halt(1)
-      end
+      houston!(task_args)
+      IO.puts("")
+      IO.puts(ok("#{@check} backfill_missing_documents complete (provider #{provider_id}, #{length(sale_ids)} sale(s))."))
     after
       unless opts.keep_csv?, do: File.rm_rf(workdir)
     end
@@ -155,7 +177,8 @@ defmodule ProcessMissingSales do
     init = %{
       profile: @default_profile,
       keep_csv?: false,
-      dry_run?: false,
+      # nil = not given: asked on a terminal, true without one.
+      dry_run?: nil,
       skip_upload?: false,
       positional: []
     }
@@ -171,14 +194,188 @@ defmodule ProcessMissingSales do
   defp do_parse([], acc), do: acc
   defp do_parse(["--profile", val | rest], acc), do: do_parse(rest, %{acc | profile: val})
   defp do_parse(["--keep-csv" | rest], acc), do: do_parse(rest, %{acc | keep_csv?: true})
+
+  # A bare --dry-run means true; a value after it says which.
+  defp do_parse(["--dry-run", v | rest], acc) when v in ["true", "false"],
+    do: do_parse(rest, %{acc | dry_run?: v == "true"})
+
   defp do_parse(["--dry-run" | rest], acc), do: do_parse(rest, %{acc | dry_run?: true})
+  defp do_parse(["--dry-run=" <> v | rest], acc), do: do_parse(rest, %{acc | dry_run?: bool_of(v)})
 
   defp do_parse(["--skip-upload" | rest], acc),
-    do: do_parse(rest, %{acc | skip_upload?: true, dry_run?: true, keep_csv?: true})
+    do: do_parse(rest, %{acc | skip_upload?: true, keep_csv?: true})
 
-  defp do_parse(["--profile"], _acc), do: die("--profile needs a value")
-  defp do_parse(["-" <> _ = flag | _rest], _acc), do: die("unknown flag: #{flag}")
+  defp do_parse(["--profile"], _acc), do: usage_error("--profile needs a value")
+  defp do_parse(["-" <> _ = flag | _rest], _acc), do: usage_error("unknown flag: #{flag}")
   defp do_parse([pos | rest], acc), do: do_parse(rest, %{acc | positional: [pos | acc.positional]})
+
+  defp bool_of("true"), do: true
+  defp bool_of("false"), do: false
+  defp bool_of(v), do: usage_error("--dry-run takes true or false, got #{inspect(v)}")
+
+  # --- asking the operator ---------------------------------------------------
+
+  # Asks for whatever the flags left out. Without a terminal nothing is asked:
+  # provider_id and the sale ids must be given, and the run is a dry run.
+  defp ask_missing(opts) do
+    if opts.skip_upload? and opts.dry_run? == false,
+      do: usage_error("--skip-upload only builds the CSV; it cannot go with --dry-run false")
+
+    cond do
+      terminal() == nil ->
+        if opts.provider_id == nil,
+          do: usage_error("no provider_id given, and no terminal to ask on — pass <provider_id> <sale_ids>")
+
+        if opts.sale_ids_raw == nil,
+          do: usage_error("no sale ids given, and no terminal to ask on — pass <provider_id> <sale_ids>")
+
+        if opts.dry_run? == false,
+          do: usage_error("--dry-run false needs a terminal: every write is confirmed by hand")
+
+        %{opts | dry_run?: true}
+
+      opts.skip_upload? ->
+        %{opts | dry_run?: true}
+
+      opts.dry_run? == nil ->
+        dry_run? =
+          choose("Dry run?", [
+            {true, "true", "export and upload the CSV, print the task command; run no task"},
+            {false, "false", "export, upload, then run the production task — each write confirmed twice"}
+          ])
+
+        %{opts | dry_run?: dry_run?}
+
+      true ->
+        opts
+    end
+  end
+
+  # A terminal is stdin and stdout both on the controlling terminal. Returns that
+  # device's path, which the picker hands to stty, or nil. (The stty runs in a
+  # child that has no controlling terminal — erl_child_setup calls setsid — so it
+  # names the device instead of /dev/tty.)
+  defp terminal_device do
+    with true <- Keyword.get(:io.getopts(:standard_io), :terminal) == true,
+         {out, 0} <- System.cmd("ps", ["-o", "tty=", "-p", System.pid()], stderr_to_stdout: true),
+         name when name not in ["", "?", "??"] <- String.trim(out),
+         dev = "/dev/" <> name,
+         {:ok, %File.Stat{type: :device, minor_device: rdev}} <- File.stat("/dev/fd/0"),
+         {:ok, %File.Stat{type: :device, minor_device: ^rdev}} <- File.stat(dev) do
+      dev
+    else
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp terminal, do: Process.get(:terminal)
+
+  defp stty(dev, args), do: System.cmd("sh", ["-c", "stty #{args} < #{dev}"], stderr_to_stdout: true)
+
+  # Pick one of a few with the arrow keys (or j/k, or the option's number); enter
+  # takes the highlighted one, esc or Ctrl+C stops. The first option is
+  # highlighted to begin with. Each keystroke repaints the options in place — the
+  # cursor goes back up and every line clears only its own tail, one write per
+  # frame — so the list never blanks between frames. The terminal's settings
+  # (saved with stty -g, restored exactly) and its cursor come back however the
+  # choice ends. Options are {value, label, note}.
+  defp choose(question, options) do
+    dev = terminal()
+    IO.puts("  #{hl(question)}  #{faint("↑↓ move · enter picks · esc stops")}")
+    {saved, 0} = stty(dev, "-g")
+
+    result =
+      try do
+        stty(dev, "raw -echo")
+        IO.write("\e[?25l")
+        draw(options, 0, true)
+        pick(options, 0)
+      after
+        stty(dev, "'#{String.trim(saved)}'")
+        IO.write("\e[?25h")
+      end
+
+    case result do
+      {:ok, value} ->
+        value
+
+      :stop ->
+        IO.puts(err("✗ stopped at a prompt — nothing was run."))
+        halt(1)
+    end
+  end
+
+  defp pick(options, at) do
+    n = length(options)
+
+    case read_key() do
+      k when k in ["\e[A", "\eOA", "k"] -> move(options, at, rem(at - 1 + n, n))
+      k when k in ["\e[B", "\eOB", "j"] -> move(options, at, rem(at + 1, n))
+      <<d>> when d in ?1..?9 and d - ?0 <= n -> move(options, at, d - ?1)
+      k when k in ["\r", "\n"] -> {:ok, options |> Enum.at(at) |> elem(0)}
+      k when k in ["\e", <<3>>, <<4>>, "q"] -> :stop
+      _ -> pick(options, at)
+    end
+  end
+
+  # A key that changes nothing on screen writes nothing.
+  defp move(options, at, at), do: pick(options, at)
+  defp move(options, _before, at), do: (draw(options, at, false); pick(options, at))
+
+  # Raw mode turns off the terminal's own newline translation, hence \r\n.
+  defp draw(options, at, first?) do
+    frame =
+      options
+      |> Enum.with_index()
+      |> Enum.map_join(fn {{_value, label, note}, i} ->
+        line = if i == at, do: "  #{cmd("❯")} #{hl(label)}", else: "    #{label}"
+        note = if note, do: faint("  · #{note}"), else: ""
+        line <> note <> "\e[K\r\n"
+      end)
+
+    IO.write(if(first?, do: "", else: "\e[#{length(options)}A\r") <> frame)
+  end
+
+  # One key: an escape sequence, a lone esc, or one byte. A lone esc is told
+  # from the start of a sequence by nothing following it within 80 ms; esc stops
+  # the run, so the read left waiting then never matters.
+  defp read_key do
+    case IO.binread(:stdio, 1) do
+      "\e" ->
+        next = Task.async(fn -> IO.binread(:stdio, 1) end)
+
+        case Task.yield(next, 80) do
+          {:ok, b} when b in ["[", "O"] -> "\e" <> b <> read_sequence("")
+          _ -> "\e"
+        end
+
+      b when is_binary(b) ->
+        b
+
+      _eof ->
+        <<4>>
+    end
+  end
+
+  defp read_sequence(acc) do
+    case IO.binread(:stdio, 1) do
+      <<c>> = b when c in ?0..?9 or c == ?; -> read_sequence(acc <> b)
+      b when is_binary(b) -> acc <> b
+      _ -> acc
+    end
+  end
+
+  # A write: confirmed by typing "yes", and — this is production — a second time
+  # by typing "production". Either answer wrong and the run stops before it.
+  defp confirm_write!(what, aborted) do
+    yes = prompt_value(~s(Type "yes" to #{what}: )) |> String.downcase()
+    unless yes == "yes", do: (IO.puts(aborted); halt(1))
+
+    again = prompt_value(~s(This writes #{err("PRODUCTION")}. Type "production" to confirm: ))
+    unless again == "production", do: (IO.puts(aborted); halt(1))
+  end
 
   # --- input resolution + validation -----------------------------------------
 
@@ -284,17 +481,25 @@ defmodule ProcessMissingSales do
 
   # --- UI helpers ------------------------------------------------------------
 
-  defp banner(provider_id, sale_count, s3_uri, dry_run?) do
+  defp banner(provider_id, sale_count, s3_uri, opts) do
+    mode =
+      cond do
+        opts.skip_upload? -> "CSV ONLY (--skip-upload): export, keep the CSV, upload nothing"
+        opts.dry_run? -> "DRY RUN — export + upload, the task will NOT be run"
+        true -> "LIVE — export, upload, then run the task"
+      end
+
     IO.puts("")
     IO.puts("============================================================")
-    IO.puts("  backfill_missing_documents")
+    IO.puts("  backfill_missing_documents — #{err("PRODUCTION")}")
     IO.puts("  provider_id : #{provider_id}")
     IO.puts("  sale ids    : #{sale_count} sale(s)")
     IO.puts("  db          : houston psql #{@db_env} #{@db_name}")
     IO.puts("  s3          : #{s3_uri}")
     IO.puts("  task        : houston task run #{@service} #{@task}")
     IO.puts("  note        : sales with an existing document are skipped by the task")
-    if dry_run?, do: IO.puts("  MODE        : DRY RUN (task will NOT be run)")
+    IO.puts("  MODE        : #{mode}")
+    unless opts.skip_upload?, do: IO.puts("  writes      : each confirmed twice — \"yes\", then \"production\"")
     IO.puts("============================================================")
     IO.puts("")
   end
@@ -317,6 +522,12 @@ defmodule ProcessMissingSales do
   defp die(msg) do
     IO.puts(:stderr, err("#{@cross} ERROR: #{msg}"))
     halt(1)
+  end
+
+  # The call was wrong: exit 2.
+  defp usage_error(msg) do
+    IO.puts(:stderr, err("#{@cross} ERROR: #{msg}"))
+    halt(2)
   end
 
   # Cleanup-safe halt: removes the registered workdir (unless --keep-csv) before
@@ -343,10 +554,12 @@ defmodule ProcessMissingSales do
 
   defp indent(s), do: s |> String.trim_trailing() |> String.split("\n") |> Enum.map_join("\n", &("    " <> &1))
 
-  defp hl(s), do: IO.ANSI.format([:bright, :white, s, :reset])
-  defp ok(s), do: IO.ANSI.format([:bright, :green, s, :reset])
-  defp warn(s), do: IO.ANSI.format([:bright, :yellow, s, :reset])
-  defp err(s), do: IO.ANSI.format([:bright, :red, s, :reset])
+  defp hl(s), do: IO.ANSI.format([:bright, :white, s, :reset]) |> IO.chardata_to_string()
+  defp ok(s), do: IO.ANSI.format([:bright, :green, s, :reset]) |> IO.chardata_to_string()
+  defp warn(s), do: IO.ANSI.format([:bright, :yellow, s, :reset]) |> IO.chardata_to_string()
+  defp err(s), do: IO.ANSI.format([:bright, :red, s, :reset]) |> IO.chardata_to_string()
+  defp faint(s), do: IO.ANSI.format([:faint, s, :reset]) |> IO.chardata_to_string()
+  defp cmd(s), do: IO.ANSI.format([:yellow, s, :reset]) |> IO.chardata_to_string()
 end
 
 ProcessMissingSales.run(System.argv())

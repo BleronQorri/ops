@@ -33,7 +33,7 @@ INHERITED FLAGS
 
 EXAMPLES
   # one comment line when the intent is not obvious
-  $ ops run force_retry_invoices --dry-run 123,456
+  $ ops run force_retry_invoices --env production --dry-run true 123,456
 
 LEARN MORE
   Use `ops orion script <command> --help` for more information about a command.

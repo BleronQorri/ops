@@ -55,8 +55,10 @@ defmodule DeregisterSuppliers do
   # --        body: {"workflow_id": "<uuid>", "silo_entry_id": "<entry id>"}
   # --
   # -- SAFETY: this script REFUSES to run unless the workspace is a sandbox (staging).
-  # --         It prints the workspace and requires you to type its slug to confirm, then a
-  # --         final "yes" before any job is created. Use --dry-run to plan without firing.
+  # --         It is a dry run unless --dry-run false is passed or picked: the plan is
+  # --         listed and nothing is POSTed. With false, the jobs are fired only after a
+  # --         typed "yes" that names the workspace. Without a terminal it asks nothing
+  # --         and is always a dry run.
 
   @check "✅"
   @cross "❌"
@@ -103,21 +105,16 @@ defmodule DeregisterSuppliers do
 
     Dotenv.load()
 
-    opts = %{
-      dry_run?: "--dry-run" in argv,
-      # One job per silo ENTRY by default — invalidate everything. Pass --latest-only to
-      # collapse to a single job per supplier (their most recent entry).
-      all_entries?: "--latest-only" not in argv,
-      # Void/cancelled suppliers are included by default — we want to invalidate everything.
-      # Pass --skip-void to leave already-void suppliers alone.
-      include_void?: "--skip-void" not in argv,
-      wait: flag_value(argv, "--wait"),
-      workflow_id: flag_value(argv, "--workflow-id")
-    }
+    opts = parse_args(argv)
+    Process.put(:terminal, terminal_device())
+    opts = ask_missing(opts)
 
     IO.puts("")
-    IO.puts(hl("=== Invopop supplier deregistration ==="))
-    if opts.dry_run?, do: IO.puts(IO.ANSI.format([:bright, :yellow, "[DRY RUN] no jobs will be created", :reset]))
+    IO.puts(hl("=== Invopop supplier deregistration — SANDBOX workspaces only ==="))
+
+    if opts.dry_run?,
+      do: IO.puts(IO.ANSI.format([:bright, :yellow, "[DRY RUN] list the jobs, create none — --dry-run false fires them", :reset])),
+      else: IO.puts(IO.ANSI.format([:bright, :yellow, ~s(LIVE: the jobs are fired after a typed "yes"), :reset]))
 
     base_url = System.get_env(@base_url_env) || @default_base_url
     token = resolve_token()
@@ -144,9 +141,6 @@ defmodule DeregisterSuppliers do
 
     IO.puts(IO.ANSI.format([:bright, :green, "  #{@check} sandbox workspace confirmed", :reset]))
 
-    # --- WORKSPACE CONFIRMATION ---------------------------------------------
-    confirm_workspace!(workspace)
-
     # --- WORKFLOW SELECTION --------------------------------------------------
     workflow_id = choose_workflow(workspace, opts.workflow_id)
     IO.puts(faint("Deregister workflow: #{workflow_id}"))
@@ -170,15 +164,15 @@ defmodule DeregisterSuppliers do
       System.halt(0)
     end
 
-    # --- FINAL CONFIRMATION --------------------------------------------------
+    # --- CONFIRMATION: the one write, confirmed once (a sandbox) --------------
     unless opts.dry_run? do
       IO.puts("")
-      IO.puts(IO.ANSI.format([:bright, :yellow, "About to trigger deregistration for #{length(targets)} supplier(s) on workspace '#{workspace.slug}'.", :reset]))
+      IO.puts(IO.ANSI.format([:bright, :yellow, "About to trigger deregistration for #{length(targets)} supplier(s) on sandbox workspace '#{workspace.name}' (#{workspace.slug}).", :reset]))
       ans = prompt_value(~s(Type "yes" to fire the workflow jobs: )) |> String.downcase()
 
-      unless ans in ["yes", "y"] do
+      unless ans == "yes" do
         IO.puts("Aborted. No jobs created.")
-        System.halt(0)
+        System.halt(1)
       end
     end
 
@@ -271,7 +265,7 @@ defmodule DeregisterSuppliers do
     IO.puts(hl("=== Done ==="))
 
     if opts.dry_run? do
-      IO.puts(IO.ANSI.format([:yellow, "  [DRY RUN] #{length(targets)} job(s) would be created. Re-run without --dry-run to fire.", :reset]))
+      IO.puts(IO.ANSI.format([:yellow, "  [DRY RUN] #{length(targets)} job(s) would be created. Re-run with --dry-run false to fire.", :reset]))
     else
       IO.puts(IO.ANSI.format([:green, "  #{@check} created: #{ok}", :reset]))
       if failed > 0, do: IO.puts(err("  #{@cross} failed:  #{failed}"))
@@ -328,17 +322,6 @@ defmodule DeregisterSuppliers do
     end
   end
 
-  defp confirm_workspace!(workspace) do
-    IO.puts("")
-    IO.puts(IO.ANSI.format([:bright, :yellow, "You are about to act on the workspace above.", :reset]))
-    typed = prompt_value("Type the workspace slug '#{workspace.slug}' to continue: ") |> String.trim()
-
-    unless typed == to_string(workspace.slug) and filled?(workspace.slug) do
-      IO.puts(err("Slug did not match ('#{typed}' ≠ '#{workspace.slug}'). Aborting."))
-      System.halt(1)
-    end
-  end
-
   # --- Workflow selection ---
 
   defp choose_workflow(_workspace, workflow_id) when is_binary(workflow_id) and workflow_id != "" do
@@ -346,50 +329,50 @@ defmodule DeregisterSuppliers do
     workflow_id
   end
 
+  # Without a terminal nothing is asked: the workflow suggested for the
+  # workspace's country is taken (it is a dry run), or --workflow-id must say.
   defp choose_workflow(workspace, _nil) do
     suggested = suggest_index(workspace)
+    workflows = staging_deregister_workflows()
 
-    IO.puts("")
-    IO.puts(hl("=== Deregistration workflow (staging) ==="))
-
-    staging_deregister_workflows()
-    |> Enum.with_index(1)
-    |> Enum.each(fn {{name, id}, i} ->
-      tag = if i == suggested, do: IO.ANSI.format([:green, "  ← suggested for country=#{workspace.country}", :reset]), else: ""
-      IO.puts("  #{i}) #{String.pad_trailing(name, 18)} #{faint(id)}#{tag}")
-    end)
-
-    default_hint = if suggested, do: " [default #{suggested}]", else: ""
-    raw = prompt_value("Select workflow (1-#{length(staging_deregister_workflows())})#{default_hint}, or paste a UUID: ") |> String.trim()
-
-    resolve_workflow_choice(raw, suggested)
-  end
-
-  defp resolve_workflow_choice("", suggested) when is_integer(suggested), do: nth_workflow(suggested)
-
-  defp resolve_workflow_choice(raw, _suggested) do
     cond do
-      # a bare index
-      raw =~ ~r/^\d+$/ ->
-        idx = String.to_integer(raw)
+      terminal() == nil and is_integer(suggested) ->
+        {name, id} = Enum.at(workflows, suggested - 1)
+        IO.puts(faint("No terminal: taking #{name}, suggested for country=#{workspace.country} (--workflow-id picks another)."))
+        id
 
-        if idx >= 1 and idx <= length(staging_deregister_workflows()),
-          do: nth_workflow(idx),
-          else: (IO.puts(err("Invalid selection.")); System.halt(1))
+      terminal() == nil ->
+        usage_error("no deregister workflow suggested for country=#{workspace.country}, and no terminal to ask on — pass --workflow-id UUID")
 
-      # looks like a UUID
-      String.length(raw) >= 32 and String.contains?(raw, "-") ->
-        raw
+      workflows == [] ->
+        IO.puts(faint("No deregister workflow configured in the environment."))
+        resolve_workflow_uuid(prompt_value("Paste the deregister workflow UUID: ") |> String.trim())
 
       true ->
-        IO.puts(err("Unrecognized workflow selection: #{raw}"))
-        System.halt(1)
+        options =
+          workflows
+          |> Enum.with_index(1)
+          |> Enum.map(fn {{name, id}, i} ->
+            note = if i == suggested, do: "#{id} · suggested for country=#{workspace.country}", else: id
+            {id, name, note}
+          end)
+
+        IO.puts("")
+
+        case choose("Deregistration workflow (staging)?", options ++ [{:other, "another", "paste its UUID"}], (suggested || 1) - 1) do
+          :other -> resolve_workflow_uuid(prompt_value("Paste the deregister workflow UUID: ") |> String.trim())
+          id -> id
+        end
     end
   end
 
-  defp nth_workflow(idx) do
-    {_name, id} = Enum.at(staging_deregister_workflows(), idx - 1)
-    id
+  defp resolve_workflow_uuid(raw) do
+    if String.length(raw) >= 32 and String.contains?(raw, "-") do
+      raw
+    else
+      IO.puts(err("Unrecognized workflow selection: #{raw}"))
+      System.halt(1)
+    end
   end
 
   # Suggest a workflow index from the workspace country. ES is ambiguous (VeriFactu vs
@@ -538,9 +521,201 @@ defmodule DeregisterSuppliers do
         v
 
       _ ->
+        if terminal() == nil,
+          do: usage_error("$#{@token_env} is not set, and there is no terminal to ask for it on")
+
         IO.puts(faint("$#{@token_env} not set."))
         prompt_value("Paste Invopop API token (staging): ")
     end
+  end
+
+  # --- Arguments ---
+
+  defp parse_args(argv) do
+    init = %{
+      # nil = not given: asked on a terminal, true without one.
+      dry_run?: nil,
+      # One job per silo ENTRY by default — invalidate everything. Pass --latest-only to
+      # collapse to a single job per supplier (their most recent entry).
+      all_entries?: true,
+      # Void/cancelled suppliers are included by default — we want to invalidate everything.
+      # Pass --skip-void to leave already-void suppliers alone.
+      include_void?: true,
+      wait: nil,
+      workflow_id: nil
+    }
+
+    do_parse(argv, init)
+  end
+
+  defp do_parse([], acc), do: acc
+
+  # A bare --dry-run means true; a value after it says which.
+  defp do_parse(["--dry-run", v | rest], acc) when v in ["true", "false"],
+    do: do_parse(rest, %{acc | dry_run?: v == "true"})
+
+  defp do_parse(["--dry-run" | rest], acc), do: do_parse(rest, %{acc | dry_run?: true})
+  defp do_parse(["--dry-run=" <> v | rest], acc), do: do_parse(rest, %{acc | dry_run?: bool_of(v)})
+  defp do_parse(["--latest-only" | rest], acc), do: do_parse(rest, %{acc | all_entries?: false})
+  defp do_parse(["--skip-void" | rest], acc), do: do_parse(rest, %{acc | include_void?: false})
+  defp do_parse(["--wait", v | rest], acc), do: do_parse(rest, %{acc | wait: v})
+  defp do_parse(["--workflow-id", v | rest], acc), do: do_parse(rest, %{acc | workflow_id: v})
+  defp do_parse([flag], _acc) when flag in ["--wait", "--workflow-id"], do: usage_error("#{flag} takes a value")
+  defp do_parse(["-" <> _ = flag | _], _acc), do: usage_error("unknown flag: #{flag}")
+  defp do_parse([arg | _], _acc), do: usage_error("unexpected argument: #{arg} (this script takes flags only)")
+
+  defp bool_of("true"), do: true
+  defp bool_of("false"), do: false
+  defp bool_of(v), do: usage_error("--dry-run takes true or false, got #{inspect(v)}")
+
+  # --- Asking the operator ---
+
+  # Asks for whatever the flags left out. Without a terminal nothing is asked and
+  # the run is a dry run.
+  defp ask_missing(opts) do
+    cond do
+      terminal() == nil ->
+        if opts.dry_run? == false,
+          do: usage_error("--dry-run false needs a terminal: the write is confirmed by hand")
+
+        %{opts | dry_run?: true}
+
+      opts.dry_run? == nil ->
+        IO.puts("")
+
+        dry_run? =
+          choose("Dry run?", [
+            {true, "true", "list the jobs that would be created; POST nothing"},
+            {false, "false", ~s(fire the jobs, after a typed "yes")}
+          ])
+
+        %{opts | dry_run?: dry_run?}
+
+      true ->
+        opts
+    end
+  end
+
+  # A terminal is stdin and stdout both on the controlling terminal. Returns that
+  # device's path, which the picker hands to stty, or nil. (The stty runs in a
+  # child that has no controlling terminal — erl_child_setup calls setsid — so it
+  # names the device instead of /dev/tty.)
+  defp terminal_device do
+    with true <- Keyword.get(:io.getopts(:standard_io), :terminal) == true,
+         {out, 0} <- System.cmd("ps", ["-o", "tty=", "-p", System.pid()], stderr_to_stdout: true),
+         name when name not in ["", "?", "??"] <- String.trim(out),
+         dev = "/dev/" <> name,
+         {:ok, %File.Stat{type: :device, minor_device: rdev}} <- File.stat("/dev/fd/0"),
+         {:ok, %File.Stat{type: :device, minor_device: ^rdev}} <- File.stat(dev) do
+      dev
+    else
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp terminal, do: Process.get(:terminal)
+
+  defp stty(dev, args), do: System.cmd("sh", ["-c", "stty #{args} < #{dev}"], stderr_to_stdout: true)
+
+  # Pick one of a few with the arrow keys (or j/k, or the option's number); enter
+  # takes the highlighted one, esc or Ctrl+C stops. `at` is highlighted to begin
+  # with (the first, unless said). Each keystroke repaints the options in place —
+  # the cursor goes back up and every line clears only its own tail, one write per
+  # frame — so the list never blanks between frames. The terminal's settings
+  # (saved with stty -g, restored exactly) and its cursor come back however the
+  # choice ends. Options are {value, label, note}.
+  defp choose(question, options, at \\ 0) do
+    dev = terminal()
+    IO.puts("  #{hl(question)}  #{faint("↑↓ move · enter picks · esc stops")}")
+    {saved, 0} = stty(dev, "-g")
+
+    result =
+      try do
+        stty(dev, "raw -echo")
+        IO.write("\e[?25l")
+        draw(options, at, true)
+        pick(options, at)
+      after
+        stty(dev, "'#{String.trim(saved)}'")
+        IO.write("\e[?25h")
+      end
+
+    case result do
+      {:ok, value} ->
+        value
+
+      :stop ->
+        IO.puts(err("✗ stopped at a prompt — no jobs created."))
+        System.halt(1)
+    end
+  end
+
+  defp pick(options, at) do
+    n = length(options)
+
+    case read_key() do
+      k when k in ["\e[A", "\eOA", "k"] -> move(options, at, rem(at - 1 + n, n))
+      k when k in ["\e[B", "\eOB", "j"] -> move(options, at, rem(at + 1, n))
+      <<d>> when d in ?1..?9 and d - ?0 <= n -> move(options, at, d - ?1)
+      k when k in ["\r", "\n"] -> {:ok, options |> Enum.at(at) |> elem(0)}
+      k when k in ["\e", <<3>>, <<4>>, "q"] -> :stop
+      _ -> pick(options, at)
+    end
+  end
+
+  # A key that changes nothing on screen writes nothing.
+  defp move(options, at, at), do: pick(options, at)
+  defp move(options, _before, at), do: (draw(options, at, false); pick(options, at))
+
+  # Raw mode turns off the terminal's own newline translation, hence \r\n.
+  defp draw(options, at, first?) do
+    frame =
+      options
+      |> Enum.with_index()
+      |> Enum.map_join(fn {{_value, label, note}, i} ->
+        line = if i == at, do: "  #{cmd("❯")} #{hl(label)}", else: "    #{label}"
+        note = if note, do: faint("  · #{note}"), else: ""
+        line <> note <> "\e[K\r\n"
+      end)
+
+    IO.write(if(first?, do: "", else: "\e[#{length(options)}A\r") <> frame)
+  end
+
+  # One key: an escape sequence, a lone esc, or one byte. A lone esc is told
+  # from the start of a sequence by nothing following it within 80 ms; esc stops
+  # the run, so the read left waiting then never matters.
+  defp read_key do
+    case IO.binread(:stdio, 1) do
+      "\e" ->
+        next = Task.async(fn -> IO.binread(:stdio, 1) end)
+
+        case Task.yield(next, 80) do
+          {:ok, b} when b in ["[", "O"] -> "\e" <> b <> read_sequence("")
+          _ -> "\e"
+        end
+
+      b when is_binary(b) ->
+        b
+
+      _eof ->
+        <<4>>
+    end
+  end
+
+  defp read_sequence(acc) do
+    case IO.binread(:stdio, 1) do
+      <<c>> = b when c in ?0..?9 or c == ?; -> read_sequence(acc <> b)
+      b when is_binary(b) -> acc <> b
+      _ -> acc
+    end
+  end
+
+  # The call was wrong: exit 2.
+  defp usage_error(msg) do
+    IO.puts(:stderr, err("#{@cross} #{msg}"))
+    System.halt(2)
   end
 
   # --- Small helpers ---
@@ -550,15 +725,25 @@ defmodule DeregisterSuppliers do
     deregister_invopop_suppliers — trigger the Invopop supplier-deregistration workflow for all suppliers
 
     Usage:
-      ./ds [flags]
+      ./deregister_invopop_suppliers.exs [flags]
+
+    Sandbox only: REFUSES to run unless the workspace is a sandbox (staging), so it
+    never asks which environment.
+
+    On a terminal it asks for what is left out: whether to dry run (a picker: ↑↓ or
+    j/k, enter picks, esc stops), the token when $#{@token_env} is unset, and the
+    deregister workflow. Firing the jobs is confirmed by typing "yes". Without a
+    terminal it asks nothing: the token must be set, the workflow is --workflow-id
+    or the one suggested for the workspace's country, and the run is a dry run.
 
     Auth / target:
-      Token comes from $#{@token_env} (else you're prompted). The token decides the
+      Token comes from $#{@token_env} (else you're asked). The token decides the
       workspace. Base URL from $#{@base_url_env} (default #{@default_base_url}).
-      REFUSES to run unless the workspace is a sandbox (staging).
 
     Flags:
-      --dry-run             List the jobs that would be created; POST nothing
+      --dry-run BOOL        true (the default; a bare --dry-run means true): list the
+                            jobs that would be created, POST nothing. false: fire them,
+                            after a typed "yes"
       --latest-only         One job per supplier (their latest entry)
                             (default: one job per silo ENTRY — invalidate everything)
       --skip-void           Skip entries in a void/cancelled state
@@ -566,14 +751,9 @@ defmodule DeregisterSuppliers do
       --wait N              Pass ?wait=N to the job create call (block up to N seconds)
       --workflow-id UUID    Use this workflow id instead of picking a known staging one
       -h, --help            Show this help
-    """)
-  end
 
-  defp flag_value(argv, flag) do
-    case Enum.find_index(argv, &(&1 == flag)) do
-      nil -> nil
-      i -> Enum.at(argv, i + 1)
-    end
+    Exit codes: 0 done, 1 a request failed or the operator stopped it, 2 the call was wrong.
+    """)
   end
 
   defp prompt_value(label) do
@@ -584,9 +764,10 @@ defmodule DeregisterSuppliers do
     end
   end
 
-  defp hl(s), do: IO.ANSI.format([:bright, :white, s, :reset])
-  defp faint(s), do: IO.ANSI.format([:faint, s, :reset])
-  defp err(s), do: IO.ANSI.format([:bright, :red, s, :reset])
+  defp hl(s), do: IO.ANSI.format([:bright, :white, s, :reset]) |> IO.chardata_to_string()
+  defp faint(s), do: IO.ANSI.format([:faint, s, :reset]) |> IO.chardata_to_string()
+  defp err(s), do: IO.ANSI.format([:bright, :red, s, :reset]) |> IO.chardata_to_string()
+  defp cmd(s), do: IO.ANSI.format([:yellow, s, :reset]) |> IO.chardata_to_string()
 
   defp filled?(nil), do: false
   defp filled?(""), do: false

@@ -83,14 +83,14 @@ force_retry_invoices                   production  write   prod-write           
 
 $ ops orion script view force_retry_invoices          # the page: summary, tier, key AGENTS.md sections, live --help, examples
 
-$ ops task run force_retry_invoices --dry-run 123,456
+$ ops task run force_retry_invoices --env production --dry-run true 123,456
 ops ▸ run 42  force_retry_invoices  ⚠ PRODUCTION WRITE  production · write · prod-write — …
 …the script's own prompts, gates and output…
 ops ▸ run 42 completed in 18s (exit 0)  · ops task logs 42
 
 $ ops task ls --script force_retry_invoices
 ID  STATUS     SCRIPT          STARTED    DURATION  ARGS
-42  completed  force_retry_invoices  2m ago     18s       --dry-run 123,456
+42  completed  force_retry_invoices  2m ago     18s       --env production --dry-run true 123,456
 41  failed     force_retry_invoices  yesterday  4s        999
 ```
 
