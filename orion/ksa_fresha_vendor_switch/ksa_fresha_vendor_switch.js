@@ -37,7 +37,10 @@ function usage() {
   return `ksa_fresha_vendor_switch — move Fresha's Saudi entity between Comarch and Invopop, one checked step at a time
 
 Usage:
-  ksa_fresha_vendor_switch [flags] <MODE>
+  ksa_fresha_vendor_switch [flags] [MODE]
+
+On a terminal it asks for what is left out: the mode, the environment and whether
+to dry run. Nothing else is needed to start.
 
 Modes:
   onboard-invopop        the one-time move of the entity to Invopop: check a batch has
@@ -48,9 +51,11 @@ Modes:
   to-invopop             flip the plugin back to Invopop once the cause is fixed
 
 Flags:
-      --execute          run the writes, each after a typed confirmation. Without it
-                         every mode reads, checks and runs the tasks' own dry runs, and
-                         writes nothing
+  -e, --env ENV          production or staging (prod / stg also work). Staging runs
+                         against the eng-orion namespace unless --namespace says otherwise
+      --dry-run BOOL     true (the default): read, check and run the tasks' own dry
+                         runs, write nothing. false: run the writes, each after a
+                         typed confirmation — two in production
   -c, --config ID        the account configuration (default: the one SA configuration
                          with an invoice_entity_id, which is Fresha's own)
       --branch-name S    BRANCH_NAME for the registration (onboard-invopop; asked for
@@ -61,12 +66,13 @@ Flags:
       --flip-task NAME   the runner task that sets the integrator (default ${FLIP_TASK})
       --wait-minutes N   how long to wait for the registration webhook or the resent
                          documents (default 15)
-  -n, --namespace NAME   target namespace (default production)
+  -n, --namespace NAME   override the namespace (default: production, or eng-orion for
+                         staging)
   -s, --service NAME     houston service (default accounting-documents-web)
   -h, --help             show this help
 
-Every write is a houston runner task and needs --execute and a terminal. Reads go
-through houston psql (VPN up, houston authenticated).
+Every write is a houston runner task and needs a terminal. Reads go through
+houston psql (VPN up, houston authenticated).
 
 Exit codes: 0 done, 1 a check failed or the operator stopped it, 2 the call was wrong.
 `;
@@ -78,7 +84,7 @@ function fail(message, code) {
 }
 
 function parseArgs(argv) {
-  const o = { mode: null, execute: false, config: null, branchName: null, businessCategory: null, flipTask: FLIP_TASK, waitMinutes: 15, namespace: "production", service: "accounting-documents-web" };
+  const o = { mode: null, env: null, dryRun: null, config: null, branchName: null, businessCategory: null, flipTask: FLIP_TASK, waitMinutes: 15, namespace: null, service: "accounting-documents-web" };
   const num = (flag, v) => {
     if (!/^\d+$/.test(String(v || ""))) fail(`${flag} takes a whole number, got ${v === undefined ? "nothing" : JSON.stringify(v)}`, 2);
     return Number(v);
@@ -91,7 +97,14 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") { process.stdout.write(usage()); process.exit(0); }
-    else if (a === "--execute") o.execute = true;
+    else if (a === "-e" || a === "--env") o.env = envOf(val(a, argv[++i]));
+    else if (a === "--dry-run") {
+      // A bare --dry-run means true; a value after it says which.
+      const next = argv[i + 1];
+      if (next === "true" || next === "false") o.dryRun = argv[++i] === "true";
+      else o.dryRun = true;
+    }
+    else if (a.startsWith("--dry-run=")) o.dryRun = boolOf(a.slice("--dry-run=".length));
     else if (a === "-c" || a === "--config") o.config = num(a, argv[++i]);
     else if (a === "--branch-name") o.branchName = val(a, argv[++i]);
     else if (a === "--business-category") o.businessCategory = val(a, argv[++i]);
@@ -102,11 +115,107 @@ function parseArgs(argv) {
     else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
     else positional.push(a);
   }
-  if (positional.length !== 1) fail(`expected one mode (${MODES.join(", ")}), got ${positional.length ? positional.join(" ") : "none"}`, 2);
-  if (!MODES.includes(positional[0])) fail(`unknown mode ${JSON.stringify(positional[0])} — one of ${MODES.join(", ")}`, 2);
-  o.mode = positional[0];
-  if (o.execute && !(process.stdin.isTTY && process.stdout.isTTY)) fail("--execute needs a terminal: every write is confirmed by hand", 2);
+  if (positional.length > 1) fail(`expected one mode (${MODES.join(", ")}), got ${positional.join(" ")}`, 2);
+  if (positional.length && !MODES.includes(positional[0])) fail(`unknown mode ${JSON.stringify(positional[0])} — one of ${MODES.join(", ")}`, 2);
+  o.mode = positional[0] ?? null;
   return o;
+}
+
+function envOf(v) {
+  const e = { production: "production", prod: "production", staging: "staging", stg: "staging" }[String(v).toLowerCase()];
+  if (!e) fail(`--env takes production or staging, got ${JSON.stringify(v)}`, 2);
+  return e;
+}
+
+function boolOf(v) {
+  if (v !== "true" && v !== "false") fail(`--dry-run takes true or false, got ${JSON.stringify(v)}`, 2);
+  return v === "true";
+}
+
+const TERMINAL = process.stdin.isTTY && process.stdout.isTTY;
+// A picker hides the cursor while it draws; whatever ends the run, it comes back.
+if (TERMINAL) process.on("exit", () => process.stdout.write("\x1b[?25h"));
+
+// Pick one of a few with the arrow keys (or j/k, or the option's number); enter
+// takes the highlighted one, esc or Ctrl+C stops. The first is highlighted to
+// begin with. Each keystroke repaints the options in place — the cursor goes back
+// up and every line clears only its own tail — so the list never blanks between
+// frames, and the terminal gets its cursor back however the choice ends.
+function choose(question, options) {
+  closeRl();
+  const out = process.stdout;
+  const line = (o, i, at) => (i === at ? `  ${c.cmd("❯")} ${c.header(o.label)}` : `    ${o.label}`) + (o.note ? c.faint(`  · ${o.note}`) : "");
+  const draw = (at, first) => {
+    const frame = options.map((o, i) => `${line(o, i, at)}\x1b[K`).join("\n") + "\n";
+    out.write((first ? "" : `\x1b[${options.length}A\r`) + frame);
+  };
+  say(`${c.header(question)}  ${c.faint("↑↓ move · enter picks · esc stops")}`);
+  out.write("\x1b[?25l");
+  let at = 0;
+  draw(at, true);
+  return new Promise((resolve, reject) => {
+    const done = (fn) => {
+      process.stdin.off("data", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1b[?25h");
+      fn();
+    };
+    // One read can carry several keys (a held arrow, a paste), so it is split into
+    // them first: an escape sequence, a lone esc, or one character.
+    const onKey = (buf) => {
+      const before = at;
+      for (const k of buf.toString().match(/\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|[\s\S]/g) || []) {
+        if (k === "\x1b[A" || k === "\x1bOA" || k === "k") at = (at + options.length - 1) % options.length;
+        else if (k === "\x1b[B" || k === "\x1bOB" || k === "j") at = (at + 1) % options.length;
+        else if (/^[1-9]$/.test(k) && Number(k) <= options.length) at = Number(k) - 1;
+        else if (k === "\r" || k === "\n") {
+          if (at !== before) draw(at, false);
+          return done(() => resolve(options[at].value));
+        } else if (k === "\x1b" || k === "\x03" || k === "\x04" || k === "q") return done(() => reject(new Stop("stopped at a prompt")));
+      }
+      // A key that changes nothing on screen writes nothing.
+      if (at !== before) draw(at, false);
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", onKey);
+  });
+}
+
+// Asks for whatever the flags left out. Without a terminal nothing is asked: the
+// mode and the environment must be given, and the run is a dry run unless told.
+async function askMissing(o) {
+  if (!TERMINAL) {
+    if (!o.mode) fail(`no mode given — one of ${MODES.join(", ")}`, 2);
+    if (!o.env) fail("no environment given — --env production or --env staging", 2);
+    if (o.dryRun === false) fail("--dry-run false needs a terminal: every write is confirmed by hand", 2);
+    o.dryRun = true;
+  } else {
+    if (!o.mode) {
+      o.mode = await choose("Which step?", [
+        { value: "onboard-invopop", label: "onboard-invopop", note: "the one-time move of the entity to Invopop" },
+        { value: "to-comarch", label: "to-comarch", note: "fall back: flip to Comarch and resubmit the refused invoices" },
+        { value: "to-invopop", label: "to-invopop", note: "flip back to Invopop once the cause is fixed" },
+      ]);
+    }
+    if (!o.env) {
+      o.env = await choose("Which environment?", [
+        { value: "staging", label: "staging", note: "eng-orion" },
+        { value: "production", label: "production" },
+      ]);
+    }
+    if (o.dryRun === null) {
+      o.dryRun = await choose("Dry run?", [
+        { value: true, label: "true", note: "read, check and dry-run the tasks; write nothing" },
+        { value: false, label: "false", note: "run the writes, each after a confirmation" },
+      ]);
+    }
+  }
+  if (!o.namespace) o.namespace = o.env === "production" ? "production" : "eng-orion";
+  if (o.env === "staging" && o.namespace === "production") fail("--env staging cannot run against the production namespace", 2);
+  if (o.env === "production" && o.namespace !== "production") fail(`--env production runs against the production namespace, not ${o.namespace}`, 2);
+  o.execute = !o.dryRun;
 }
 
 // One readline interface at a time, closed before houston runs so nothing else is
@@ -274,12 +383,13 @@ function houston(opts, task, params) {
   });
 }
 
-// A task's own dry run. It writes nothing, so it needs no --execute.
+// A task's own dry run. It writes nothing, so it needs no confirmation.
 function dryRunTask(opts, task, params) {
   return houston(opts, task, params);
 }
 
-// A write: planned only without --execute, otherwise confirmed by a typed "yes".
+// A write: only planned in a dry run; otherwise confirmed by a typed "yes", and in
+// production a second time by typing the namespace back.
 async function writeTask(opts, what, task, params) {
   if (!opts.execute) {
     process.stdout.write(`\n  ${c.warn("would run")} ${what}:\n  ${c.cmd(`houston ${shown(taskArgs(opts, task, params))}`)}\n`);
@@ -289,6 +399,10 @@ async function writeTask(opts, what, task, params) {
   process.stdout.write(`\n  ${c.warn("about to")} ${what} in ${where}:\n  ${c.cmd(`houston ${shown(taskArgs(opts, task, params))}`)}\n`);
   const answer = (await ask(`  Type "yes" to run it: `)).toLowerCase();
   if (answer !== "yes") stop(`stopped before ${what} — nothing was run`);
+  if (opts.env === "production") {
+    const again = await ask(`  This writes ${c.bad("PRODUCTION")}. Type "production" to confirm: `);
+    if (again !== "production") stop(`stopped before ${what} — nothing was run`);
+  }
   return houston(opts, task, params);
 }
 
@@ -551,11 +665,12 @@ async function toInvopop(opts) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const where = opts.namespace === "production" ? c.bad("production") : c.warn(opts.namespace);
-  process.stdout.write(`${c.header("ksa_fresha_vendor_switch")} ${opts.mode} — ${where}, ${opts.execute ? c.warn("writes on confirmation") : "dry run: reads, checks and task dry runs only"}\n`);
+  await askMissing(opts);
+  const where = opts.env === "production" ? c.bad("production") : c.warn(`staging (${opts.namespace})`);
+  process.stdout.write(`\n${c.header("ksa_fresha_vendor_switch")} ${opts.mode} — ${where}, DRY_RUN=${opts.dryRun} — ${opts.execute ? c.warn(`writes on confirmation${opts.env === "production" ? ", twice each" : ""}`) : "reads, checks and task dry runs only"}\n`);
   const run = { "onboard-invopop": onboardInvopop, "to-comarch": toComarch, "to-invopop": toInvopop }[opts.mode];
   const code = await run(opts);
-  if (!opts.execute) process.stdout.write(`\n${c.faint("Dry run: nothing was written. --execute runs the writes, each after a confirmation.")}\n`);
+  if (!opts.execute) process.stdout.write(`\n${c.faint("Dry run: nothing was written. --dry-run false runs the writes, each after a confirmation.")}\n`);
   return code;
 }
 

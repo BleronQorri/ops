@@ -56,10 +56,9 @@ frozen — every update happens here.
   and `ops interactive` group the same way, with headings the cursor skips.
   Which tax authority a tool talks to outranks which database it points at.
   A runbook — a `kind: runbook` script that walks an operation step by step, or
-  a doc-only `status: runbook` directory — gets its own subsection after its
-  integration's tools (`ZATCA · SA · runbooks`), on the list, the picker and the
-  screen alike; `catalogue.integrationGroups` splits
-  them, so every surface splits them the same way.
+  a doc-only `status: runbook` directory — stays in its integration's table and
+  reads RUNBOOK where a status would go (`catalogue.statusLabel`); only the
+  doc-only kind has nothing to run.
 - **The environment is a column, not a heading.** It lost the heading to the
   integration, so rows sort production before staging inside a subsection and the
   column is never faint: production red, staging warn, the same two colours the
@@ -128,14 +127,14 @@ ops · ops --help · ops orion · ops run --help · ops help nope (exit 2)
 ops orion script list (a section per domain, a table per integration on a tty) · --flat · NO_COLOR=1 … | cat -v · … | cut -f1 (flat, ENV kept)
 ops orion script list --json | jq -r '.[].name'  ·  --status retired  ·  --include-retired · ops orion script list -t bogus (exit 2)
 ops orion script list --domain accounting-documents (no COUNTRY/INTEGRATION columns) · --country sa (case-insensitive) · --integration zatca (one table) · --integrator invopop
-ops orion script list --kind runbook ("ZATCA · SA · runbooks" holds the scripted one and fix_credit_note_references) · ops orion script list (ZATCA/Verifactu/Smart Receipts tables carry no COUNTRY column; "Invopop · any scheme" and "Any integration" catch the rest)
+ops orion script list --kind runbook (the scripted one and the two doc-only ones, RUNBOOK in the status column) · ops orion script list (ZATCA/Verifactu/Smart Receipts tables carry no COUNTRY column; "Invopop · any scheme" and "Any integration" catch the rest)
 ops orion script list -d bogus (exit 2) · ops orion script view force_retry_invoices (Domain/Country/Integration rows) · view patch_invoice_payloads (no country rows)
 ops orion script new zz --lang js --domain e-invoicing --country IT --integration smart_receipts --integrator invopop --env staging --access write
 ops orion script new zz --lang js --domain accounting-documents --country IT … (exit 2) · --country italy (exit 2)
 ops orion script view force_retry_invoices · --raw · --path · | cat  (md tables render as box tables, blockquotes as a bar)
 ops orion script view backfill_missing_documents      (no live --help for Elixir, pointer shown)
 ops orion script view fix_credit_note_references (status BLOCKED, blocked_on shown)
-cd /tmp && ops task run force_retry_invoices --dry-run 1   (banner + trailer on stderr, report in /tmp, exit code == direct run)
+cd /tmp && ops task run force_retry_invoices --env production --dry-run true 1   (banner + trailer on stderr, report in /tmp, exit code == direct run)
 ops task run force_retry_invoices --help  vs  ops task run --help
 ops task run edit_document_payload (exit 2, points to view)
 ops task run match_credit_notes_to_invoices/decode_payloads --help

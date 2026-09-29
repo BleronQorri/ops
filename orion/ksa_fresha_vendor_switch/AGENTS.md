@@ -10,18 +10,14 @@ access: write
 tier: prod-write
 lang: js
 examples:
-  - args: "onboard-invopop --branch-name \"Fresha KSA\" --business-category Software"
-    note: checks, the onboarding dry run and the plan; writes nothing
-  - args: "onboard-invopop --execute --branch-name \"Fresha KSA\" --business-category Software"
-    note: the one-time move to Invopop, each write confirmed, the OTP asked for
-  - args: "to-comarch"
-    note: the fallback, planned — the flip dry run and the refused invoices it would resubmit
-  - args: "to-comarch --execute"
-    note: flip to Comarch, pick the refused invoices, resubmit them, report their trackers
-  - args: "to-invopop --execute"
-    note: flip back once the cause is fixed; refuses without an Invopop registration
-  - args: "--namespace eng-orion to-invopop"
-    note: rehearse against the simulation account
+  - args: ""
+    note: asks for the step, the environment and whether to dry run
+  - args: "to-comarch --env staging"
+    note: eng-orion; asks only whether to dry run
+  - args: "to-comarch --env production --dry-run true"
+    note: reads, checks and dry-runs the tasks; writes nothing
+  - args: "onboard-invopop --env production --dry-run false"
+    note: each write confirmed twice
 related: [lookup_sa_zatca_document, force_retry_invoices]
 ---
 # ksa_fresha_vendor_switch
@@ -82,9 +78,13 @@ through Comarch after the flip.
 
 ## Safety
 
-- Dry run by default: every mode reads, checks and runs the tasks' own dry runs,
-  and prints the writes it would make. `--execute` runs them, each after a typed
-  `yes`, and needs a terminal.
+- It starts by asking three things (each also a flag): the step, the environment
+  (`--env production|staging`; staging runs against `eng-orion`) and `--dry-run
+  true|false`, true by default.
+- A dry run reads, checks and runs the tasks' own dry runs, and prints the writes
+  it would make. With `--dry-run false` each write is confirmed with a typed
+  `yes` — and in production a second time, by typing `production` back. Writes
+  need a terminal; without one the run is a dry run.
 - Reads are `houston psql` only; every write is a houston runner task.
 - A task's exit code is not taken as proof: `run/2` in the runner exits 0 whatever
   the task returned, so after each write the plugin or the documents are read back.

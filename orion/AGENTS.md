@@ -104,9 +104,8 @@ heading of its own.
 A runbook is an operation's fixed order of steps. It is either prose an operator
 follows by hand (`status: runbook`, no script) or a script that walks the steps
 itself — reads, checks and houston tasks, stopping on the first check that fails
-(`kind: runbook`). Both sit in a subsection of their own after their integration's
-tools, headed `<integration> · runbooks`: a runbook is where an operation starts,
-not one more row among the lookups it is made of.
+(`kind: runbook`). Both sit among their integration's tools and read RUNBOOK where
+a status would go; only the prose kind has nothing to run.
 
 | domain | what belongs in it |
 |---|---|
@@ -128,6 +127,33 @@ surgery that branches on whatever the document's country turns out to be, a
 staging wipe that deletes rows whatever they are — leaves them out rather than
 naming a country it does not actually mean. A tool that serves several countries
 today is a tool waiting to be split into granular ones.
+
+## Asking the operator
+
+A script that writes starts by asking for whatever its flags left out, one picker
+per question, in this order:
+
+1. **The step**, when the script has modes.
+2. **The environment**: `production` or `staging`. Staging runs against `eng-orion`
+   unless `--namespace` names another; production runs against `production` only.
+   A script that can reach one environment only (a staging wipe, a prod-only
+   backfill) skips this question and names the environment in its banner.
+3. **Dry run**: `true` (preselected) or `false`. `true` reads, checks and runs the
+   tasks' own dry runs; `false` writes. This answer is the only write switch.
+
+Every question is also a flag (`<mode>`, `--env production|staging`,
+`--dry-run true|false`), and the frontmatter `examples` answer them: an empty one
+that asks everything, then a few that pre-answer some.
+
+- **Picker**: ↑↓ or j/k move, enter picks, a number jumps, esc or Ctrl+C stops.
+  It repaints its lines in place and hides the cursor while it draws, restoring it
+  on exit. Copy `choose()` from `ksa_fresha_vendor_switch` — scripts share no code.
+- **Typed lines** for everything that is text rather than a choice: an OTP, ids,
+  which rows to leave out.
+- **Each write** is confirmed with a typed `yes`; in production a second time by
+  typing `production`. Either answer wrong, and the run stops before that write.
+- **Without a terminal** the script asks nothing: the mode and `--env` must be
+  given, the run is a dry run, and `--dry-run false` exits 2.
 
 ## Adding a new script
 
