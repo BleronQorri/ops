@@ -9,6 +9,7 @@ env: production
 access: write
 tier: prod-write
 lang: js
+asks: true
 examples:
   - args: ""
     note: asks for the step, the environment and whether to dry run
@@ -78,9 +79,11 @@ through Comarch after the flip.
 
 ## Safety
 
-- It starts by asking three things (each also a flag): the step, the environment
-  (`--env production|staging`; staging runs against `eng-orion`) and `--dry-run
-  true|false`, true by default.
+- It starts by asking three things (each also a flag): what to do (change the
+  plugin to Comarch, change it to Invopop, or onboard to Invopop), the
+  environment (`--env production|staging`; for staging, `eng-orion` or a typed
+  namespace, `--namespace`) and `--dry-run true|false`, true by default.
+  `ops interactive` goes straight to these questions (`asks: true`).
 - A dry run reads, checks and runs the tasks' own dry runs, and prints the writes
   it would make. With `--dry-run false` each write is confirmed with a typed
   `yes` — and in production a second time, by typing `production` back. Writes

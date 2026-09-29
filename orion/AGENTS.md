@@ -143,7 +143,9 @@ per question, in this order:
 
 Every question is also a flag (`<mode>`, `--env production|staging`,
 `--dry-run true|false`), and the frontmatter `examples` answer them: an empty one
-that asks everything, then a few that pre-answer some.
+that asks everything, then a few that pre-answer some. A script that asks everything
+itself sets `asks: true`, and `ops interactive` then runs it straight into its
+questions instead of offering the examples first.
 
 - **Picker**: ↑↓ or j/k move, enter picks, a number jumps, esc or Ctrl+C stops.
   It repaints its lines in place and hides the cursor while it draws, restoring it
@@ -188,6 +190,7 @@ lang: js | exs                   # active/deprecated only
 also: [other_entrypoint.js]      # optional secondary executables in the directory
 secrets: [SOME_TOKEN]            # env vars holding a credential: ops asks once and passes them in
 help_flag: false                 # only if the script has no --help
+asks: true                       # the script asks the operator itself; `ops interactive` skips the examples frame
 examples:                        # ≥ 1 for an active script; args as typed after the script
   - args: "--dry-run 123"
     note: plan only

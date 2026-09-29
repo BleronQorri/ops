@@ -39,8 +39,9 @@ function usage() {
 Usage:
   ksa_fresha_vendor_switch [flags] [MODE]
 
-On a terminal it asks for what is left out: the mode, the environment and whether
-to dry run. Nothing else is needed to start.
+On a terminal it asks for what is left out: the step, the environment (for
+staging, eng-orion or a typed namespace) and whether to dry run. Nothing else is
+needed to start.
 
 Modes:
   onboard-invopop        the one-time move of the entity to Invopop: check a batch has
@@ -193,17 +194,27 @@ async function askMissing(o) {
     o.dryRun = true;
   } else {
     if (!o.mode) {
-      o.mode = await choose("Which step?", [
-        { value: "onboard-invopop", label: "onboard-invopop", note: "the one-time move of the entity to Invopop" },
-        { value: "to-comarch", label: "to-comarch", note: "fall back: flip to Comarch and resubmit the refused invoices" },
-        { value: "to-invopop", label: "to-invopop", note: "flip back to Invopop once the cause is fixed" },
+      o.mode = await choose("What do you want to do?", [
+        { value: "to-comarch", label: "Change plugin to Comarch", note: "fall back: flip to Comarch and resubmit the refused invoices" },
+        { value: "to-invopop", label: "Change plugin to Invopop", note: "flip back to Invopop once the cause is fixed" },
+        { value: "onboard-invopop", label: "Onboard provider to Invopop", note: "the one-time move of the entity to Invopop" },
       ]);
     }
     if (!o.env) {
       o.env = await choose("Which environment?", [
-        { value: "staging", label: "staging", note: "eng-orion" },
+        { value: "staging", label: "staging" },
         { value: "production", label: "production" },
       ]);
+    }
+    if (o.env === "staging" && !o.namespace) {
+      const typed = await choose("Which staging namespace?", [
+        { value: false, label: "eng-orion", note: "the default" },
+        { value: true, label: "type another…" },
+      ]);
+      if (typed) {
+        o.namespace = await ask("  Namespace: ");
+        if (!o.namespace) stop("no namespace typed");
+      }
     }
     if (o.dryRun === null) {
       o.dryRun = await choose("Dry run?", [
