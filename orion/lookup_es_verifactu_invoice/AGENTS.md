@@ -9,7 +9,7 @@ env: production
 access: read-only
 tier: read-only
 lang: js
-secrets: [INVOPOP_API_TOKEN]
+secrets: [INVOPOP_ES_VERIFACTU_API_TOKEN_RO]
 examples:
   - args: ""
     note: asks for the invoice number, then for a tax ID you can skip
@@ -113,7 +113,7 @@ test. There is nothing to dry-run and nothing to confirm.
 ## Prereqs
 
 - Node ≥ 20 on PATH (built-in `fetch`; no dependencies).
-- `INVOPOP_API_TOKEN` — the token for the **ES Verifactu** workspace, the same one
+- `INVOPOP_ES_VERIFACTU_API_TOKEN_RO` — the token for the **ES Verifactu** workspace, the same one
   `check_invopop_suppliers` reads. `ops run` asks for it once and saves it
   (`ops help credentials`); run directly, it prompts with the echo off.
   `INVOPOP_API_BASE_URL` or `--base-url` points somewhere other than

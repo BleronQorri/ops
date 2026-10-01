@@ -7,7 +7,7 @@
 // Copy helpers from a sibling script rather than importing them.
 //
 // Transport: Invopop REST API (https://api.invopop.com), global fetch. No houston.
-// Auth: Bearer token from INVOPOP_API_TOKEN, else a paste prompt with
+// Auth: Bearer token from INVOPOP_ES_VERIFACTU_API_TOKEN_RO, else a paste prompt with
 //       the echo off.
 //       The token decides the workspace, and therefore the country and integration —
 //       the workspace is printed first so you can see you asked the right one.
@@ -33,7 +33,7 @@ const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 const c = { header: sgr("1;37"), cmd: sgr("33"), sql: sgr("36"), faint: sgr("2"), ok: sgr("32"), bad: sgr("31"), warn: sgr("1;33") };
 
 const DEFAULT_BASE_URL = "https://api.invopop.com";
-const TOKEN_ENV = "INVOPOP_API_TOKEN";
+const TOKEN_ENV = "INVOPOP_ES_VERIFACTU_API_TOKEN_RO";
 const TIMEOUT_MS = 20000;
 // Fresha's own side of the story, read through the Metabase CLI. Invopop only
 // knows what reached it; when an invoice never did, the warehouse is the only place

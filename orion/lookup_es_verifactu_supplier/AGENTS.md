@@ -9,7 +9,7 @@ env: production
 access: read-only
 tier: read-only
 lang: js
-secrets: [INVOPOP_API_TOKEN]
+secrets: [INVOPOP_ES_VERIFACTU_API_TOKEN_RO]
 examples:
   - args: ""
     note: asks for the NIF, then whether to read Fresha's side too
@@ -77,7 +77,7 @@ test (whole words, so the `DELETED_AT` columns it reads do not count). There is 
 ## Prereqs
 
 - Node ≥ 20 on PATH (built-in `fetch`; no dependencies).
-- `INVOPOP_API_TOKEN` — the token for the **ES Verifactu** workspace, the same one
+- `INVOPOP_ES_VERIFACTU_API_TOKEN_RO` — the token for the **ES Verifactu** workspace, the same one
   `check_invopop_suppliers` and `lookup_es_verifactu_invoice` read. `ops run` asks
   for it once and saves it (`ops help credentials`); run directly, it prompts with
   the echo off.

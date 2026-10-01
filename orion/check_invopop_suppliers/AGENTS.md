@@ -9,7 +9,7 @@ env: production
 access: read-only
 tier: read-only
 lang: exs
-secrets: [INVOPOP_API_TOKEN]
+secrets: [INVOPOP_ES_VERIFACTU_API_TOKEN_RO]
 help_flag: false
 examples:
   - args: ""
@@ -34,11 +34,11 @@ reports: ["invopop_report_*.md", "invopop_entries_*.csv"]
   nothing stuck stays hidden.
 - **Read-only** — never writes to Invopop.
 
-The Bearer token (`INVOPOP_API_TOKEN`, else paste prompt) selects the
+The Bearer token (`INVOPOP_ES_VERIFACTU_API_TOKEN_RO`, else paste prompt) selects the
 workspace/integration (ES, IT, …) being queried.
 
 ## Prereqs
 
 - Elixir on PATH (`Mix.install` pulls `req` + `nimble_csv`).
-- `INVOPOP_API_TOKEN` for the target workspace. VPN + `houston` only if using
+- `INVOPOP_ES_VERIFACTU_API_TOKEN_RO` for the target workspace. VPN + `houston` only if using
   the psql cross-reference.

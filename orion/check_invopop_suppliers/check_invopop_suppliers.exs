@@ -45,7 +45,7 @@ defmodule InvopopSupplierCheck do
   # -- Purpose: list Invopop "suppliers" silo entries and diagnose ones in problem states.
   # -- Transport: Invopop REST API (https://api.invopop.com) via Req. No houston needed
   # --            (optional provider cross-reference uses `houston psql accounting-documents`).
-  # -- Auth: Bearer token from INVOPOP_API_TOKEN, else paste prompt. The token itself
+  # -- Auth: Bearer token from INVOPOP_ES_VERIFACTU_API_TOKEN_RO, else paste prompt. The token itself
   # --       determines which integration/workspace (ES, IT, …) we're querying.
   # -- Base URL override: INVOPOP_API_BASE_URL
 
@@ -69,7 +69,7 @@ defmodule InvopopSupplierCheck do
   @error_states ~w(error rejected invalid)
   @voided_states ~w(void voided cancelled canceled)
 
-  @token_env "INVOPOP_API_TOKEN"
+  @token_env "INVOPOP_ES_VERIFACTU_API_TOKEN_RO"
 
   def run(argv) do
     Dotenv.load()

@@ -69,7 +69,7 @@ defmodule DeregisterSuppliers do
   @suppliers_folder "suppliers"
   @page_limit 100
   # Staging-specific vars: this script REQUIRES a sandbox workspace, so its token
-  # is kept separate from the production INVOPOP_API_TOKEN used by read-only tools.
+  # is kept separate from the production INVOPOP_ES_VERIFACTU_API_TOKEN_RO used by read-only tools.
   @token_env "INVOPOP_SANDBOX_API_TOKEN"
   @base_url_env "INVOPOP_SANDBOX_API_BASE_URL"
 

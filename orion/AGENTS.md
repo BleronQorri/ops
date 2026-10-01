@@ -87,7 +87,7 @@ ever need them.
 - Elixir/Erlang are pinned via `.tool-versions` (asdf); Node ≥ 20 on PATH.
   Elixir scripts that need deps auto-install them via `Mix.install` (e.g. `Req`);
   `backfill_missing_documents` and the Node scripts are dependency-free.
-- Tokens (`INVOPOP_API_TOKEN`, `INVOPOP_SANDBOX_API_TOKEN`, `COMARCH_UAT_JWT`) come
+- Tokens (`INVOPOP_ES_VERIFACTU_API_TOKEN_RO`, `INVOPOP_SANDBOX_API_TOKEN`, `COMARCH_UAT_JWT`) come
   from the environment; the scripts prompt when one is unset. A script lists the
   ones it reads as `secrets:` in its frontmatter, and `ops run` asks for those
   once and passes them in from its git-ignored `.env` (`ops help credentials`).
