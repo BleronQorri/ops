@@ -24,6 +24,7 @@ Edit the frontmatter, not the tables.
 |--------|-----|------|-----|--------------|
 | [audit_it_smart_receipt_errors](audit_it_smart_receipt_errors/) | IT · smart_receipts | read-only | `ops run audit_it_smart_receipt_errors` | Table the IT invoices and credit notes stuck in an error state in Invopop, and aggregate why they failed |
 | [check_invopop_suppliers](check_invopop_suppliers/) | ES · verifactu | read-only | `ops run check_invopop_suppliers` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
+| [lookup_es_verifactu_invoice](lookup_es_verifactu_invoice/) | ES · verifactu | read-only | `ops run lookup_es_verifactu_invoice` | Find one ES Verifactu invoice or credit note in Invopop by its number and report its state, faults and links |
 | [lookup_it_smart_receipt](lookup_it_smart_receipt/) | IT · smart_receipts | read-only | `ops run lookup_it_smart_receipt` | Find one IT Smart Receipt in Invopop by its number and report its state, faults and links |
 | [lookup_sa_zatca_document](lookup_sa_zatca_document/) | SA · zatca | read-only | `ops run lookup_sa_zatca_document` | Find one KSA invoice or credit note by its number and report where it is on its way to ZATCA, and why |
 <!-- ops:end catalogue:production/read-only -->
@@ -55,7 +56,7 @@ Edit the frontmatter, not the tables.
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `audit_it_smart_receipt_errors`, `check_invopop_suppliers`, `lookup_it_smart_receipt`, `lookup_sa_zatca_document`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `audit_it_smart_receipt_errors`, `check_invopop_suppliers`, `lookup_es_verifactu_invoice`, `lookup_it_smart_receipt`, `lookup_sa_zatca_document`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `ksa_fresha_vendor_switch`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
 - **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
 
