@@ -34,12 +34,12 @@ examples:
   - args: "--json --since 24h"
     note: for a script; never prompts
 reports: ["it-receipt-errors-*.md", "it-receipt-errors-*.csv"]
-related: [lookup_it_smart_receipt, check_invopop_suppliers]
+related: [lookup_invopop_document, check_invopop_suppliers]
 ---
 
 # audit_it_smart_receipt_errors
 
-Answers the question `lookup_it_smart_receipt` cannot: *not what happened to this
+Answers the question `lookup_invopop_document` cannot: *not what happened to this
 receipt, but what is going wrong across all of them.* It sweeps the Italian Smart
 Receipts workspace for invoices and credit notes that did not land, tables them
 with the silo entry each one lives in, and counts the reasons — so a hundred stuck

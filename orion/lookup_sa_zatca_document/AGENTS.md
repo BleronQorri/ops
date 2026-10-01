@@ -24,7 +24,7 @@ examples:
     note: the document Comarch knows by this WebDocId
   - args: "--json IRN031174"
     note: for a script; never prompts
-related: [lookup_it_smart_receipt, match_credit_notes_to_invoices, force_retry_invoices]
+related: [lookup_invopop_document, match_credit_notes_to_invoices, force_retry_invoices]
 ---
 
 # lookup_sa_zatca_document
@@ -34,7 +34,7 @@ printed on a Saudi invoice or credit note (`IRN…`) and it says whether ZATCA
 approved it, whether Comarch refused it before ZATCA ever saw it, or whether it is
 still on its way — and, when it went wrong, what Comarch said.
 
-The KSA sibling of `lookup_it_smart_receipt`, with one difference that shapes it:
+The KSA sibling of `lookup_invopop_document`, with one difference that shapes it:
 it never calls Comarch. Everything Comarch says about a document is already written
 down in Fresha's own tables, so this reads those, through the Metabase CLI.
 

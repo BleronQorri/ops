@@ -24,7 +24,8 @@ Edit the frontmatter, not the tables.
 |--------|-----|------|-----|--------------|
 | [audit_it_smart_receipt_errors](audit_it_smart_receipt_errors/) | IT · smart_receipts | read-only | `ops run audit_it_smart_receipt_errors` | Table the IT invoices and credit notes stuck in an error state in Invopop, and aggregate why they failed |
 | [check_invopop_suppliers](check_invopop_suppliers/) | ES · verifactu | read-only | `ops run check_invopop_suppliers` | List Invopop supplier silo entries and flag the ones stuck in error or void states |
-| [lookup_it_smart_receipt](lookup_it_smart_receipt/) | IT · smart_receipts | read-only | `ops run lookup_it_smart_receipt` | Find one IT Smart Receipt in Invopop by its number and report its state, faults and links |
+| [lookup_invopop_document](lookup_invopop_document/) | — | read-only | `ops run lookup_invopop_document` | Find one ES Verifactu invoice or IT Smart Receipt in Invopop by its number and report its state and faults |
+| [lookup_invopop_supplier](lookup_invopop_supplier/) | — | read-only | `ops run lookup_invopop_supplier` | Find one ES Verifactu or IT Smart Receipts supplier in Invopop by tax ID and report its registration history |
 | [lookup_sa_zatca_document](lookup_sa_zatca_document/) | SA · zatca | read-only | `ops run lookup_sa_zatca_document` | Find one KSA invoice or credit note by its number and report where it is on its way to ZATCA, and why |
 <!-- ops:end catalogue:production/read-only -->
 
@@ -55,7 +56,7 @@ Edit the frontmatter, not the tables.
 ## Danger tiers
 
 <!-- ops:begin tiers -->
-- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `audit_it_smart_receipt_errors`, `check_invopop_suppliers`, `lookup_it_smart_receipt`, `lookup_sa_zatca_document`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
+- **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `audit_it_smart_receipt_errors`, `check_invopop_suppliers`, `lookup_invopop_document`, `lookup_invopop_supplier`, `lookup_sa_zatca_document`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `ksa_fresha_vendor_switch`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
 - **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
 
@@ -69,6 +70,7 @@ Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the wors
 |--------|---------|-----|
 | [audit_tax_identity_drift](audit_tax_identity_drift/) | 2026-09-10 | Written to survey tax-identity drift during the Billing Profiles rollout; that migration is complete (team-orion #282 and #296) and the survey has served its purpose |
 | [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | 2026-09-10 | The bug bash it was written for ran on 2026-09-04 with all ten cases green; RENEWAL_EMAIL_GAP.md stays as the open question (team-orion#575) |
+| [lookup_it_smart_receipt](lookup_it_smart_receipt/) | 2026-10-01 | Folded into lookup_invopop_document, which looks up an IT Smart Receipt or an ES Verifactu invoice with --regime smart_receipts or verifactu |
 | [onboard_location_scripts](onboard_location_scripts/) | 2026-09-10 | The Billing Profiles migration it predates is complete (team-orion #282 and #296, 35/35 tickets), so its checks and task suggestions target a schema that no longer describes onboarding |
 | [plugin_legal_entity_updates](plugin_legal_entity_updates/) | 2026-09-10 | It drove the Billing Profiles migration, which is complete including the plugin backfills (team-orion #300 and #463); nothing is left to migrate or link |
 
@@ -85,7 +87,7 @@ ever need them.
 - Elixir/Erlang are pinned via `.tool-versions` (asdf); Node ≥ 20 on PATH.
   Elixir scripts that need deps auto-install them via `Mix.install` (e.g. `Req`);
   `backfill_missing_documents` and the Node scripts are dependency-free.
-- Tokens (`INVOPOP_API_TOKEN`, `INVOPOP_SANDBOX_API_TOKEN`, `COMARCH_UAT_JWT`) come
+- Tokens (`INVOPOP_ES_VERIFACTU_API_TOKEN_RO`, `INVOPOP_SANDBOX_API_TOKEN`, `COMARCH_UAT_JWT`) come
   from the environment; the scripts prompt when one is unset. A script lists the
   ones it reads as `secrets:` in its frontmatter, and `ops run` asks for those
   once and passes them in from its git-ignored `.env` (`ops help credentials`).
@@ -126,7 +128,12 @@ All three are one value or none. A tool that is country-blind by design — payl
 surgery that branches on whatever the document's country turns out to be, a
 staging wipe that deletes rows whatever they are — leaves them out rather than
 naming a country it does not actually mean. A tool that serves several countries
-today is a tool waiting to be split into granular ones.
+today is a tool waiting to be split into granular ones — with one exception: when
+the regimes differ only in which token opens which workspace, one tool may serve
+them all if the regime is the first thing it asks. It names the `integrator` alone,
+takes `--regime` (a picker on a terminal, required without one), and keeps every
+regime-specific value in one table at the top of the file.
+`lookup_invopop_document` and `lookup_invopop_supplier` are the examples.
 
 ## Asking the operator
 

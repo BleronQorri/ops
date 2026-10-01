@@ -138,9 +138,9 @@ so the asking happens once:
 
 ```
 $ ops run check_invopop_suppliers
-ops ▸ check_invopop_suppliers needs INVOPOP_API_TOKEN
+ops ▸ check_invopop_suppliers needs INVOPOP_ES_VERIFACTU_API_TOKEN_RO
   saved to /…/ops/.env (0600, git-ignored) · Enter to skip and let the script ask
-  INVOPOP_API_TOKEN:
+  INVOPOP_ES_VERIFACTU_API_TOKEN_RO:
 ops ▸ run 43  check_invopop_suppliers  production · read-only · read-only — Read-only
 ```
 
@@ -153,7 +153,7 @@ prompt, so: a JWT is checked against its own `exp` and an expired one is asked
 for again rather than passed; and when a run that was given a saved secret fails,
 ops names it and offers to replace it. `ops secrets unset <NAME>` hands the
 prompt back to the script at any time. What your shell exported always wins, so
-`INVOPOP_API_TOKEN=other ops run …` is still a one-off. Full rules:
+`INVOPOP_ES_VERIFACTU_API_TOKEN_RO=other ops run …` is still a one-off. Full rules:
 `ops help credentials`.
 
 ## Where things come from

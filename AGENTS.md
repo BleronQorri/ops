@@ -68,7 +68,10 @@ frozen — every update happens here.
   `integrator` are one value or none: `SA`/`zatca`/`comarch`, `ES`/`verifactu` and
   `IT`/`smart_receipts` go through `invopop`. A script that branches on whatever
   country the document turns out to be leaves all three out rather than naming one
-  it does not mean, and a script that serves several is one waiting to be split.
+  it does not mean, and a script that serves several is one waiting to be split —
+  unless the regime is the first thing it asks: an integrator-level tool whose
+  regimes differ only in token and country (`lookup_invopop_document`, `lookup_invopop_supplier`) names the
+  integrator alone, takes `--regime`, and sits under "Invopop · any scheme".
   A section where every row is empty drops those columns instead of printing
   dashes — and so does one where the heading has already given the answer, which
   is why the ZATCA table has no COUNTRY or INTEGRATION column.
