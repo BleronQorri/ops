@@ -1,25 +1,29 @@
 #!/usr/bin/env node
 "use strict";
 
-// lookup_es_verifactu_invoice — find one ES Verifactu invoice in Invopop and say what state it is in.
+// lookup_invopop_document — find one document in an Invopop workspace and say what
+// state it is in: an ES Verifactu invoice or an IT Smart Receipt.
 //
 // Self-contained on purpose: one directory, one entrypoint, no shared library.
 // Copy helpers from a sibling script rather than importing them.
 //
-// Transport: Invopop REST API (https://api.invopop.com), global fetch. No houston.
-// Auth: Bearer token from INVOPOP_ES_VERIFACTU_API_TOKEN_RO, else a paste prompt with
-//       the echo off.
-//       The token decides the workspace, and therefore the country and integration —
-//       the workspace is printed first so you can see you asked the right one.
+// The regime is the first thing it asks (or --regime): it picks the token, and the
+// token picks the workspace. One token per regime, never one for both — Invopop
+// workspaces are per country, and a token that opens the wrong one answers "not
+// found" about everything. The workspace is printed first and a mismatch warned
+// about, so a wrong token is obvious rather than looking like a missing document.
 //
-// Read-only: two GETs, no writes anywhere, nothing to dry-run.
+// Transport: Invopop REST API (https://api.invopop.com), global fetch. No houston.
+// Auth: Bearer token from the regime's variable, else a paste prompt, echo off.
+//
+// Read-only: GETs only, no writes anywhere, nothing to dry-run.
 //   1. GET /access/v1/workspace          — whose workspace this token opens
 //   2. GET /silo/v1/entries/{id}         — when the argument is a UUID
 //      GET /silo/v1/search?q=…           — otherwise, a free-text search
 //
-// The invoice number is whatever is printed on the invoice: the search is
-// free-text over the workspace's documents, so a series+code, a code on its own
-// or an Invopop entry UUID all find it.
+// The number is whatever is printed on the document: the search is free-text over
+// the workspace's documents, so a series+code, a code on its own or an Invopop
+// entry UUID all find it.
 
 const fs = require("fs");
 const { spawnSync } = require("child_process");
@@ -33,12 +37,19 @@ const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 const c = { header: sgr("1;37"), cmd: sgr("33"), sql: sgr("36"), faint: sgr("2"), ok: sgr("32"), bad: sgr("31"), warn: sgr("1;33") };
 
 const DEFAULT_BASE_URL = "https://api.invopop.com";
-const TOKEN_ENV = "INVOPOP_ES_VERIFACTU_API_TOKEN_RO";
+// Everything that differs between the regimes, in one place. Adding one is a row
+// here and a line in the AGENTS.md table, nothing else.
+const REGIMES = {
+  verifactu: { country: "ES", label: "ES Verifactu", noun: "invoice", token: "INVOPOP_ES_VERIFACTU_API_TOKEN_RO", other: "IT" },
+  smart_receipts: { country: "IT", label: "IT Smart Receipts", noun: "receipt", token: "SMART_RECEIPTS_READ_ONLY_API_TOKEN", other: "ES" },
+};
+// Set once the regime is known; everything after the questions reads it.
+let REGIME = null;
 const TIMEOUT_MS = 20000;
 // Fresha's own side of the story, read through the Metabase CLI. Invopop only
-// knows what reached it; when an invoice never did, the warehouse is the only place
+// knows what reached it; when a document never did, the warehouse is the only place
 // that says so — and it is also the only place that knows which tax ID the
-// invoice's account configuration actually carries.
+// document's account configuration actually carries.
 const MB_DATABASE = 87; // "Snowflake Postgres" in metabase.data-eng.fresha.io
 const DOC_TABLE = "ACCOUNTING_DOCUMENTS.PUBLIC_ACCOUNTING_DOCUMENTS";
 const TRACKER_TABLE = "ACCOUNTING_DOCUMENTS.PUBLIC_E_INVOICE_TRACKERS";
@@ -49,7 +60,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // A tax ID is typed a dozen ways — "ES B-8590549 5", "es-b85905495", with or
 // without the country in front — and they all mean the same registration. Compare
 // on the digits and letters alone, and let a code match whether or not the country
-// is on it, since the invoice prints it both ways.
+// is on it, since the document prints it both ways.
 function taxKey(v) {
   return String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
@@ -142,16 +153,18 @@ function ui_warn(message) {
 }
 
 function usage() {
-  return `lookup_es_verifactu_invoice — find an ES Verifactu invoice in Invopop and report its status
+  return `lookup_invopop_document — find an ES Verifactu invoice or an IT Smart Receipt in Invopop
 
 Usage:
-  lookup_es_verifactu_invoice [flags] <INVOICE>
+  lookup_invopop_document [flags] <NUMBER>
 
 Arguments:
-  INVOICE                the invoice number as printed on it, or an Invopop entry UUID.
+  NUMBER                 the document number as printed on it, or an Invopop entry UUID.
                          Asked for on a terminal when left out.
 
 Flags:
+  -r, --regime NAME      verifactu (ES) or smart_receipts (IT). Asked for on a
+                         terminal when left out; required everywhere else
   -f, --folder NAME      only search this silo folder (default: every folder)
   -t, --tax-id CODE      only the supplier with this tax ID, with or without the
                          country in front. Asked for on a terminal when left out;
@@ -166,7 +179,7 @@ Flags:
       --base-url URL     Invopop API base URL (default ${DEFAULT_BASE_URL})
       --loose            keep every search hit, not only the documents whose
                          number is exactly the one asked for
-      --db, --no-db      also look the invoice up in Snowflake Postgres through
+      --db, --no-db      also look the document up in Snowflake Postgres through
                          the Metabase CLI, which knows whether it was ever sent
                          and which tax ID its account configuration carries.
                          Asked for on a terminal when neither is given.
@@ -176,20 +189,21 @@ Flags:
       --json             emit JSON instead of a report; never prompts
   -h, --help             show this help
 
-The token comes from $${TOKEN_ENV}, and is asked for with the echo
-off when that is unset. \`ops secrets set ${TOKEN_ENV}\` saves it
+The token comes from the regime's variable — ${Object.entries(REGIMES).map(([k, r]) => `${r.token} (${k})`).join(", ")} — and is
+asked for with the echo off when that is unset. \`ops secrets set <NAME>\` saves it
 so the question is asked once.
 
-Exit codes: 0 the invoice was found and is not in an error state, 1 it was not found
+Exit codes: 0 the document was found and is not in an error state, 1 it was not found
 or it is in one, 2 the call was wrong or the token was refused.
 `;
 }
 
 function parseArgs(argv) {
-  const o = { folder: null, taxId: null, loose: false, db: null, config: null, mbDatabase: MB_DATABASE, limit: 20, scan: 500, baseUrl: process.env.INVOPOP_API_BASE_URL || DEFAULT_BASE_URL, json: false, positional: [] };
+  const o = { regime: null, folder: null, taxId: null, loose: false, db: null, config: null, mbDatabase: MB_DATABASE, limit: 20, scan: 500, baseUrl: process.env.INVOPOP_API_BASE_URL || DEFAULT_BASE_URL, json: false, positional: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") { process.stdout.write(usage()); process.exit(0); }
+    else if (a === "-r" || a === "--regime") o.regime = argv[++i];
     else if (a === "-f" || a === "--folder") o.folder = argv[++i];
     else if (a === "-t" || a === "--tax-id") o.taxId = argv[++i];
     else if (a === "-l" || a === "--limit") o.limit = Number(argv[++i]);
@@ -204,7 +218,8 @@ function parseArgs(argv) {
     else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
     else o.positional.push(a);
   }
-  if (o.positional.length > 1) fail(`expected one invoice, got ${o.positional.length}: ${o.positional.join(" ")}`, 2);
+  if (o.positional.length > 1) fail(`expected one document, got ${o.positional.length}: ${o.positional.join(" ")}`, 2);
+  if (o.regime !== null && !REGIMES[o.regime]) fail(`unknown regime: ${o.regime} — one of ${Object.keys(REGIMES).join(", ")}`, 2);
   if (!Number.isInteger(o.limit) || o.limit < 1) fail("--limit must be a whole number, 1 or more", 2);
   if (!Number.isInteger(o.scan) || o.scan < 1) fail("--scan must be a whole number, 1 or more", 2);
   return o;
@@ -228,13 +243,63 @@ function closeLines() {
   RL = null;
 }
 
+// One picker per choice: ↑↓ or j/k move, a number jumps, enter picks, esc stops.
+// Repaints its own lines in place, cursor hidden while it draws. Copied from
+// ksa_fresha_vendor_switch, on stderr because stdout is this script's data.
+function choose(question, options) {
+  closeLines();
+  const out = process.stderr;
+  const line = (o, i, at) => (i === at ? `  ${c.cmd("❯")} ${c.header(o.label)}` : `    ${o.label}`) + (o.note ? c.faint(`  · ${o.note}`) : "");
+  const draw = (at, first) => {
+    const frame = options.map((o, i) => `${line(o, i, at)}\x1b[K`).join("\n") + "\n";
+    out.write((first ? "" : `\x1b[${options.length}A\r`) + frame);
+  };
+  out.write(`${c.header(question)}  ${c.faint("↑↓ move · enter picks · esc stops")}\n`);
+  out.write("\x1b[?25l");
+  let at = 0;
+  draw(at, true);
+  return new Promise((resolve) => {
+    const done = (fn) => {
+      process.stdin.off("data", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1b[?25h");
+      fn();
+    };
+    const onKey = (buf) => {
+      const before = at;
+      for (const k of buf.toString().match(/\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|[\s\S]/g) || []) {
+        if (k === "\x1b[A" || k === "\x1bOA" || k === "k") at = (at + options.length - 1) % options.length;
+        else if (k === "\x1b[B" || k === "\x1bOB" || k === "j") at = (at + 1) % options.length;
+        else if (/^[1-9]$/.test(k) && Number(k) <= options.length) at = Number(k) - 1;
+        else if (k === "\r" || k === "\n") {
+          if (at !== before) draw(at, false);
+          return done(() => resolve(options[at].value));
+        } else if (k === "\x1b" || k === "\x03" || k === "\x04" || k === "q") return done(() => fail("stopped at a prompt", 2));
+      }
+      // A key that changes nothing on screen writes nothing.
+      if (at !== before) draw(at, false);
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", onKey);
+  });
+}
+
 // Ask for what was not passed. Never on a piped stdin and never under --json: a
 // script that blocks on a question no one can answer is worse than one that fails.
 async function askMissing(opts) {
-  if (opts.json || !process.stdin.isTTY) return;
+  if (opts.json || !process.stdin.isTTY) {
+    if (!opts.regime) fail(`no regime given — --regime ${Object.keys(REGIMES).join(" or ")}`, 2);
+    return;
+  }
+  if (!opts.regime) {
+    opts.regime = await choose("Which regime?", Object.entries(REGIMES).map(([k, r]) => ({ value: k, label: k, note: `${r.label} · ${r.token}` })));
+  }
+  const noun = REGIMES[opts.regime].noun;
   try {
     if (!opts.positional.length) {
-      const typed = (await lines().question("Invoice number (as printed on it), or an entry UUID: ")).trim();
+      const typed = (await lines().question(`${noun[0].toUpperCase()}${noun.slice(1)} number (as printed on it), or an entry UUID: `)).trim();
       if (typed) opts.positional.push(typed);
     }
     if (opts.taxId === null) {
@@ -256,7 +321,7 @@ function askToken() {
   return new Promise((resolve) => {
     const { stdin, stderr } = process;
     if (!stdin.isTTY) return resolve(null);
-    stderr.write(`Paste the Invopop API token for the ES workspace (input hidden):`);
+    stderr.write(`Paste the Invopop API token for the ${REGIME.label} workspace (input hidden):`);
     let buf = "";
     const done = (v) => {
       stdin.setRawMode(false);
@@ -281,11 +346,11 @@ function askToken() {
 }
 
 async function resolveToken(json) {
-  const fromEnv = (process.env[TOKEN_ENV] || "").trim();
+  const fromEnv = (process.env[REGIME.token] || "").trim();
   if (fromEnv) return fromEnv;
-  if (json) fail(`$${TOKEN_ENV} is unset, and --json never prompts`, 2);
-  if (!process.stdin.isTTY) fail(`$${TOKEN_ENV} is unset and there is no terminal to ask on`, 2);
-  process.stderr.write(c.faint(`$${TOKEN_ENV} is not set.\n`));
+  if (json) fail(`$${REGIME.token} is unset, and --json never prompts`, 2);
+  if (!process.stdin.isTTY) fail(`$${REGIME.token} is unset and there is no terminal to ask on`, 2);
+  process.stderr.write(c.faint(`$${REGIME.token} is not set.\n`));
   const typed = await askToken();
   if (!typed) fail("no token given", 2);
   return typed;
@@ -319,11 +384,11 @@ async function api(baseUrl, token, path, params) {
 // anything is judged, up to --scan.
 const PAGE = 100;
 
-async function searchAll(baseUrl, token, invoice, folder, scan) {
+async function searchAll(baseUrl, token, document, folder, scan) {
   const list = [];
   const seen = new Set();
   for (let offset = 0; list.length < scan; offset += PAGE) {
-    const got = await api(baseUrl, token, "/silo/v1/search", { q: invoice, folder, limit: PAGE, offset });
+    const got = await api(baseUrl, token, "/silo/v1/search", { q: document, folder, limit: PAGE, offset });
     const page = got.missing ? [] : got.data?.list || [];
     for (const e of page) {
       if (e?.id && !seen.has(e.id)) {
@@ -341,10 +406,10 @@ async function searchAll(baseUrl, token, invoice, folder, scan) {
 // be worth consulting: when it has one and it is not the number asked for, that
 // candidate is dropped unread. When it has none, the fetch happens — a snippet's
 // silence is not evidence.
-function snippetRulesOut(entry, invoice) {
+function snippetRulesOut(entry, document) {
   const code = entry?.snippet?.code;
   if (!code) return false;
-  const want = String(invoice).trim().toUpperCase().replace(/\s+/g, "");
+  const want = String(document).trim().toUpperCase().replace(/\s+/g, "");
   const series = entry?.snippet?.series;
   const forms = [code, series && `${series}-${code}`, series && `${series}${code}`]
     .filter(Boolean)
@@ -378,10 +443,10 @@ async function hydrate(baseUrl, token, entries) {
 }
 
 // Invopop's search is free text, so asking for INV01118 also answers with
-// INV011180 and with anything that merely mentions it. An invoice number names one
-// invoice, so the search is treated as a way of finding candidates and the answer
+// INV011180 and with anything that merely mentions it. A document number names one
+// document, so the search is treated as a way of finding candidates and the answer
 // is the ones whose number really is the one asked for. --loose keeps the rest.
-function invoiceForms(s) {
+function documentForms(s) {
   const forms = new Set();
   const add = (v) => {
     const k = String(v || "").trim().toUpperCase().replace(/\s+/g, "");
@@ -397,8 +462,8 @@ function invoiceForms(s) {
   return forms;
 }
 
-function isExact(s, invoice) {
-  return invoiceForms(s).has(String(invoice).trim().toUpperCase().replace(/\s+/g, ""));
+function isExact(s, document) {
+  return documentForms(s).has(String(document).trim().toUpperCase().replace(/\s+/g, ""));
 }
 
 function sqlQuote(v) {
@@ -414,7 +479,7 @@ function taxPredicate(taxId) {
   const k = taxKey(taxId);
   // A Spanish NIF often starts with a letter of its own (B85905495), so the
   // country is recognised by a digit within two characters of it, not one.
-  const bare = k.replace(/^[A-Z]{2}(?=[A-Z]?\d)/, "");
+  const bare = k.replace(new RegExp(`^${REGIME.country}(?=[A-Z]?\\d)`), "");
   const norm = (col) => `REGEXP_REPLACE(UPPER(COALESCE(${col}, '')), '[^A-Z0-9]', '')`;
   const country = "UPPER(COALESCE(c.COUNTRY_CODE, ''))";
   const one = (col) =>
@@ -424,7 +489,7 @@ function taxPredicate(taxId) {
 
 // One query: the document, the tracker that last tried to send it, and the tax
 // identity of its account configuration.
-function warehouseSql(invoice, config, taxId) {
+function warehouseSql(document, config, taxId) {
   // The sheets people work from carry either id, and they are one apart in a way
   // that invites the wrong one, so both are accepted and either may match.
   const narrow = config ? `  AND (d.ACCOUNT_CONFIGURATION_ID = ${Number(config)} OR d.ACCOUNT_CONFIGURATION_PLUGIN_ID = ${Number(config)})` : "";
@@ -436,7 +501,8 @@ function warehouseSql(invoice, config, taxId) {
     `FROM ${DOC_TABLE} d`,
     `LEFT JOIN ${CONFIG_TABLE} c ON c.ID = d.ACCOUNT_CONFIGURATION_ID`,
     `LEFT JOIN ${TRACKER_TABLE} t ON t.ID = d.LATEST_TRACKER_ID`,
-    `WHERE d.RECEIPT_NUMBER = ${sqlQuote(invoice)}`,
+    `WHERE d.RECEIPT_NUMBER = ${sqlQuote(document)}`,
+    `  AND UPPER(c.COUNTRY_CODE) = ${sqlQuote(REGIME.country)}`,
     taxId ? taxPredicate(taxId) : "",
     narrow,
     "ORDER BY d.ID",
@@ -447,9 +513,9 @@ function warehouseSql(invoice, config, taxId) {
 
 // `mb` is the Metabase CLI (`mb auth login` once). A missing or unauthenticated
 // CLI is reported and stepped over: the Invopop half of the answer still stands.
-function warehouseLookup(invoice, database, config, taxId) {
-  const body = JSON.stringify({ database, type: "native", native: { query: warehouseSql(invoice, config, taxId) } });
-  const file = path.join(os.tmpdir(), `lookup-invoice-${process.pid}.json`);
+function warehouseLookup(document, database, config, taxId) {
+  const body = JSON.stringify({ database, type: "native", native: { query: warehouseSql(document, config, taxId) } });
+  const file = path.join(os.tmpdir(), `lookup-document-${process.pid}.json`);
   fs.writeFileSync(file, body);
   try {
     const r = spawnSync("mb", ["query", "--file", file, "--json", "--max-bytes", "0"], { encoding: "utf8", timeout: 60000 });
@@ -476,7 +542,7 @@ function warehouseLookup(invoice, database, config, taxId) {
 function reportWarehouse(rows, scope) {
   const out = [c.header("In Fresha") + c.faint("  · Snowflake Postgres, via the Metabase CLI")];
   if (!rows.length) {
-    return out.concat(`  ${c.warn("?")} no accounting document matches${scope ? ` ${scope}` : " this invoice number"}`).join("\n");
+    return out.concat(`  ${c.warn("?")} no accounting document matches${scope ? ` ${scope}` : " this document number"}`).join("\n");
   }
   for (const r of rows) {
     const sent = String(r.UPLOAD_STATUS || "").toLowerCase();
@@ -574,17 +640,18 @@ function render(found, taxId, limit = Infinity) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   await askMissing(opts);
-  if (!opts.positional.length) fail("no invoice given — pass the number printed on the invoice, or an entry UUID", 2);
-  const invoice = opts.positional[0];
+  REGIME = REGIMES[opts.regime];
+  if (!opts.positional.length) fail("no document given — pass the number printed on the document, or an entry UUID", 2);
+  const document = opts.positional[0];
   const token = await resolveToken(opts.json);
 
-  // Fresha first when asked for: it knows whether the invoice was ever sent, and
+  // Fresha first when asked for: it knows whether the document was ever sent, and
   // its account configuration carries the tax ID that tells the suppliers apart.
   let warehouse = null;
   if (opts.db) {
-    warehouse = warehouseLookup(invoice, opts.mbDatabase, opts.config, opts.taxId);
+    warehouse = warehouseLookup(document, opts.mbDatabase, opts.config, opts.taxId);
     if (!opts.json && warehouse.error) ui_warn(`Snowflake lookup skipped — ${warehouse.error}`);
-    // An invoice number repeats across configurations — Fresha's own rows prove it,
+    // A document number repeats across configurations — Fresha's own rows prove it,
     // several countries deep — so its tax ID is only borrowed when every row
     // agrees on one. Picking the first would answer confidently about a supplier
     // nobody asked after.
@@ -600,36 +667,36 @@ async function main() {
   const ws = await api(opts.baseUrl, token, "/access/v1/workspace");
   const workspace = ws.data || {};
   // The workspace is the one thing the token chooses, and an IT or sandbox token
-  // answers "not found" about every Spanish invoice. Say so before the answer does.
-  if (!opts.json && workspace.country && String(workspace.country).toUpperCase() !== "ES") {
-    ui_warn(`this token opens ${workspace.name || workspace.slug || "a workspace"} (${workspace.country}), not the ES Verifactu one`);
+  // answers "not found" about every Spanish document. Say so before the answer does.
+  if (!opts.json && workspace.country && String(workspace.country).toUpperCase() !== REGIME.country) {
+    ui_warn(`this token opens ${workspace.name || workspace.slug || "a workspace"} (${workspace.country}), not the ${REGIME.label} one`);
   }
 
   let entries = [];
   let scanned = 0;
   let truncated = false;
   let skipped = 0;
-  if (UUID_RE.test(invoice)) {
-    const got = await api(opts.baseUrl, token, `/silo/v1/entries/${invoice}`);
+  if (UUID_RE.test(document)) {
+    const got = await api(opts.baseUrl, token, `/silo/v1/entries/${document}`);
     if (!got.missing && got.data) entries = [got.data];
   } else {
-    const found = await searchAll(opts.baseUrl, token, invoice, opts.folder, opts.scan);
+    const found = await searchAll(opts.baseUrl, token, document, opts.folder, opts.scan);
     scanned = found.list.length;
     truncated = found.truncated;
-    entries = opts.loose ? found.list : found.list.filter((e) => !snippetRulesOut(e, invoice));
+    entries = opts.loose ? found.list : found.list.filter((e) => !snippetRulesOut(e, document));
     skipped = found.list.length - entries.length;
   }
 
   const hits = (await hydrate(opts.baseUrl, token, entries)).map(summarise);
   // Exact first: the search found candidates, these are the ones that are actually
-  // the invoice asked for.
-  const all = opts.loose ? hits : hits.filter((s) => isExact(s, invoice));
-  // An invoice number is only unique within a supplier, so the same number can come
+  // the document asked for.
+  const all = opts.loose ? hits : hits.filter((s) => isExact(s, document));
+  // A document number is only unique within a supplier, so the same number can come
   // back for several. --tax-id picks one; without it they are shown apart.
   const found = opts.taxId ? all.filter((s) => taxMatches(opts.taxId, s.supplier.tax_id)) : all;
 
   if (!opts.json && warehouse && !warehouse.error) {
-    const scope = [`invoice ${invoice}`, opts.taxId && `tax ID ${opts.taxId}`, opts.config && `configuration ${opts.config}`].filter(Boolean).join(" · ");
+    const scope = [`document ${document}`, opts.taxId && `tax ID ${opts.taxId}`, opts.config && `configuration ${opts.config}`].filter(Boolean).join(" · ");
     process.stdout.write(reportWarehouse(warehouse.rows, scope) + "\n\n");
   }
   if (!opts.json) {
@@ -644,7 +711,7 @@ async function main() {
     process.stdout.write(
       JSON.stringify(
         {
-          invoice,
+          document,
           tax_id: opts.taxId,
           fresha: warehouse && !warehouse.error ? warehouse.rows : null,
           fresha_error: warehouse?.error ?? null,
@@ -659,24 +726,24 @@ async function main() {
       ) + "\n"
     );
   } else if (!found.length) {
-    process.stdout.write(`${c.warn("?")} no document in this workspace matches ${c.header(invoice)}${opts.taxId ? ` for tax ID ${c.header(opts.taxId)}` : ""}\n`);
+    process.stdout.write(`${c.warn("?")} no document in this workspace matches ${c.header(document)}${opts.taxId ? ` for tax ID ${c.header(opts.taxId)}` : ""}\n`);
     // Being told the number exists, just not for that supplier, is the answer
     // nine times out of ten when a tax ID was given.
     if (!all.length && hits.length) {
       const near = [...new Set(hits.map((s) => [s.series, s.code].filter(Boolean).join("-")).filter(Boolean))];
-      process.stdout.write(c.faint(`    ${hits.length} document(s) mention it, none numbered exactly ${invoice}${near.length ? `: ${near.slice(0, 8).join(", ")}` : ""}.\n    --loose shows them.\n`));
+      process.stdout.write(c.faint(`    ${hits.length} document(s) mention it, none numbered exactly ${document}${near.length ? `: ${near.slice(0, 8).join(", ")}` : ""}.\n    --loose shows them.\n`));
     } else if (opts.taxId && all.length) {
       const others = [...new Set(all.map((s) => taxLabel(s.supplier.tax_id)).filter(Boolean))];
       if (others.length) {
-        process.stdout.write(c.faint(`    ${all.length} document(s) do match ${invoice}, for ${others.join(", ")}.\n`));
+        process.stdout.write(c.faint(`    ${all.length} document(s) do match ${document}, for ${others.join(", ")}.\n`));
       } else {
         // Filtering everything out because the field is missing is not the same
         // as filtering everything out because it did not match, and saying so is
         // the difference between a wrong answer and a useful one.
-        process.stdout.write(c.faint(`    ${all.length} document(s) match ${invoice}, but none of them names a supplier tax ID,\n    so the --tax-id filter could not keep any. Run it again without --tax-id to see them.\n`));
+        process.stdout.write(c.faint(`    ${all.length} document(s) match ${document}, but none of them names a supplier tax ID,\n    so the --tax-id filter could not keep any. Run it again without --tax-id to see them.\n`));
       }
     } else {
-      process.stdout.write(c.faint(`    The token decides the workspace — an ES invoice will not be found with an IT token.\n    A number printed on the invoice is searched as free text; try the code on its own.\n`));
+      process.stdout.write(c.faint(`    The token decides the workspace — a ${REGIME.country} ${REGIME.noun} will not be found with an ${REGIME.other} token.\n    A number printed on the document is searched as free text; try the code on its own.\n`));
     }
   } else {
     process.stdout.write(render(found, opts.taxId, opts.limit) + "\n");
@@ -687,7 +754,7 @@ async function main() {
   }
 
   // 1 means the data is wrong: nothing found, or what was found is in an error
-  // state. An invoice still processing is not a problem, so it stays 0.
+  // state. A document still processing is not a problem, so it stays 0.
   const neverSent = (warehouse?.rows || []).some((r) => String(r.UPLOAD_STATUS || "").toLowerCase() === "not_started");
   if (!opts.json && !found.length && neverSent) {
     process.stdout.write(c.faint("    Fresha says it was never uploaded, so its absence here is expected, not a gap.\n"));

@@ -19,7 +19,7 @@ examples:
     note: both sides — Fresha's Verifactu plugin and Invopop's entries
   - args: "--json B85905495"
     note: for a script; never prompts
-related: [check_invopop_suppliers, lookup_es_verifactu_invoice]
+related: [check_invopop_suppliers, lookup_invopop_document]
 ---
 
 # lookup_es_verifactu_supplier
@@ -78,7 +78,7 @@ test (whole words, so the `DELETED_AT` columns it reads do not count). There is 
 
 - Node ≥ 20 on PATH (built-in `fetch`; no dependencies).
 - `INVOPOP_ES_VERIFACTU_API_TOKEN_RO` — the token for the **ES Verifactu** workspace, the same one
-  `check_invopop_suppliers` and `lookup_es_verifactu_invoice` read. `ops run` asks
+  `check_invopop_suppliers` and `lookup_invopop_document` read. `ops run` asks
   for it once and saves it (`ops help credentials`); run directly, it prompts with
   the echo off.
 - For `--db` only: the Metabase CLI (`mb`), logged in with `mb auth login`.

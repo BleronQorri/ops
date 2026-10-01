@@ -8,6 +8,9 @@ integrator: invopop
 env: production
 access: read-only
 tier: read-only
+status: retired
+retired_on: 2026-10-01
+retired_reason: Folded into lookup_invopop_document, which looks up an IT Smart Receipt or an ES Verifactu invoice with --regime smart_receipts or verifactu
 lang: js
 secrets: [SMART_RECEIPTS_READ_ONLY_API_TOKEN]
 examples:
