@@ -103,11 +103,13 @@ frozen — every update happens here.
   match). The directory, the entrypoint and `name:` always agree. Renaming means
   `git mv` both, then a word-boundary rewrite of every mention — never inside a
   longer identifier, since `process_missing_sales_events` is a Houston task name.
-- **Retiring a script is a frontmatter change, never a delete.** `status: retired`
-  plus a one-line `retired_reason` (quote it if it cites a #ticket). It then leaves
-  the catalogue and the generated tables, gains a row in the Retired table, and
-  `ops run` refuses it; the file stays runnable on its own. Do not delete the
-  directory — its AGENTS.md is the record of what was done.
+- **Retire a script first, then delete it.** `status: retired` plus a one-line
+  `retired_reason` (quote it if it cites a #ticket): it leaves the catalogue and the
+  generated tables, gains a row in the Retired table, and `ops run` refuses it while
+  the file stays runnable on its own. Once nothing points at it any more — no
+  `related:`, no example, no comment sending a reader there — `git rm -r` the
+  directory and `ops orion docs sync`. Git history is the record of what was done;
+  the commit that deletes it names what replaced it, if anything did.
 - **Frontmatter is the source of truth** for the scripts catalogue; the root
   tables in the scripts repo are generated. If a field is added to the schema,
   update `KNOWN_KEYS` + `validateScript` in `lib/orion/catalogue.js`, the

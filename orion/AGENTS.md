@@ -66,17 +66,7 @@ Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the wors
 ## Retired
 
 <!-- ops:begin retired -->
-| Script | Retired | Why |
-|--------|---------|-----|
-| [audit_tax_identity_drift](audit_tax_identity_drift/) | 2026-09-10 | Written to survey tax-identity drift during the Billing Profiles rollout; that migration is complete (team-orion #282 and #296) and the survey has served its purpose |
-| [it_credential_lifecycle_bugbash](it_credential_lifecycle_bugbash/) | 2026-09-10 | The bug bash it was written for ran on 2026-09-04 with all ten cases green; RENEWAL_EMAIL_GAP.md stays as the open question (team-orion#575) |
-| [lookup_it_smart_receipt](lookup_it_smart_receipt/) | 2026-10-01 | Folded into lookup_invopop_document, which looks up an IT Smart Receipt or an ES Verifactu invoice with --regime smart_receipts or verifactu |
-| [onboard_location_scripts](onboard_location_scripts/) | 2026-09-10 | The Billing Profiles migration it predates is complete (team-orion #282 and #296, 35/35 tickets), so its checks and task suggestions target a schema that no longer describes onboarding |
-| [plugin_legal_entity_updates](plugin_legal_entity_updates/) | 2026-09-10 | It drove the Billing Profiles migration, which is complete including the plugin backfills (team-orion #300 and #463); nothing is left to migrate or link |
-
-These are decommissioned. They are hidden from `ops orion script list` (use
-`--status retired`) and `ops run` refuses them; the files still run directly if you
-ever need them.
+_Nothing retired right now. Deleted scripts live in git history._
 <!-- ops:end retired -->
 
 ## Prereqs (most scripts)

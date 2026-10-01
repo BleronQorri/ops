@@ -1,7 +1,5 @@
 # Generated reports / exports — from each script's AGENTS.md `reports:` (ops orion docs sync)
 # ops:begin reports
-account-config-le-audit-*.csv
-account-config-le-audit-*.md
 b2b-credit-notes-*.csv
 b2b-credit-notes-*.md
 decoded-payloads-*.csv
@@ -10,12 +8,9 @@ invoice-payloads-*.csv
 invoice-payloads-*.sql
 invopop_entries_*.csv
 invopop_report_*.md
-it-credential-lifecycle-bugbash-*.md
 it-receipt-errors-*.csv
 it-receipt-errors-*.md
 originals/
-preflight-*.md
-rollout-report-*.md
 # ops:end reports
 
 # Elixir crash dumps

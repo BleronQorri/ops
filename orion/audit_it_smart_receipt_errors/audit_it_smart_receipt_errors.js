@@ -5,7 +5,7 @@
 //
 // Self-contained on purpose: one directory, one entrypoint, no shared library.
 // Copy helpers from a sibling script rather than importing them — most of what is
-// here came from lookup_it_smart_receipt, which answers the same question about
+// here came from lookup_invopop_document, which answers the same question about
 // one receipt instead of all of them.
 //
 // Transport: Invopop REST API (https://api.invopop.com), global fetch. No houston.
@@ -115,7 +115,7 @@ function isReceiptDoc(entry) {
 const CREDIT_TYPES = ["credit-note", "corrective", "debit-note"];
 
 // ---------------------------------------------------------------------------
-// States, the same buckets check_invopop_suppliers and lookup_it_smart_receipt use,
+// States, the same buckets check_invopop_suppliers and lookup_invopop_document use,
 // so a state means the same thing whichever script shows it to you.
 // ---------------------------------------------------------------------------
 
@@ -275,7 +275,7 @@ function parseArgs(argv) {
     else if (a === "--console-url") o.consoleUrl = argv[++i];
     else if (a === "--json") o.json = true;
     else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
-    else fail(`unexpected argument: ${a} — this script sweeps a window, it does not take a receipt number (see lookup_it_smart_receipt)`, 2);
+    else fail(`unexpected argument: ${a} — this script sweeps a window, it does not take a receipt number (see lookup_invopop_document --regime smart_receipts)`, 2);
   }
   const TYPES = { all: "all", invoice: "invoices", invoices: "invoices", "credit-note": "credit-notes", "credit-notes": "credit-notes", "credit_note": "credit-notes" };
   if (!TYPES[o.type]) fail(`--type must be one of invoices, credit-notes, all — not ${o.type}`, 2);
