@@ -23,7 +23,7 @@ examples:
     note: both sides — Fresha's own row and Invopop's
   - args: "--regime smart_receipts --json INV01475"
     note: for a script; never prompts
-related: [lookup_es_verifactu_supplier, check_invopop_suppliers, audit_it_smart_receipt_errors, lookup_sa_zatca_document]
+related: [lookup_invopop_supplier, check_invopop_suppliers, audit_it_smart_receipt_errors, lookup_sa_zatca_document]
 ---
 
 # lookup_invopop_document

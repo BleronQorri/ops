@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 "use strict";
 
-// lookup_es_verifactu_supplier — find one ES Verifactu supplier in Invopop by its tax
-// ID and say whether it is registered.
+// lookup_invopop_supplier — find one supplier in an Invopop workspace by its tax ID
+// and say whether it is registered: ES Verifactu or IT Smart Receipts.
 //
 // Self-contained on purpose: one directory, one entrypoint, no shared library.
 // Copy helpers from a sibling script rather than importing them.
 //
+// The regime is the first thing it asks (or --regime): it picks the token, and the
+// token picks the workspace. The workspace is printed first and a mismatch warned
+// about, so a wrong token is obvious rather than looking like a missing supplier.
+//
 // Transport: Invopop REST API (https://api.invopop.com), global fetch. No houston.
-// Auth: Bearer token from INVOPOP_ES_VERIFACTU_API_TOKEN_RO, else a paste prompt with the echo off.
-//       The token decides the workspace, and therefore the country and integration —
-//       the workspace is printed first, and a non-ES one is warned about.
+// Auth: Bearer token from the regime's variable, else a paste prompt, echo off.
 //
 // Read-only: GETs only, no writes anywhere, nothing to dry-run.
 //   1. GET /access/v1/workspace             — whose workspace this token opens
@@ -35,7 +37,15 @@ const sgr = (code) => (s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 const c = { header: sgr("1;37"), cmd: sgr("33"), sql: sgr("36"), faint: sgr("2"), ok: sgr("32"), bad: sgr("31"), warn: sgr("1;33") };
 
 const DEFAULT_BASE_URL = "https://api.invopop.com";
-const TOKEN_ENV = "INVOPOP_ES_VERIFACTU_API_TOKEN_RO";
+// Everything that differs between the regimes, in one place. `integration` is the
+// value Fresha's plugin rows carry, so it doubles as the warehouse filter. Adding a
+// regime is a row here and a line in the AGENTS.md table, nothing else.
+const REGIMES = {
+  verifactu: { country: "ES", label: "ES Verifactu", token: "INVOPOP_ES_VERIFACTU_API_TOKEN_RO", integration: "verifactu", taxName: "NIF", other: "IT" },
+  smart_receipts: { country: "IT", label: "IT Smart Receipts", token: "SMART_RECEIPTS_READ_ONLY_API_TOKEN", integration: "smart_receipts", taxName: "partita IVA", other: "ES" },
+};
+// Set once the regime is known; everything after the questions reads it.
+let REGIME = null;
 const TIMEOUT_MS = 20000;
 const SUPPLIERS_FOLDER = "suppliers";
 // Fresha's own side, read through the Metabase CLI: the account configuration
@@ -44,17 +54,18 @@ const MB_DATABASE = 87; // "Snowflake Postgres" in metabase.data-eng.fresha.io
 const CONFIG_TABLE = "ACCOUNTING_DOCUMENTS.PUBLIC_ACCOUNT_CONFIGURATIONS";
 const PLUGIN_TABLE = "ACCOUNTING_DOCUMENTS.PUBLIC_ACCOUNT_CONFIGURATION_PLUGINS";
 
-// A NIF is typed a dozen ways — "B-8590549 5", "esb85905495", with or without the
-// country in front — and they all mean one registration. Compare on letters and
-// digits alone, and drop a leading ES only when what follows is still a NIF: a
-// NIF often starts with a letter of its own (B85905495, Y5581133J), so the country
-// is recognised by a digit within two characters of it, not one. Exact, never a
+// A tax ID is typed a dozen ways — "B-8590549 5", "esb85905495", "IT 0404266092 0",
+// with or without the country in front — and they all mean one registration.
+// Compare on letters and digits alone, and drop the regime's country only when what
+// follows is still a tax ID: a Spanish NIF often starts with a letter of its own
+// (B85905495, Y5581133J), so the country is recognised by a digit within two
+// characters of it, not one. Exact, never a
 // suffix: a shorter number is a different supplier.
 function taxKey(v) {
   return String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 function bareNif(v) {
-  return taxKey(v).replace(/^ES(?=[A-Z]?\d)/, "");
+  return taxKey(v).replace(new RegExp(`^${REGIME.country}(?=[A-Z]?\\d)`), "");
 }
 
 // GOBL keeps the country in its own field, but it is routinely typed into the code
@@ -108,30 +119,33 @@ function ui_warn(message) {
 }
 
 function usage() {
-  return `lookup_es_verifactu_supplier — find an ES Verifactu supplier in Invopop by its tax ID
+  return `lookup_invopop_supplier — find an ES Verifactu or IT Smart Receipts supplier in Invopop by its tax ID
 
 Usage:
-  lookup_es_verifactu_supplier [flags] <TAX_ID>
+  lookup_invopop_supplier [flags] <TAX_ID>
 
 Arguments:
-  TAX_ID                 the supplier's NIF, with or without ES in front, however it
-                         is spaced. Asked for on a terminal when left out.
+  TAX_ID                 the supplier's tax ID (an ES NIF, an IT partita IVA), with or
+                         without the country in front, however it is spaced. Asked
+                         for on a terminal when left out.
 
 Flags:
+  -r, --regime NAME      verifactu (ES) or smart_receipts (IT). Asked for on a
+                         terminal when left out; required everywhere else
   -f, --folder NAME      the silo folder suppliers live in (default ${SUPPLIERS_FOLDER})
       --scan N           how many entries to read when the search finds nothing and
                          the whole folder is read instead (default 2000)
       --base-url URL     Invopop API base URL (default ${DEFAULT_BASE_URL})
       --db, --no-db      also look the supplier up in Snowflake Postgres through the
-                         Metabase CLI: the Verifactu plugin that registered it and
+                         Metabase CLI: the regime's plugin that registered it and
                          the status Fresha holds. Asked for on a terminal when
                          neither is given.
       --mb-database N    Metabase database id to query (default ${MB_DATABASE})
       --json             emit JSON instead of a report; never prompts
   -h, --help             show this help
 
-The token comes from $${TOKEN_ENV}, and is asked for with the echo
-off when that is unset. \`ops secrets set ${TOKEN_ENV}\` saves it
+The token comes from the regime's variable — ${Object.entries(REGIMES).map(([k, r]) => `${r.token} (${k})`).join(", ")} — and is
+asked for with the echo off when that is unset. \`ops secrets set <NAME>\` saves it
 so the question is asked once.
 
 Exit codes: 0 the supplier was found and its newest entry is not in an error state,
@@ -141,10 +155,11 @@ was refused.
 }
 
 function parseArgs(argv) {
-  const o = { folder: SUPPLIERS_FOLDER, scan: 2000, db: null, mbDatabase: MB_DATABASE, baseUrl: process.env.INVOPOP_API_BASE_URL || DEFAULT_BASE_URL, json: false, positional: [] };
+  const o = { regime: null, folder: SUPPLIERS_FOLDER, scan: 2000, db: null, mbDatabase: MB_DATABASE, baseUrl: process.env.INVOPOP_API_BASE_URL || DEFAULT_BASE_URL, json: false, positional: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") { process.stdout.write(usage()); process.exit(0); }
+    else if (a === "-r" || a === "--regime") o.regime = argv[++i];
     else if (a === "-f" || a === "--folder") o.folder = argv[++i];
     else if (a === "--scan") o.scan = Number(argv[++i]);
     else if (a === "--base-url") o.baseUrl = argv[++i];
@@ -155,7 +170,8 @@ function parseArgs(argv) {
     else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
     else o.positional.push(a);
   }
-  // A NIF with a space in it arrives as two words; that is still one tax ID.
+  if (o.regime !== null && !REGIMES[o.regime]) fail(`unknown regime: ${o.regime} — one of ${Object.keys(REGIMES).join(", ")}`, 2);
+  // A tax ID with a space in it arrives as two words; that is still one tax ID.
   if (o.positional.length > 1) o.positional = [o.positional.join(" ")];
   if (!o.folder) fail("--folder needs a name", 2);
   if (!Number.isInteger(o.scan) || o.scan < 1) fail("--scan must be a whole number, 1 or more", 2);
@@ -180,11 +196,61 @@ function closeLines() {
   RL = null;
 }
 
+// One picker per choice: ↑↓ or j/k move, a number jumps, enter picks, esc stops.
+// Repaints its own lines in place, cursor hidden while it draws. Copied from
+// ksa_fresha_vendor_switch, on stderr because stdout is this script's data.
+function choose(question, options) {
+  closeLines();
+  const out = process.stderr;
+  const line = (o, i, at) => (i === at ? `  ${c.cmd("❯")} ${c.header(o.label)}` : `    ${o.label}`) + (o.note ? c.faint(`  · ${o.note}`) : "");
+  const draw = (at, first) => {
+    const frame = options.map((o, i) => `${line(o, i, at)}\x1b[K`).join("\n") + "\n";
+    out.write((first ? "" : `\x1b[${options.length}A\r`) + frame);
+  };
+  out.write(`${c.header(question)}  ${c.faint("↑↓ move · enter picks · esc stops")}\n`);
+  out.write("\x1b[?25l");
+  let at = 0;
+  draw(at, true);
+  return new Promise((resolve) => {
+    const done = (fn) => {
+      process.stdin.off("data", onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write("\x1b[?25h");
+      fn();
+    };
+    const onKey = (buf) => {
+      const before = at;
+      for (const k of buf.toString().match(/\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|[\s\S]/g) || []) {
+        if (k === "\x1b[A" || k === "\x1bOA" || k === "k") at = (at + options.length - 1) % options.length;
+        else if (k === "\x1b[B" || k === "\x1bOB" || k === "j") at = (at + 1) % options.length;
+        else if (/^[1-9]$/.test(k) && Number(k) <= options.length) at = Number(k) - 1;
+        else if (k === "\r" || k === "\n") {
+          if (at !== before) draw(at, false);
+          return done(() => resolve(options[at].value));
+        } else if (k === "\x1b" || k === "\x03" || k === "\x04" || k === "q") return done(() => fail("stopped at a prompt", 2));
+      }
+      // A key that changes nothing on screen writes nothing.
+      if (at !== before) draw(at, false);
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", onKey);
+  });
+}
+
 async function askMissing(opts) {
-  if (opts.json || !process.stdin.isTTY) return;
+  if (opts.json || !process.stdin.isTTY) {
+    if (!opts.regime) fail(`no regime given — --regime ${Object.keys(REGIMES).join(" or ")}`, 2);
+    return;
+  }
+  if (!opts.regime) {
+    opts.regime = await choose("Which regime?", Object.entries(REGIMES).map(([k, r]) => ({ value: k, label: k, note: `${r.label} · ${r.token}` })));
+  }
+  const taxName = REGIMES[opts.regime].taxName;
   try {
     if (!opts.positional.length) {
-      const typed = (await lines().question("Supplier tax ID (NIF): ")).trim();
+      const typed = (await lines().question(`Supplier tax ID (${taxName}): `)).trim();
       if (typed) opts.positional.push(typed);
     }
     if (opts.db === null) {
@@ -202,7 +268,7 @@ function askToken() {
   return new Promise((resolve) => {
     const { stdin, stderr } = process;
     if (!stdin.isTTY) return resolve(null);
-    stderr.write(`Paste the Invopop API token for the ES workspace (input hidden): `);
+    stderr.write(`Paste the Invopop API token for the ${REGIME.label} workspace (input hidden): `);
     let buf = "";
     const done = (v) => {
       stdin.setRawMode(false);
@@ -227,11 +293,11 @@ function askToken() {
 }
 
 async function resolveToken(json) {
-  const fromEnv = (process.env[TOKEN_ENV] || "").trim();
+  const fromEnv = (process.env[REGIME.token] || "").trim();
   if (fromEnv) return fromEnv;
-  if (json) fail(`$${TOKEN_ENV} is unset, and --json never prompts`, 2);
-  if (!process.stdin.isTTY) fail(`$${TOKEN_ENV} is unset and there is no terminal to ask on`, 2);
-  process.stderr.write(c.faint(`$${TOKEN_ENV} is not set.\n`));
+  if (json) fail(`$${REGIME.token} is unset, and --json never prompts`, 2);
+  if (!process.stdin.isTTY) fail(`$${REGIME.token} is unset and there is no terminal to ask on`, 2);
+  process.stderr.write(c.faint(`$${REGIME.token} is not set.\n`));
   const typed = await askToken();
   if (!typed) fail("no token given", 2);
   return typed;
@@ -269,12 +335,12 @@ function listOf(body) {
 
 const PAGE = 100;
 
-// The search is free text, so each way of writing the NIF is asked for: the index
+// The search is free text, so each way of writing the tax ID is asked for: the index
 // matches what was stored, and a supplier stored as "ESB85905495" is not found by
 // "B85905495" in every case. Candidates are judged afterwards, exactly.
 async function searchSupplier(baseUrl, token, taxId, folder) {
   const bare = bareNif(taxId);
-  const forms = [...new Set([String(taxId).trim(), bare, `ES${bare}`].filter(Boolean))];
+  const forms = [...new Set([String(taxId).trim(), bare, `${REGIME.country}${bare}`].filter(Boolean))];
   const seen = new Map();
   for (const q of forms) {
     for (let offset = 0; ; offset += PAGE) {
@@ -390,11 +456,11 @@ function sqlQuote(v) {
 }
 
 // The same tolerance as the Invopop side, in SQL: letters and digits alone, with or
-// without ES in front. PARENT_NUMBER is the plugin's tax ID and is stored however it
+// without the country in front. PARENT_NUMBER is the plugin's tax ID and is stored however it
 // was typed — lower case included — so it is normalised before it is compared.
 function warehouseSql(taxId) {
   const bare = bareNif(taxId);
-  const forms = [bare, `ES${bare}`].map(sqlQuote).join(", ");
+  const forms = [bare, `${REGIME.country}${bare}`].map(sqlQuote).join(", ");
   const norm = (col) => `REGEXP_REPLACE(UPPER(COALESCE(${col}, '')), '[^A-Z0-9]', '')`;
   return [
     "SELECT p.ID AS PLUGIN_ID, p.ACCOUNT_CONFIGURATION_ID, p.PARENT_NUMBER, p.BRANCH_NUMBER,",
@@ -402,7 +468,7 @@ function warehouseSql(taxId) {
     "       p.LEGAL_ENTITY_ID, p.UPDATED_AT, c.TAX_ID, c.ENABLED, c.DELETED_AT",
     `FROM ${PLUGIN_TABLE} p`,
     `LEFT JOIN ${CONFIG_TABLE} c ON c.ID = p.ACCOUNT_CONFIGURATION_ID`,
-    "WHERE p.INTEGRATION = 'verifactu'",
+    `WHERE p.INTEGRATION = ${sqlQuote(REGIME.integration)}`,
     "  AND p._FRESHA_HARD_DELETED_AT IS NULL",
     `  AND (${norm("p.PARENT_NUMBER")} IN (${forms}) OR ${norm("c.TAX_ID")} IN (${forms}) OR ${norm("c.VAT_NUMBER")} IN (${forms}))`,
     "ORDER BY p.IS_DEFAULT DESC, p.ID",
@@ -439,7 +505,7 @@ function warehouseLookup(taxId, database) {
 
 function reportWarehouse(rows, taxId) {
   const out = [c.header("In Fresha") + c.faint("  · Snowflake Postgres, via the Metabase CLI")];
-  if (!rows.length) return out.concat(`  ${c.warn("?")} no Verifactu plugin carries tax ID ${taxId}`).join("\n");
+  if (!rows.length) return out.concat(`  ${c.warn("?")} no ${REGIME.integration} plugin carries tax ID ${taxId}`).join("\n");
   for (const r of rows) {
     const st = String(r.PLUGIN_STATUS || "").toLowerCase();
     const mark = st === "enabled" ? c.ok("✓") : st === "pending" ? c.warn("…") : c.bad("✗");
@@ -459,7 +525,8 @@ function reportWarehouse(rows, taxId) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   await askMissing(opts);
-  if (!opts.positional.length) fail("no tax ID given — pass the supplier's NIF", 2);
+  REGIME = REGIMES[opts.regime];
+  if (!opts.positional.length) fail(`no tax ID given — pass the supplier's ${REGIME.taxName}`, 2);
   const taxId = opts.positional[0];
   if (!bareNif(taxId)) fail(`"${taxId}" has no letters or digits to look up`, 2);
   const token = await resolveToken(opts.json);
@@ -469,10 +536,11 @@ async function main() {
 
   const ws = await api(opts.baseUrl, token, "/access/v1/workspace");
   const workspace = ws.data || {};
-  // An IT or sandbox token answers "not found" about every Spanish supplier. Say
+  // A token for another country, or a sandbox, answers "not found" about every
+  // supplier of this one. Say
   // so before the answer does.
-  if (!opts.json && workspace.country && String(workspace.country).toUpperCase() !== "ES") {
-    ui_warn(`this token opens ${workspace.name || workspace.slug || "a workspace"} (${workspace.country}), not the ES Verifactu one`);
+  if (!opts.json && workspace.country && String(workspace.country).toUpperCase() !== REGIME.country) {
+    ui_warn(`this token opens ${workspace.name || workspace.slug || "a workspace"} (${workspace.country}), not the ${REGIME.label} one`);
   }
 
   let source = "search";
@@ -516,10 +584,10 @@ async function main() {
     if (truncated) process.stdout.write(c.warn(`  the folder was cut off at --scan ${opts.scan}; there may be more\n`));
     if (!latest) {
       process.stdout.write(`  ${c.warn("?")} no entry in '${opts.folder}' carries tax ID ${c.header(taxId)}\n`);
-      const esWorkspace = !workspace.country || String(workspace.country).toUpperCase() === "ES";
-      if (!esWorkspace) process.stdout.write(c.faint(`    The token decides the workspace — an ES supplier will not be found with an IT token.\n`));
+      const rightWorkspace = !workspace.country || String(workspace.country).toUpperCase() === REGIME.country;
+      if (!rightWorkspace) process.stdout.write(c.faint(`    The token decides the workspace — a ${REGIME.country} supplier will not be found with an ${REGIME.other} token.\n`));
       // Only worth saying when the workspace was the right one to look in.
-      if (esWorkspace && (warehouse?.rows || []).length) process.stdout.write(c.faint(`    Fresha has a Verifactu plugin for it, so it was registered on Fresha's side but never reached Invopop.\n`));
+      if (rightWorkspace && (warehouse?.rows || []).length) process.stdout.write(c.faint(`    Fresha has a ${REGIME.integration} plugin for it, so it was registered on Fresha's side but never reached Invopop.\n`));
     } else {
       const who = [taxLabel(latest.tax_id), latest.name].filter(Boolean).join("  ·  ");
       process.stdout.write(`  ${c.header(who)}  ${c.faint(`${found.length} entr${found.length === 1 ? "y" : "ies"}, newest first`)}\n\n`);
