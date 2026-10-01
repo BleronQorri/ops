@@ -8,6 +8,7 @@ access: read-only
 tier: read-only
 lang: js
 secrets: [INVOPOP_ES_VERIFACTU_API_TOKEN_RO, SMART_RECEIPTS_READ_ONLY_API_TOKEN]
+asks: true
 examples:
   - args: ""
     note: asks for the regime, the tax ID, then whether to read Fresha's side too

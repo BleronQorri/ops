@@ -604,4 +604,5 @@ async function main() {
   process.exit(!latest || latest.status === "error" ? 1 : 0);
 }
 
-main().catch((err) => fail(err.stack || err.message, 2));
+// Ctrl+C at a typed question rejects the readline promise: a stop, not a crash.
+main().catch((err) => fail(err?.name === "AbortError" ? "stopped at a prompt" : err.stack || err.message, 2));
