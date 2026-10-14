@@ -50,6 +50,7 @@ Edit the frontmatter, not the tables.
 |--------|-----|------|-----|--------------|
 | [confirm_comarch_uat_queue](confirm_comarch_uat_queue/) | SA · zatca | staging | `ops run confirm_comarch_uat_queue` | Process the Comarch UAT queue by confirming "sent" items via the edoc-online UAT REST API |
 | [deregister_invopop_suppliers](deregister_invopop_suppliers/) | — | staging | `ops run deregister_invopop_suppliers` | Fire the Invopop supplier-deregistration workflow, one Transform job per supplier, in a sandbox workspace |
+| [send_zatca_scenarios_to_invopop](send_zatca_scenarios_to_invopop/) | SA · zatca | staging | `ops run send_zatca_scenarios_to_invopop` | Send made-up KSA invoices and credit notes to ZATCA through an Invopop sandbox and report which are accepted |
 | [wipe_provider_einvoicing](wipe_provider_einvoicing/) | — | staging | `ops run wipe_provider_einvoicing` | Wipe all of a provider's e-invoicing rows from a staging accounting_documents DB in one transaction |
 <!-- ops:end catalogue:staging/write -->
 
@@ -58,7 +59,7 @@ Edit the frontmatter, not the tables.
 <!-- ops:begin tiers -->
 - **Read-only** (`read-only`) — SELECTs and external GETs only; cannot write anywhere: `audit_it_smart_receipt_errors`, `check_invopop_suppliers`, `lookup_invopop_document`, `lookup_invopop_supplier`, `lookup_sa_zatca_document`, `match_credit_notes_to_invoices`, `patch_invoice_payloads`.
 - **Prod writes (gated, reversible-ish)** (`prod-write`) — gated Houston tasks; dry run by default; requires a terminal: `backfill_missing_documents`, `force_retry_invoices`, `ksa_fresha_vendor_switch`, `edit_document_payload` (runbook), `fix_credit_note_references` (runbook).
-- **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `wipe_provider_einvoicing`.
+- **Staging / sandbox** (`staging`) — non-production only — the staging databases, the Invopop sandbox, Comarch UAT; refuses production, and some of it deletes rows: `confirm_comarch_uat_queue`, `deregister_invopop_suppliers`, `send_zatca_scenarios_to_invopop`, `wipe_provider_einvoicing`.
 
 Mode-by-mode nuance lives in each script's own `AGENTS.md`; the tier is the worst thing the script can do in any mode. `ops help tiers` has the long form.
 <!-- ops:end tiers -->
