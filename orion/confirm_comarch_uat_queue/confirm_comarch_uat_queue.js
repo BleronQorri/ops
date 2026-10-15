@@ -10,9 +10,8 @@
 // UAT only: the base URL is hardcoded to the UAT host, so there is no environment
 // question — the banner names it. Reads are POST /api/status/sent; the one write is
 // POST /api/status/sent/confirm, one per batch, each after the batch is listed and
-// a typed "yes".
+// the operator picks "confirm" (stop is highlighted to begin with).
 
-const readline = require("readline/promises");
 const fs = require("fs");
 const path = require("path");
 
@@ -59,23 +58,29 @@ function usage() {
 Usage:
   confirm_comarch_uat_queue [flags]
 
-On a terminal it asks for what is left out: the queue, whether to dry run, and the
-Comarch JWT unless COMARCH_UAT_JWT is set. Comarch UAT only — there is no
-production path and no environment question.
+On a terminal it asks for what is left out — the queue and whether to dry run —
+with arrow-key pickers only; nothing is typed. A picked queue is followed by a
+"What next?" picker to clear another one in the same run. The token comes from one
+POST /api/auth per run with COMARCH_UAT_LOGIN and COMARCH_UAT_PASSWORD, kept in
+memory for that run only. Comarch UAT only — there is no production path and no
+environment question.
 
 Flags:
   -q, --queue QUEUE      invoice (ConfigId ${CONFIG_IDS.invoice}), onboarding (${CONFIG_IDS.onboarding})
                          or aperak (${CONFIG_IDS.aperak})
       --dry-run BOOL     true (the default): list the queue's sent items and show
                          which would be confirmed; confirm nothing. false: confirm
-                         them, one batch at a time, each after a typed "yes".
-                         A bare --dry-run means true
+                         them, one batch at a time, each after "confirm" or
+                         "confirm all" is picked (stop is highlighted to begin
+                         with). A bare --dry-run means true
   -h, --help             show this help
 
 Environment:
-  COMARCH_UAT_JWT        the Comarch UAT JWT; asked for on a terminal when unset
+  COMARCH_UAT_LOGIN      the Comarch UAT login; required
+  COMARCH_UAT_PASSWORD   its password; required (ops run asks for both and passes
+                         them in; ops secrets set <name> saves one)
 
-Without a terminal nothing is asked: --queue and COMARCH_UAT_JWT must be given,
+Without a terminal nothing is asked: --queue and both credentials must be given,
 the run is a dry run, and --dry-run false is refused.
 
 Exit codes: 0 done, 1 an API call failed or the operator stopped it, 2 the call was wrong.
@@ -132,7 +137,6 @@ if (TERMINAL) process.on("exit", () => process.stdout.write("\x1b[?25h"));
 // up and every line clears only its own tail — so the list never blanks between
 // frames, and the terminal gets its cursor back however the choice ends.
 function choose(question, options) {
-  closeRl();
   const out = process.stdout;
   const line = (o, i, at) => (i === at ? `  ${c.cmd("❯")} ${c.header(o.label)}` : `    ${o.label}`) + (o.note ? c.faint(`  · ${o.note}`) : "");
   const draw = (at, first) => {
@@ -173,14 +177,16 @@ function choose(question, options) {
   });
 }
 
-// Asks for whatever the flags left out. Without a terminal nothing is asked: the
-// queue and the token must be given, and the run is a dry run.
+// Asks for whatever the flags left out, with pickers only. Without a terminal
+// nothing is asked: the queue must be given, and the run is a dry run.
 async function askMissing(o) {
+  for (const name of ["COMARCH_UAT_LOGIN", "COMARCH_UAT_PASSWORD"]) {
+    if (!process.env[name]) fail(`${name} is not set — ops run asks for it, or: ops secrets set ${name}`, 2);
+  }
   if (!TERMINAL) {
     if (!o.queue) fail(`no queue given — --queue ${QUEUES.join("|")}`, 2);
-    if (o.dryRun === false) fail("--dry-run false needs a terminal: every confirmation is typed by hand", 2);
+    if (o.dryRun === false) fail("--dry-run false needs a terminal: every batch is confirmed by hand", 2);
     o.dryRun = true;
-    if (!process.env.COMARCH_UAT_JWT) fail("COMARCH_UAT_JWT is not set, and without a terminal there is no one to ask", 2);
   } else {
     if (!o.queue) {
       o.queue = await choose("Which queue?", QUEUES.map((q) => ({ value: q, label: q, note: `ConfigId ${CONFIG_IDS[q]}` })));
@@ -188,52 +194,37 @@ async function askMissing(o) {
     if (o.dryRun === null) {
       o.dryRun = await choose("Dry run?", [
         { value: true, label: "true", note: "list the sent items; confirm nothing" },
-        { value: false, label: "false", note: "confirm them, each batch after a typed yes" },
+        { value: false, label: "false", note: "confirm them, each batch after you pick confirm" },
       ]);
     }
-  }
-  if (process.env.COMARCH_UAT_JWT) {
-    console.log("Using Comarch JWT from $COMARCH_UAT_JWT.");
-    o.token = process.env.COMARCH_UAT_JWT;
-  } else {
-    o.token = await promptToken();
   }
   o.execute = !o.dryRun;
 }
 
-// One readline interface at a time, closed before a picker takes stdin.
-let RL = null;
-async function ask(q) {
-  if (!RL) RL = readline.createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    return (await RL.question(q)).trim();
-  } catch (err) {
-    // Ctrl+C / Ctrl+D at a prompt is the operator saying no.
-    if (err.name === "AbortError") stop("stopped at a prompt");
-    throw err;
+// One login per run: the token is kept in memory for every batch and queue of this
+// run and never written down, so the next run logs in again.
+async function login() {
+  const url = `${BASE_URL}/api/auth`;
+  console.log(`POST ${url} (login ${process.env.COMARCH_UAT_LOGIN})`);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ login: process.env.COMARCH_UAT_LOGIN, password: process.env.COMARCH_UAT_PASSWORD }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`/api/auth failed (${res.status}): ${text}`);
   }
-}
-function closeRl() {
-  if (RL) RL.close();
-  RL = null;
+  // The body is the JWT as a bare JSON string.
+  const token = await res.json();
+  if (typeof token !== "string" || !token) throw new Error("/api/auth returned no token");
+  return token;
 }
 
-// Stops the run: exit 1, and nothing after it runs.
+// Esc at a picker: exit 1, and nothing after it runs.
 class Stop extends Error {}
-function stop(message) {
-  throw new Stop(message);
-}
 
 const say = (s = "") => process.stdout.write(`  ${s}\n`);
-
-async function promptToken() {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const value = await ask("Comarch JWT token: ");
-    if (value) return value;
-    console.error("Token cannot be empty.");
-  }
-  throw new Error("No token provided.");
-}
 
 function buildHeaders(token) {
   return {
@@ -294,16 +285,16 @@ function listRecords(records, limit = 25) {
   if (records.length > limit) say(c.faint(`… and ${records.length - limit} more`));
 }
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  await askMissing(opts);
+// Works one queue until it is empty, the dry run has listed it, or the operator
+// stops; returns false only when the operator stopped before a batch.
+async function runQueue(opts, headers) {
   const configId = CONFIG_IDS[opts.queue];
-  const headers = buildHeaders(opts.token);
-  process.stdout.write(`\n${c.header("confirm_comarch_uat_queue")} ${opts.queue} — ${c.warn("staging (Comarch UAT)")}, DRY_RUN=${opts.dryRun} — ${opts.execute ? c.warn("confirms each batch after a typed yes") : "lists the queue only"}\n`);
+  process.stdout.write(`\n${c.header("confirm_comarch_uat_queue")} ${opts.queue} — ${c.warn("staging (Comarch UAT)")}, DRY_RUN=${opts.dryRun} — ${opts.execute ? c.warn("confirms each batch after you pick confirm") : "lists the queue only"}\n`);
   console.log(`Base URL: ${BASE_URL}`);
   console.log(`Using ${opts.queue} queue (ConfigId=${configId})`);
 
   let confirmed = 0;
+  let confirmAll = false;
   while (true) {
     console.log("Fetching sent records...");
     const records = await fetchSent(headers, configId);
@@ -311,20 +302,30 @@ async function main() {
 
     if (records.length === 0) {
       console.log(confirmed ? `Queue empty. Done — ${confirmed} record(s) confirmed.` : "Queue empty. Done.");
-      return 0;
+      return true;
     }
 
     listRecords(records);
 
     if (!opts.execute) {
       process.stdout.write(`\n  ${c.warn("would confirm")} these ${records.length} record(s): POST ${BASE_URL}/api/status/sent/confirm\n`);
-      process.stdout.write(`\n${c.faint("Dry run: nothing was confirmed. --dry-run false confirms them, each batch after a typed yes.")}\n`);
-      return 0;
+      process.stdout.write(`\n${c.faint("Dry run: nothing was confirmed. --dry-run false confirms them, each batch after you pick confirm.")}\n`);
+      return true;
     }
 
-    process.stdout.write(`\n  ${c.warn("about to")} confirm these ${records.length} record(s) in ${c.warn("Comarch UAT")}:\n  ${c.cmd(`POST ${BASE_URL}/api/status/sent/confirm`)}\n`);
-    const answer = (await ask(`  Type "yes" to confirm them (anything else stops): `)).toLowerCase();
-    if (answer !== "yes") stop(`stopped before confirming ${records.length} record(s) — nothing more was sent${confirmed ? ` (${confirmed} confirmed earlier in this run)` : ""}`);
+    if (!confirmAll) {
+      process.stdout.write(`\n  ${c.warn("about to")} confirm these ${records.length} record(s) in ${c.warn("Comarch UAT")}:\n  ${c.cmd(`POST ${BASE_URL}/api/status/sent/confirm`)}\n`);
+      const go = await choose(`Confirm these ${records.length} record(s)?`, [
+        { value: "stop", label: "stop", note: "send nothing more" },
+        { value: "one", label: "confirm", note: `POST /api/status/sent/confirm for ${records.length} record(s), then ask again` },
+        { value: "all", label: "confirm all", note: "this batch and every next one until the queue is empty, without asking" },
+      ]);
+      if (go === "stop") {
+        process.stdout.write(`\n${c.bad("✗ stopped:")} stopped before confirming ${records.length} record(s) — nothing more was sent${confirmed ? ` (${confirmed} confirmed earlier)` : ""}\n`);
+        return false;
+      }
+      confirmAll = go === "all";
+    }
 
     console.log("Confirming all records...");
     const result = await confirmSent(headers, records);
@@ -333,10 +334,33 @@ async function main() {
   }
 }
 
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  // Only a run that picked its queue goes round again; one given flags does what they say once.
+  const pickedQueue = TERMINAL && !opts.queue;
+  const pickedDryRun = TERMINAL && opts.dryRun === null;
+  await askMissing(opts);
+  const headers = buildHeaders(await login());
+
+  let ok = await runQueue(opts, headers);
+  while (pickedQueue) {
+    process.stdout.write("\n");
+    const next = await choose("What next?", [
+      { value: "done", label: "done", note: "exit" },
+      { value: "again", label: "another queue", note: "pick the queue and dry run again" },
+    ]);
+    if (next === "done") break;
+    opts.queue = null;
+    if (pickedDryRun) opts.dryRun = null;
+    await askMissing(opts);
+    ok = (await runQueue(opts, headers)) && ok;
+  }
+  return ok ? 0 : 1;
+}
+
 main()
-  .then((code) => { closeRl(); process.exit(code); })
+  .then((code) => process.exit(code))
   .catch((err) => {
-    closeRl();
     if (err instanceof Stop) {
       process.stdout.write(`\n${c.bad("✗ stopped:")} ${err.message}\n`);
       process.exit(1);

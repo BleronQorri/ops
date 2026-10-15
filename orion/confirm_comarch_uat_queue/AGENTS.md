@@ -9,14 +9,15 @@ env: staging
 access: write
 tier: staging
 lang: js
-secrets: [COMARCH_UAT_JWT]
+secrets: [COMARCH_UAT_LOGIN, COMARCH_UAT_PASSWORD]
+asks: true
 examples:
   - args: ""
-    note: asks for the queue, whether to dry run and, unless COMARCH_UAT_JWT is set, the JWT
+    note: asks for the queue and whether to dry run, each with a picker
   - args: "--queue invoice --dry-run true"
     note: list the invoice queue's sent items; confirm nothing
   - args: "--queue aperak --dry-run false"
-    note: confirm the aperak queue's sent items, each batch after a typed yes
+    note: confirm the aperak queue's sent items, each batch after picking confirm or confirm all
 ---
 # confirm_comarch_uat_queue
 
@@ -24,23 +25,33 @@ examples:
 
 - Talks to the edoc-online UAT API (`https://edi-uat.edoc-online.com/EdiRest`).
 - Asks for the **queue** (`invoice`, `onboarding` or `aperak`) and whether to
-  **dry run**, a picker each, then for the **Comarch JWT token** as a typed line
-  unless `COMARCH_UAT_JWT` is set.
+  **dry run**, an arrow-key picker each. Nothing is typed.
+- Logs in once per run (`POST /api/auth` with `COMARCH_UAT_LOGIN` and
+  `COMARCH_UAT_PASSWORD`, which `ops run` asks for before the run; unset, the
+  script exits 2) and keeps the JWT in memory for every batch and queue of that
+  run. It is never saved, so the next run logs in again.
 - Fetches the queue's "sent" items (`POST /api/status/sent`) for the matching
   `ConfigId` (invoice = 119208, onboarding = 119286, aperak = 119328) and lists
   them.
-- A dry run stops there. Otherwise the listed batch is confirmed
-  (`POST /api/status/sent/confirm`) after a typed `yes`, and the queue is fetched
-  again until it comes back empty; any other answer stops before that batch.
+- A dry run stops there. Otherwise each listed batch gets a picker: `stop`
+  (highlighted to begin with) sends nothing more, `confirm` confirms that batch
+  (`POST /api/status/sent/confirm`) and asks again on the next one, and
+  `confirm all` confirms it and every next batch without asking until the queue
+  comes back empty. Esc stops the run.
+- When the queue was picked rather than given with `--queue`, a `What next?`
+  picker follows each queue: `done` exits, `another queue` asks for the queue
+  (and the dry run, unless `--dry-run` was given) again. `asks: true` makes
+  `ops interactive` run it straight into these pickers.
 
 ## Safety
 
 UAT-only: the base URL is hardcoded to the UAT host — there is no production
 path in this script, so it asks no environment question and names Comarch UAT in
-its banner. Without a terminal it asks nothing: `--queue` and `COMARCH_UAT_JWT`
-must be given, and the run is a dry run.
+its banner. Without a terminal it asks nothing: `--queue` must be given, and the
+run is a dry run.
 
 ## Prereqs
 
 - Node on PATH (dependency-free).
-- A valid Comarch UAT JWT token.
+- The Comarch UAT login and password, saved with `ops secrets set COMARCH_UAT_LOGIN`
+  and `ops secrets set COMARCH_UAT_PASSWORD`.
