@@ -7,6 +7,7 @@ env: production
 access: read-only
 tier: read-only
 lang: js
+also: [dump_payment_advances.js]
 secrets: [INVOPOP_ES_VERIFACTU_API_TOKEN_RO, SMART_RECEIPTS_READ_ONLY_API_TOKEN]
 asks: true
 examples:
