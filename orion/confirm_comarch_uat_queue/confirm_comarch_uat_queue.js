@@ -58,8 +58,9 @@ function usage() {
 Usage:
   confirm_comarch_uat_queue [flags]
 
-On a terminal it asks for what is left out — the queue and whether to dry run —
-with arrow-key pickers only; nothing is typed. A picked queue is followed by a
+It confirms: there is no dry run. On a terminal it asks for the queue when
+--queue is left out, with an arrow-key picker, and then before each batch —
+stop, confirm, or confirm all. Nothing is typed. A picked queue is followed by a
 "What next?" picker to clear another one in the same run. The token comes from one
 POST /api/auth per run with COMARCH_UAT_LOGIN and COMARCH_UAT_PASSWORD, kept in
 memory for that run only. Comarch UAT only — there is no production path and no
@@ -68,15 +69,9 @@ environment question.
 Flags:
   -q, --queue QUEUE      invoice (ConfigId ${CONFIG_IDS.invoice}), onboarding (${CONFIG_IDS.onboarding})
                          or aperak (${CONFIG_IDS.aperak})
-      --dry-run BOOL     true (the default): list the queue's sent items and show
-                         which would be confirmed; confirm nothing. false: confirm
-                         them, one batch at a time, each after "confirm" or
-                         "confirm all" is picked (stop is highlighted to begin
-                         with). A bare --dry-run means true
       --confirm all      confirm every batch until the queue is empty without
                          asking — what picking "confirm all" does, decided up
-                         front. Implies --dry-run false; this is the flag a timer
-                         (ops schedule) needs, since it has no terminal to pick on
+                         front. Without a terminal this is what happens anyway
   -h, --help             show this help
 
 Environment:
@@ -85,8 +80,8 @@ Environment:
                          them in; ops secrets set <name> saves one)
 
 Without a terminal nothing is asked: --queue and both credentials must be given,
-and the run is a dry run unless --confirm all says otherwise; --dry-run false on
-its own is refused, because each batch would need a hand.
+and every batch is confirmed until the queue is empty, as --confirm all does.
+There is no dry run; the target is UAT.
 
 Exit codes: 0 done, 1 an API call failed or the operator stopped it, 2 the call was wrong.
 `;
@@ -98,7 +93,7 @@ function fail(message, code) {
 }
 
 function parseArgs(argv) {
-  const o = { queue: null, dryRun: null, confirmAll: false };
+  const o = { queue: null, confirmAll: false };
   const val = (flag, v) => {
     if (v === undefined || v.startsWith("-")) fail(`${flag} takes a value`, 2);
     return v;
@@ -108,13 +103,7 @@ function parseArgs(argv) {
     if (a === "-h" || a === "--help") { process.stdout.write(usage()); process.exit(0); }
     else if (a === "-q" || a === "--queue") o.queue = queueOf(val(a, argv[++i]));
     else if (a.startsWith("--queue=")) o.queue = queueOf(a.slice("--queue=".length));
-    else if (a === "--dry-run") {
-      // A bare --dry-run means true; a value after it says which.
-      const next = argv[i + 1];
-      if (next === "true" || next === "false") o.dryRun = argv[++i] === "true";
-      else o.dryRun = true;
-    }
-    else if (a.startsWith("--dry-run=")) o.dryRun = boolOf(a.slice("--dry-run=".length));
+    else if (a === "--dry-run" || a.startsWith("--dry-run=")) fail("there is no dry run: this script confirms the queue (UAT). Drop the flag", 2);
     else if (a === "--confirm") o.confirmAll = confirmOf(val(a, argv[++i]));
     else if (a.startsWith("--confirm=")) o.confirmAll = confirmOf(a.slice("--confirm=".length));
     else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
@@ -134,11 +123,6 @@ function queueOf(v) {
 function confirmOf(v) {
   if (v !== "all") fail(`--confirm takes all, got ${JSON.stringify(v)}`, 2);
   return true;
-}
-
-function boolOf(v) {
-  if (v !== "true" && v !== "false") fail(`--dry-run takes true or false, got ${JSON.stringify(v)}`, 2);
-  return v === "true";
 }
 
 const TERMINAL = process.stdin.isTTY && process.stdout.isTTY;
@@ -191,33 +175,19 @@ function choose(question, options) {
   });
 }
 
-// Asks for whatever the flags left out, with pickers only. Without a terminal
-// nothing is asked: the queue must be given, and the run is a dry run unless
-// --confirm all has already answered every picker there would have been.
+// Asks for the queue when it was left out, with a picker. Without a terminal
+// nothing is asked: the queue must be given, and every batch is confirmed, since
+// there is nobody to pick for each one.
 async function askMissing(o) {
   for (const name of ["COMARCH_UAT_LOGIN", "COMARCH_UAT_PASSWORD"]) {
     if (!process.env[name]) fail(`${name} is not set — ops run asks for it, or: ops secrets set ${name}`, 2);
   }
-  if (o.confirmAll) {
-    if (o.dryRun === true) fail("--confirm all and --dry-run true contradict each other: one confirms, the other confirms nothing", 2);
-    o.dryRun = false;
-  }
   if (!TERMINAL) {
     if (!o.queue) fail(`no queue given — --queue ${QUEUES.join("|")}`, 2);
-    if (o.dryRun === false && !o.confirmAll) fail("--dry-run false needs a terminal: every batch is confirmed by hand — --confirm all confirms them without one", 2);
-    o.dryRun = true;
-  } else {
-    if (!o.queue) {
-      o.queue = await choose("Which queue?", QUEUES.map((q) => ({ value: q, label: q, note: `ConfigId ${CONFIG_IDS[q]}` })));
-    }
-    if (o.dryRun === null) {
-      o.dryRun = await choose("Dry run?", [
-        { value: true, label: "true", note: "list the sent items; confirm nothing" },
-        { value: false, label: "false", note: "confirm them, each batch after you pick confirm" },
-      ]);
-    }
+    o.confirmAll = true;
+  } else if (!o.queue) {
+    o.queue = await choose("Which queue?", QUEUES.map((q) => ({ value: q, label: q, note: `ConfigId ${CONFIG_IDS[q]}` })));
   }
-  o.execute = !o.dryRun;
 }
 
 // One login per run: the token is kept in memory for every batch and queue of this
@@ -304,12 +274,12 @@ function listRecords(records, limit = 25) {
   if (records.length > limit) say(c.faint(`… and ${records.length - limit} more`));
 }
 
-// Works one queue until it is empty, the dry run has listed it, or the operator
-// stops; returns false only when the operator stopped before a batch.
+// Works one queue until it is empty or the operator stops; returns false only
+// when the operator stopped before a batch.
 async function runQueue(opts, headers) {
   const configId = CONFIG_IDS[opts.queue];
-  const mode = !opts.execute ? "lists the queue only" : opts.confirmAll ? c.warn("confirms every batch without asking (--confirm all)") : c.warn("confirms each batch after you pick confirm");
-  process.stdout.write(`\n${c.header("confirm_comarch_uat_queue")} ${opts.queue} — ${c.warn("staging (Comarch UAT)")}, DRY_RUN=${opts.dryRun} — ${mode}\n`);
+  const mode = opts.confirmAll ? c.warn(`confirms every batch without asking${TERMINAL ? " (--confirm all)" : ""}`) : c.warn("confirms each batch after you pick confirm");
+  process.stdout.write(`\n${c.header("confirm_comarch_uat_queue")} ${opts.queue} — ${c.warn("staging (Comarch UAT)")} — ${mode}\n`);
   console.log(`Base URL: ${BASE_URL}`);
   console.log(`Using ${opts.queue} queue (ConfigId=${configId})`);
 
@@ -326,12 +296,6 @@ async function runQueue(opts, headers) {
     }
 
     listRecords(records);
-
-    if (!opts.execute) {
-      process.stdout.write(`\n  ${c.warn("would confirm")} these ${records.length} record(s): POST ${BASE_URL}/api/status/sent/confirm\n`);
-      process.stdout.write(`\n${c.faint("Dry run: nothing was confirmed. --dry-run false confirms them, each batch after you pick confirm.")}\n`);
-      return true;
-    }
 
     if (!confirmAll) {
       process.stdout.write(`\n  ${c.warn("about to")} confirm these ${records.length} record(s) in ${c.warn("Comarch UAT")}:\n  ${c.cmd(`POST ${BASE_URL}/api/status/sent/confirm`)}\n`);
@@ -358,7 +322,6 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   // Only a run that picked its queue goes round again; one given flags does what they say once.
   const pickedQueue = TERMINAL && !opts.queue;
-  const pickedDryRun = TERMINAL && opts.dryRun === null;
   await askMissing(opts);
   const headers = buildHeaders(await login());
 
@@ -367,11 +330,10 @@ async function main() {
     process.stdout.write("\n");
     const next = await choose("What next?", [
       { value: "done", label: "done", note: "exit" },
-      { value: "again", label: "another queue", note: "pick the queue and dry run again" },
+      { value: "again", label: "another queue", note: "pick the queue again" },
     ]);
     if (next === "done") break;
     opts.queue = null;
-    if (pickedDryRun) opts.dryRun = null;
     await askMissing(opts);
     ok = (await runQueue(opts, headers)) && ok;
   }
