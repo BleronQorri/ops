@@ -18,8 +18,10 @@ examples:
     note: the ES Verifactu workspace, the last 24 hours
   - args: "--regime smart_receipts --since 3d --report"
     note: the IT workspace over three days, with the Markdown and CSV in the current directory
-  - args: "--regime zatca_sandbox --report --notify slack"
+  - args: "--regime smart_receipts --report --notify slack"
     note: the form a daily timer runs — the report on disk and the summary in Slack
+  - args: "--regime verifactu --report --notify slack:SLACK_WEBHOOK_URL_ES"
+    note: the same, posted to the webhook saved under that name — one channel per workspace
   - args: "--regime verifactu --json"
     note: the whole report as JSON; never prompts
 ---
@@ -58,7 +60,11 @@ each one lands every morning without one workspace's trouble hiding another's.
 6. **Where it goes** — the report on stdout; with `--report` a Markdown report
    and a CSV of the errored documents in the current directory; with
    `--notify slack` a summary posted to the incoming webhook in
-   `SLACK_WEBHOOK_URL` (verdict, counts, top faults, the report's path).
+   `SLACK_WEBHOOK_URL` (verdict, counts, a table of every supplier in error and
+   of every failed document, the report's path). `--notify slack:NAME` posts to
+   the webhook saved under `NAME` instead, so each workspace's timer can have
+   its own channel: save one with `ops secrets set SLACK_WEBHOOK_URL_ES` and
+   name it on that timer. Every value in .env reaches the run, declared or not.
 
 ## Safety
 
@@ -72,9 +78,10 @@ outbound write and it goes to a webhook you created. Without a terminal
   `SMART_RECEIPTS_READ_ONLY_API_TOKEN` or `INVOPOP_SA_ZATCA_SANDBOX_API_TOKEN`.
   `ops run` asks for the ones it does not hold; Enter skips the ones another
   regime needs.
-- For `--notify slack`: a Slack incoming webhook URL saved as `SLACK_WEBHOOK_URL`.
-  Unset, a run with `--notify slack` fails before it reads anything, so a timer
-  that cannot deliver shows up failed rather than quietly reporting to nobody.
+- For `--notify slack`: a Slack incoming webhook URL saved as `SLACK_WEBHOOK_URL`,
+  or under any name given as `--notify slack:NAME`. Unset, a run with `--notify`
+  fails before it reads anything, so a timer that cannot deliver shows up failed
+  rather than quietly reporting to nobody.
 
 ## Output
 
@@ -89,9 +96,11 @@ outbound write and it goes to a webhook you created. Without a terminal
 
 ```
 mkdir -p ~/reports/invopop-health && cd ~/reports/invopop-health
-ops schedule add --name health_es --cron "0 7 * * *" report_invopop_workspace_health --regime verifactu --report --notify slack
-ops schedule add --name health_it --cron "0 7 * * *" report_invopop_workspace_health --regime smart_receipts --report --notify slack
-ops schedule add --name health_sa_sandbox --cron "0 7 * * *" report_invopop_workspace_health --regime zatca_sandbox --report --notify slack
+ops secrets set SLACK_WEBHOOK_URL_ES
+ops secrets set SLACK_WEBHOOK_URL_IT
+ops schedule add --name health_es --cron "0 7 * * *" report_invopop_workspace_health --regime verifactu --report --notify slack:SLACK_WEBHOOK_URL_ES
+ops schedule add --name health_it --cron "0 7 * * *" report_invopop_workspace_health --regime smart_receipts --report --notify slack:SLACK_WEBHOOK_URL_IT
 ```
 
-One timer per workspace, from the directory the reports should land in.
+One timer per workspace, from the directory the reports should land in, each
+posting to its own channel.

@@ -83,9 +83,9 @@ function isDoc(entry) {
 }
 
 const VERDICT = {
-  healthy: { mark: "✓", slack: ":large_green_circle:", paint: c.ok, rank: 0 },
-  degraded: { mark: "!", slack: ":large_yellow_circle:", paint: c.warn, rank: 1 },
-  broken: { mark: "✗", slack: ":red_circle:", paint: c.bad, rank: 2 },
+  healthy: { mark: "✓", slack: ":large_green_circle: :tada:", paint: c.ok, rank: 0 },
+  degraded: { mark: "!", slack: ":large_yellow_circle: :eyes:", paint: c.warn, rank: 1 },
+  broken: { mark: "✗", slack: ":red_circle: :rotating_light:", paint: c.bad, rank: 2 },
 };
 
 // ---------------------------------------------------------------------------
@@ -112,13 +112,16 @@ Flags:
       --report           also write a Markdown report and a CSV of the errored
                          documents to the current directory
       --notify slack     also post the summary to the Slack incoming webhook in
-                         $${SLACK_ENV}; unset, the run fails before it starts
+                         $${SLACK_ENV}; unset, the run fails before it starts.
+                         slack:NAME posts to the webhook in $NAME instead, which
+                         is how each workspace gets its own channel
       --json             emit JSON instead of the report; never prompts
   -h, --help             show this help
 
 Environment:
   ${Object.values(REGIMES).map((r) => `${r.token.padEnd(36)} the ${r.label} workspace`).join("\n  ")}
-  ${SLACK_ENV.padEnd(36)} the Slack incoming webhook --notify slack posts to
+  ${SLACK_ENV.padEnd(36)} the Slack incoming webhook --notify slack posts to;
+  ${"".padEnd(36)} --notify slack:NAME reads $NAME instead
   INVOPOP_API_BASE_URL                 default ${DEFAULT_BASE_URL}
 
 Verdict:
@@ -159,7 +162,12 @@ function parseArgs(argv) {
   }
   if (o.regime !== null && !REGIMES[o.regime]) fail(`unknown regime: ${o.regime} — one of ${Object.keys(REGIMES).join(", ")}`, 2);
   if (!Number.isInteger(o.scan) || o.scan < PAGE) fail(`--scan takes a whole number of at least ${PAGE}`, 2);
-  if (o.notify !== null && o.notify !== "slack") fail(`--notify takes slack, got ${JSON.stringify(o.notify)}`, 2);
+  if (o.notify !== null) {
+    const m = /^slack(?::([A-Za-z_][A-Za-z0-9_]*))?$/.exec(o.notify);
+    if (!m) fail(`--notify takes slack or slack:VARIABLE, got ${JSON.stringify(o.notify)}`, 2);
+    o.notify = "slack";
+    o.slackEnv = m[1] || SLACK_ENV;
+  }
   o.sinceMs = parseSince(o.since);
   return o;
 }
@@ -564,19 +572,21 @@ function slackTable(headers, rows, widths) {
 async function notifySlack(r, url, files) {
   const v = VERDICT[r.verdict];
   const lines = [`${v.slack} *Invopop ${r.label}* — *${r.verdict}*${r.workspace ? ` · ${r.workspace.name}` : ""}`];
-  if (r.token_refused) lines.push(`token refused (${r.token_refused})`);
+  if (r.token_refused) lines.push(`:lock: token refused (${r.token_refused})`);
+  // Slack shortcodes, so they render as emoji whatever client reads them.
+  const counts = (by) => `:white_check_mark: ${by.ok} ok · :hourglass_flowing_sand: ${by.pending} pending · :x: ${by.error} error · :no_entry_sign: ${by.voided} voided${by.unknown ? ` · :grey_question: ${by.unknown} unknown` : ""}`;
   if (r.suppliers) {
     const s = r.suppliers.by_state;
-    lines.push(`*Suppliers:* ${r.suppliers.total} — ${s.ok} ok · ${s.pending} pending · ${s.error} error · ${s.voided} voided${s.unknown ? ` · ${s.unknown} unknown` : ""}`);
+    lines.push(`:office: *Suppliers:* ${r.suppliers.total} — ${counts(s)}`);
     lines.push(slackTable(["SUPPLIER", "TAX ID", "STATE", "ENTRIES", "LAST TRIED", "FAULT"], r.suppliers.errored.map((e) => [e.name || e.id, e.tax_id, e.state, String(e.entries), day(e.last_at), e.faults.join("; ") || "(no fault recorded)"]), [28, 13, 7, 7, 10, 48]));
   }
   if (r.documents) {
     const d = r.documents.by_state;
-    lines.push(`*Documents, last ${r.window}:* ${r.documents.total} — ${d.ok} ok · ${d.pending} pending · ${d.error} error · ${d.voided} voided${d.unknown ? ` · ${d.unknown} unknown` : ""}`);
+    lines.push(`:receipt: *Documents, last ${r.window}:* ${r.documents.total} — ${counts(d)}`);
     lines.push(slackTable(["DOCUMENT", "TYPE", "SUPPLIER", "TAX ID", "CREATED", "FAULT"], r.errored.map((e) => [e.number, e.type, e.supplier, e.tax_id, day(e.created_at), e.faults.join("; ") || "(no fault recorded)"]), [18, 11, 24, 13, 10, 48]));
   }
-  for (const n of r.notes) lines.push(`_note: ${n}_`);
-  if (files) lines.push(`_report: ${files.md}_`);
+  for (const n of r.notes) lines.push(`:warning: _${n}_`);
+  if (files) lines.push(`:page_facing_up: _${files.md}_`);
   const text = lines.filter(Boolean).join("\n");
   let res;
   try {
@@ -598,8 +608,9 @@ async function main() {
   const regime = REGIMES[o.regime];
   const token = (process.env[regime.token] || "").trim();
   if (!token) fail(`${regime.token} is not set — ops run asks for it, or: ops secrets set ${regime.token}`, 2);
-  const slack = o.notify === "slack" ? (process.env[SLACK_ENV] || "").trim() : null;
-  if (o.notify === "slack" && !slack) fail(`${SLACK_ENV} is not set — ops secrets set ${SLACK_ENV} (a Slack incoming webhook URL)`, 2);
+  const slack = o.notify === "slack" ? (process.env[o.slackEnv] || "").trim() : null;
+  if (o.notify === "slack" && !slack) fail(`${o.slackEnv} is not set — ops secrets set ${o.slackEnv} (a Slack incoming webhook URL)`, 2);
+  if (slack && !/^https:\/\/hooks\.slack\.com\//.test(slack)) fail(`${o.slackEnv} is not a Slack incoming webhook URL (it should start with https://hooks.slack.com/)`, 2);
 
   if (!o.json) process.stderr.write(c.faint(`GET ${o.baseUrl}/access/v1/workspace, /silo/v1/entries (suppliers, invoices since ${o.since}) — read-only\n`));
   const r = await build(o, regime, token);
