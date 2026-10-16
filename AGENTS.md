@@ -75,6 +75,16 @@ frozen — every update happens here.
   A section where every row is empty drops those columns instead of printing
   dashes — and so does one where the heading has already given the answer, which
   is why the ZATCA table has no COUNTRY or INTEGRATION column.
+- **A timer runs `ops run`, never the script.** `ops schedule add` hands launchd
+  (macOS) or crontab the same `ops run <script> …` line a person would type, from
+  the directory and PATH it was added in, so every firing is a run record carrying
+  the schedule's name (`OPS_SCHEDULE`, set only by the agent or crontab line) and
+  the script sees what a pipe gives it: no terminal, so it asks nothing and refuses
+  what needs a hand, by its own rules. ops adds no `--yes` for a timer any more than
+  for a person; a script meant to run unattended grows its own flag. Nothing secret
+  goes into the plist or the crontab line — the run loads .env as always. `--every`
+  on crontab only takes an interval that divides the hour or the day; `--cron` takes
+  the rest, and launchd gets it as calendar intervals.
 - **Truncate with `ui.clip`, never `slice`; measure with `ui.displayWidth`, never
   `.length`.** A rendered line changes colour several times, and slicing the plain
   text throws every escape away. Both helpers walk the string by grapheme, copying
@@ -147,6 +157,13 @@ ops task run -p K=V <script>  (env var reaches the script; -p AFTER the name goe
 ops task ls · --script · --status · --param K=V · --param K~V · --since 7d · -L · --json
 ops task get <id> [--json] · task logs <id> [--raw] · task rerun <id> · task cancel <id> (on a running one, and on a finished one -> exit 1)
 ops run <name>  (still works: same recorded path as task run)
+OPS_STATE_DIR=/tmp/s ops schedule add --name zz_probe --every 1d confirm_comarch_uat_queue --help  (scheduled line + asks/tier/secrets notes; plist in ~/Library/LaunchAgents, loaded)
+ops schedule add <script> (no --every/--cron, exit 2) · --every 5h --cron … (exit 2) · --every 7x · --cron "0 25 * * *" · --name "Bad Name" · add edit_document_payload (all exit 2)
+ops schedule ls · | cat · --json · get zz_probe · --rendered · --json · get nope (exit 1)
+ops schedule run zz_probe → ops task ls --schedule zz_probe (one completed run, By says the schedule) · ops task get <id> · ops schedule ls (LAST RUN filled)
+ops schedule add --name zz_probe --cron "0 */5 * * *" … (replaced, five calendar dicts in --rendered) · ops schedule rm zz_probe (plist gone, launchctl print exit 113) · rm again (exit 1)
+OPS_SCHEDULER=crontab ops schedule add --name zz_cron --every 6h … → crontab -l shows the marked line · --every 5h (exit 2, does not divide the day) · run · rm → crontab -l says "no crontab" again
+ops help schedules · ops schedule --help · ops completion zsh | grep schedule
 ops orion doctor · --json
 ops orion docs check · edit a summary → check fails → docs sync → git diff shows only marker regions
 ops orion script new zz_probe --lang js --env staging --access write  (on a scratch copy) → docs check green → run zz_probe --help
@@ -163,5 +180,8 @@ ops interactive: enter on a runbook (refused, footer says so) · the footer name
 ops interactive: a script with no domain still appears, under UNCLASSIFIED (a grouped view never drops a row)
 ops interactive: a script with no integration still appears, under "Any integration" — an absent scheme is the truth, not a gap
 ops interactive: enter on a run · l (and on one with captured: none) · r · x (on a finished one)
+ops interactive: tab to SCHEDULES · enter on one (record) · r (fires it; the run lands in the runs pane) · l (timer log, or "has not fired" when none) · x (removed, the row goes)
+ops interactive: s on a script → examples frame (shown even for an asks: true script) → how-often frame (footer names the ops schedule add line, warns when it replaces) → scheduled; esc on either frame sets nothing · s on a runbook refused
+ops schedule interactive (TTY: opens on the SCHEDULES pane, tab reaches the rest) · ops schedule interactive | cat (exit 2)
 ops interactive | cat (exit 2) · bare `ops` opens it, `ops | cat` still prints the short help · ops config set interactive.bare false → bare `ops` prints the short help
 ```
