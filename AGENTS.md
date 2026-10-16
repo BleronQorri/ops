@@ -85,6 +85,15 @@ frozen — every update happens here.
   goes into the plist or the crontab line — the run loads .env as always. `--every`
   on crontab only takes an interval that divides the hour or the day; `--cron` takes
   the rest, and launchd gets it as calendar intervals.
+- **The web page looks; the terminal runs.** `ops serve` binds 127.0.0.1 only,
+  refuses a request whose Host is not this machine, and takes a mutation only with
+  the `x-ops-local` header. It never reads .env and serves no secret value — a run
+  record's secret names, as `ops task get` shows them, and nothing more. Its buttons
+  are the verbs a timer could do (fire a schedule, remove it, stop a run), each
+  calling the same function the command does; it does not run scripts, because
+  they ask on a terminal and a tab has none. The page is one file under
+  `lib/orion/web/` with no framework and no CDN, so it works offline; the server is
+  node's http module. Commander stays the only dependency.
 - **Truncate with `ui.clip`, never `slice`; measure with `ui.displayWidth`, never
   `.length`.** A rendered line changes colour several times, and slicing the plain
   text throws every escape away. Both helpers walk the string by grapheme, copying
@@ -182,6 +191,7 @@ ops interactive: a script with no integration still appears, under "Any integrat
 ops interactive: enter on a run · l (and on one with captured: none) · r · x (on a finished one)
 ops interactive: tab to SCHEDULES · enter on one (record) · r (fires it; the run lands in the runs pane) · l (timer log, or "has not fired" when none) · x (removed, the row goes)
 ops interactive: s on a script → examples frame (shown even for an asks: true script) → how-often frame (footer names the ops schedule add line, warns when it replaces) → scheduled; esc on either frame sets nothing · s on a runbook refused
+ops serve --no-open (prints the URL) · curl -s localhost:7777/api/overview | jq '.schedules|length' · curl -s -H 'Host: evil.example:7777' localhost:7777/ (403) · curl -s -X POST localhost:7777/api/schedules/x/run (403 without x-ops-local) · with the header on a missing name (404) · curl /api/runs/<id>/log (text) · open it: three tabs, a script's page, a run's log, a schedule's firings with the confirmed count, fire now / remove / stop buttons · ops serve --port 70000 (exit 2) · a second ops serve on the same port (exit 2)
 ops schedule interactive (TTY: opens on the SCHEDULES pane, tab reaches the rest) · ops schedule interactive | cat (exit 2)
 ops interactive | cat (exit 2) · bare `ops` opens it, `ops | cat` still prints the short help · ops config set interactive.bare false → bare `ops` prints the short help
 ```
