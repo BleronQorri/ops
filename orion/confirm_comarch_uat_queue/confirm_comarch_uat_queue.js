@@ -73,6 +73,10 @@ Flags:
                          them, one batch at a time, each after "confirm" or
                          "confirm all" is picked (stop is highlighted to begin
                          with). A bare --dry-run means true
+      --confirm all      confirm every batch until the queue is empty without
+                         asking — what picking "confirm all" does, decided up
+                         front. Implies --dry-run false; this is the flag a timer
+                         (ops schedule) needs, since it has no terminal to pick on
   -h, --help             show this help
 
 Environment:
@@ -81,7 +85,8 @@ Environment:
                          them in; ops secrets set <name> saves one)
 
 Without a terminal nothing is asked: --queue and both credentials must be given,
-the run is a dry run, and --dry-run false is refused.
+and the run is a dry run unless --confirm all says otherwise; --dry-run false on
+its own is refused, because each batch would need a hand.
 
 Exit codes: 0 done, 1 an API call failed or the operator stopped it, 2 the call was wrong.
 `;
@@ -93,7 +98,7 @@ function fail(message, code) {
 }
 
 function parseArgs(argv) {
-  const o = { queue: null, dryRun: null };
+  const o = { queue: null, dryRun: null, confirmAll: false };
   const val = (flag, v) => {
     if (v === undefined || v.startsWith("-")) fail(`${flag} takes a value`, 2);
     return v;
@@ -110,6 +115,8 @@ function parseArgs(argv) {
       else o.dryRun = true;
     }
     else if (a.startsWith("--dry-run=")) o.dryRun = boolOf(a.slice("--dry-run=".length));
+    else if (a === "--confirm") o.confirmAll = confirmOf(val(a, argv[++i]));
+    else if (a.startsWith("--confirm=")) o.confirmAll = confirmOf(a.slice("--confirm=".length));
     else if (a.startsWith("-")) fail(`unknown flag: ${a}`, 2);
     else fail(`unexpected argument ${JSON.stringify(a)} — the queue is --queue ${QUEUES.join("|")}`, 2);
   }
@@ -120,6 +127,13 @@ function queueOf(v) {
   const q = String(v).toLowerCase();
   if (!QUEUES.includes(q)) fail(`--queue takes ${QUEUES.join(", ")}, got ${JSON.stringify(v)}`, 2);
   return q;
+}
+
+// The only value is "all": there is no "--confirm one" — one batch at a time is
+// what the picker is for.
+function confirmOf(v) {
+  if (v !== "all") fail(`--confirm takes all, got ${JSON.stringify(v)}`, 2);
+  return true;
 }
 
 function boolOf(v) {
@@ -178,14 +192,19 @@ function choose(question, options) {
 }
 
 // Asks for whatever the flags left out, with pickers only. Without a terminal
-// nothing is asked: the queue must be given, and the run is a dry run.
+// nothing is asked: the queue must be given, and the run is a dry run unless
+// --confirm all has already answered every picker there would have been.
 async function askMissing(o) {
   for (const name of ["COMARCH_UAT_LOGIN", "COMARCH_UAT_PASSWORD"]) {
     if (!process.env[name]) fail(`${name} is not set — ops run asks for it, or: ops secrets set ${name}`, 2);
   }
+  if (o.confirmAll) {
+    if (o.dryRun === true) fail("--confirm all and --dry-run true contradict each other: one confirms, the other confirms nothing", 2);
+    o.dryRun = false;
+  }
   if (!TERMINAL) {
     if (!o.queue) fail(`no queue given — --queue ${QUEUES.join("|")}`, 2);
-    if (o.dryRun === false) fail("--dry-run false needs a terminal: every batch is confirmed by hand", 2);
+    if (o.dryRun === false && !o.confirmAll) fail("--dry-run false needs a terminal: every batch is confirmed by hand — --confirm all confirms them without one", 2);
     o.dryRun = true;
   } else {
     if (!o.queue) {
@@ -289,12 +308,13 @@ function listRecords(records, limit = 25) {
 // stops; returns false only when the operator stopped before a batch.
 async function runQueue(opts, headers) {
   const configId = CONFIG_IDS[opts.queue];
-  process.stdout.write(`\n${c.header("confirm_comarch_uat_queue")} ${opts.queue} — ${c.warn("staging (Comarch UAT)")}, DRY_RUN=${opts.dryRun} — ${opts.execute ? c.warn("confirms each batch after you pick confirm") : "lists the queue only"}\n`);
+  const mode = !opts.execute ? "lists the queue only" : opts.confirmAll ? c.warn("confirms every batch without asking (--confirm all)") : c.warn("confirms each batch after you pick confirm");
+  process.stdout.write(`\n${c.header("confirm_comarch_uat_queue")} ${opts.queue} — ${c.warn("staging (Comarch UAT)")}, DRY_RUN=${opts.dryRun} — ${mode}\n`);
   console.log(`Base URL: ${BASE_URL}`);
   console.log(`Using ${opts.queue} queue (ConfigId=${configId})`);
 
   let confirmed = 0;
-  let confirmAll = false;
+  let confirmAll = opts.confirmAll;
   while (true) {
     console.log("Fetching sent records...");
     const records = await fetchSent(headers, configId);

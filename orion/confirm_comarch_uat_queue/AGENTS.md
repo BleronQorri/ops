@@ -18,6 +18,8 @@ examples:
     note: list the invoice queue's sent items; confirm nothing
   - args: "--queue aperak --dry-run false"
     note: confirm the aperak queue's sent items, each batch after picking confirm or confirm all
+  - args: "--queue invoice --confirm all"
+    note: confirm every batch until the queue is empty without asking — the form a timer runs
 ---
 # confirm_comarch_uat_queue
 
@@ -37,7 +39,9 @@ examples:
   (highlighted to begin with) sends nothing more, `confirm` confirms that batch
   (`POST /api/status/sent/confirm`) and asks again on the next one, and
   `confirm all` confirms it and every next batch without asking until the queue
-  comes back empty. Esc stops the run.
+  comes back empty. Esc stops the run. `--confirm all` is that last choice made
+  up front: no picker, every batch confirmed until the queue is empty, and it
+  implies `--dry-run false` — which is why it is the form `ops schedule` runs.
 - When the queue was picked rather than given with `--queue`, a `What next?`
   picker follows each queue: `done` exits, `another queue` asks for the queue
   (and the dry run, unless `--dry-run` was given) again. `asks: true` makes
@@ -48,7 +52,8 @@ examples:
 UAT-only: the base URL is hardcoded to the UAT host — there is no production
 path in this script, so it asks no environment question and names Comarch UAT in
 its banner. Without a terminal it asks nothing: `--queue` must be given, and the
-run is a dry run.
+run is a dry run unless `--confirm all` was given — the one flag that confirms
+with nobody watching, which is acceptable because the target is UAT.
 
 ## Prereqs
 
