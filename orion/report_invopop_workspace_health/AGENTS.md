@@ -19,7 +19,7 @@ examples:
   - args: "--regime smart_receipts --since 3d --report"
     note: the IT workspace over three days, with the Markdown and CSV in the current directory
   - args: "--regime smart_receipts --report --notify slack"
-    note: the form a daily timer runs — the report on disk and the summary in Slack
+    note: the form the weekly timer runs — the report on disk and the summary in Slack
   - args: "--regime verifactu --report --notify slack:SLACK_WEBHOOK_URL_ES"
     note: the same, posted to the webhook saved under that name — one channel per workspace
   - args: "--regime verifactu --json"
@@ -60,8 +60,9 @@ each one lands every morning without one workspace's trouble hiding another's.
 6. **Where it goes** — the report on stdout; with `--report` a Markdown report
    and a CSV of the errored documents in the current directory; with
    `--notify slack` a summary posted to the incoming webhook in
-   `SLACK_WEBHOOK_URL` (verdict, counts, a table of every supplier in error and
-   of every failed document, the report's path). `--notify slack:NAME` posts to
+   `SLACK_WEBHOOK_URL` (verdict, counts, every supplier in error and every
+   failed document as a line linking to its silo page in the console, the
+   report's path). `--notify slack:NAME` posts to
    the webhook saved under `NAME` instead, so each workspace's timer can have
    its own channel: save one with `ops secrets set SLACK_WEBHOOK_URL_ES` and
    name it on that timer. Every value in .env reaches the run, declared or not.
@@ -98,8 +99,8 @@ outbound write and it goes to a webhook you created. Without a terminal
 mkdir -p ~/reports/invopop-health && cd ~/reports/invopop-health
 ops secrets set SLACK_WEBHOOK_URL_ES
 ops secrets set SLACK_WEBHOOK_URL_IT
-ops schedule add --name health_es --cron "0 7 * * *" report_invopop_workspace_health --regime verifactu --report --notify slack:SLACK_WEBHOOK_URL_ES
-ops schedule add --name health_it --cron "0 7 * * *" report_invopop_workspace_health --regime smart_receipts --report --notify slack:SLACK_WEBHOOK_URL_IT
+ops schedule add --name health_es --cron "0 7 * * 1" report_invopop_workspace_health --regime verifactu --report --notify slack:SLACK_WEBHOOK_URL_ES
+ops schedule add --name health_it --cron "0 7 * * 1" report_invopop_workspace_health --regime smart_receipts --report --notify slack:SLACK_WEBHOOK_URL_IT
 ```
 
 One timer per workspace, from the directory the reports should land in, each

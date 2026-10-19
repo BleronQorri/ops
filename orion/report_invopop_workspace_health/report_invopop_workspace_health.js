@@ -545,9 +545,11 @@ function writeReport(r) {
   return { md, csv };
 }
 
-// Slack has no table markup, so a table is a code block with the columns padded
-// by hand. Cells are clipped so a long fault does not push the rest off screen.
+// Slack has no table markup, and a link inside a code block is dead text, so each
+// supplier or document in error is one line with its console (silo) page as the
+// link. Faults are clipped so one long complaint does not swallow the message.
 const SLACK_ROWS = 40;
+const SLACK_FAULT = 120;
 
 // The day of an ISO timestamp, or nothing.
 function day(iso) {
@@ -559,16 +561,30 @@ function clip(s, n) {
   return t.length <= n ? t : t.slice(0, n - 1) + "…";
 }
 
-function slackTable(headers, rows, widths) {
-  if (!rows.length) return "";
-  const line = (cells) => cells.map((cell, i) => clip(cell, widths[i]).padEnd(widths[i])).join("  ").trimEnd();
-  const body = rows.slice(0, SLACK_ROWS).map(line);
-  const more = rows.length > SLACK_ROWS ? [`… and ${rows.length - SLACK_ROWS} more — the report has them all`] : [];
-  return "\n```\n" + [line(headers), ...body, ...more].join("\n") + "\n```";
+// Slack mrkdwn: the three characters it reads as markup are escaped, and a link
+// is <url|text>; an entry without a console page is printed in bold instead.
+function mrkdwn(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function slackLink(text, url) {
+  return url ? `<${url}|${mrkdwn(text)}>` : `*${mrkdwn(text)}*`;
+}
+
+// One line per entry: the linked name first, the facts dot-separated, the fault
+// after a dash. Empty cells are dropped rather than printed as gaps.
+function slackLine(link, cells, fault) {
+  return [link, ...cells.filter(Boolean)].join(" · ") + ` — ${mrkdwn(clip(fault || "(no fault recorded)", SLACK_FAULT))}`;
+}
+
+function slackRows(rows) {
+  const body = rows.slice(0, SLACK_ROWS).map((r) => `• ${r}`);
+  const more = rows.length > SLACK_ROWS ? [`• … and ${rows.length - SLACK_ROWS} more — the report has them all`] : [];
+  return [...body, ...more].join("\n");
 }
 
 // One message to the incoming webhook: the verdict, the counts, every supplier
-// in error as a table, and every failed document as another.
+// in error as a line linking to its silo page, and every failed document as another.
 async function notifySlack(r, url, files) {
   const v = VERDICT[r.verdict];
   const lines = [`${v.slack} *Invopop ${r.label}* — *${r.verdict}*${r.workspace ? ` · ${r.workspace.name}` : ""}`];
@@ -578,12 +594,12 @@ async function notifySlack(r, url, files) {
   if (r.suppliers) {
     const s = r.suppliers.by_state;
     lines.push(`:office: *Suppliers:* ${r.suppliers.total} — ${counts(s)}`);
-    lines.push(slackTable(["SUPPLIER", "TAX ID", "STATE", "ENTRIES", "LAST TRIED", "FAULT"], r.suppliers.errored.map((e) => [e.name || e.id, e.tax_id, e.state, String(e.entries), day(e.last_at), e.faults.join("; ") || "(no fault recorded)"]), [28, 13, 7, 7, 10, 48]));
+    lines.push(slackRows(r.suppliers.errored.map((e) => slackLine(slackLink(e.name || e.id, e.url), [mrkdwn(e.tax_id), e.state, e.entries > 1 && `${e.entries} entries`, e.last_at && `last tried ${day(e.last_at)}`], e.faults.join("; ")))));
   }
   if (r.documents) {
     const d = r.documents.by_state;
     lines.push(`:receipt: *Documents, last ${r.window}:* ${r.documents.total} — ${counts(d)}`);
-    lines.push(slackTable(["DOCUMENT", "TYPE", "SUPPLIER", "TAX ID", "CREATED", "FAULT"], r.errored.map((e) => [e.number, e.type, e.supplier, e.tax_id, day(e.created_at), e.faults.join("; ") || "(no fault recorded)"]), [18, 11, 24, 13, 10, 48]));
+    lines.push(slackRows(r.errored.map((e) => slackLine(slackLink(e.number, e.url), [e.type, mrkdwn(e.supplier), mrkdwn(e.tax_id), day(e.created_at)], e.faults.join("; ")))));
   }
   for (const n of r.notes) lines.push(`:warning: _${n}_`);
   if (files) lines.push(`:page_facing_up: _${files.md}_`);
