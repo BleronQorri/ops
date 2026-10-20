@@ -10,9 +10,10 @@
 //
 // 1. Reads an IssueEInvoice command export (CSV, one row per line) and keeps the
 //    standard (B2B) invoices: the buyer passes KSAB2BReportability.reportable_as_b2b?.
-// 2. Builds each one the way Comarch's B2BInvoiceXMLBuilder does on main
-//    (InvoiceBuilderBlocks + InvoiceCalculationHelper), then puts those same
-//    numbers in a GOBL invoice tagged `bypass`, so GOBL calculates nothing.
+// 2. Builds each one twice from the same BillingDocument: the way Comarch's
+//    B2BInvoiceXMLBuilder does on main (InvoiceBuilderBlocks +
+//    InvoiceCalculationHelper), and the way InvoiceGoblBuilder +
+//    TotalsGoblBuilder do on main since #2225 (tagged `bypass`).
 // 3. Sends it like Zatca.Invoice.dispatch_submission: a draft Silo entry in
 //    "invoices", then a Transform job on the sandbox's webhook-less ZATCA workflow.
 // 4. Waits for the job, then a few seconds more, and downloads the Silo entry and
@@ -302,31 +303,106 @@ function comarchXml(doc, k) {
   ].join("");
 }
 
-// --- Invopop: the same numbers as a GOBL invoice tagged bypass ----------------------
+// --- Invopop: InvoiceGoblBuilder + TotalsGoblBuilder on main (#2225, `bypass`) ------
 
-// InvoiceGoblBuilder on main, with every amount taken from the Comarch values
-// instead of recalculated: `bypass` stops GOBL from calculating, so these are the
-// totals ZATCA gets. A zero time becomes 00:00:01 (GOBL-ENVELOPE-11).
+// The GOBL is built from the same BillingDocument, the way app-accounting-documents
+// builds it on main since #2225 — not from the Comarch values — so a difference
+// between the two builders shows up as a 🔴. When a builder changes there, change
+// it here.
+//
+// Elixir's Decimal keeps a scale: "655.8" prints as "655.8", a sum started from
+// "0.00" prints with at least two places, a difference keeps the larger scale.
+// The strings in the GOBL depend on it, so it is modelled here: { v, s } is
+// v × 10^-s.
+const D = (str) => {
+  const m = /^\s*(-?)(\d*)(?:\.(\d*))?\s*$/.exec(String(str ?? ""));
+  if (!m) throw new Error(`not a decimal: ${str}`);
+  const frac = m[3] || "";
+  const v = BigInt(`${m[2] || "0"}${frac}`);
+  return { v: m[1] ? -v : v, s: frac.length };
+};
+const rescale = (a, s) => a.v * 10n ** BigInt(s - a.s);
+const dAdd = (a, b) => {
+  const s = Math.max(a.s, b.s);
+  return { v: rescale(a, s) + rescale(b, s), s };
+};
+const dSub = (a, b) => dAdd(a, { v: -b.v, s: b.s });
+const dStr = ({ v, s }) => {
+  const neg = v < 0n;
+  const digits = (neg ? -v : v).toString().padStart(s + 1, "0");
+  return `${neg ? "-" : ""}${s ? `${digits.slice(0, -s)}.${digits.slice(-s)}` : digits}`;
+};
+const dCmp0 = (a) => (a.v > 0n ? 1 : a.v < 0n ? -1 : 0);
+
 const OUTSIDE_SCOPE_VATEX = "VATEX-SA-OOS";
 
-function taxCombo(rate) {
-  if (rate > 0n) return { cat: "VAT", key: "standard", percent: `${fmt(rate, 2)}%`, ext: { "untdid-tax-category": "S" } };
+// InvoiceCalculationHelper.get_total_tax_rate: summed from "0.0", never below zero.
+function totalRateDecimal(taxItems) {
+  const r = (taxItems || []).reduce((acc, t) => dAdd(acc, D(t.rate)), D("0.0"));
+  return dCmp0(r) > 0 ? r : D("0.0");
+}
+
+// calculate_unit_net_price: Decimal.div then Decimal.round(6), printed with six
+// places; a zero gross is "0.0".
+function goblUnitPrice(item) {
+  if (dCmp0(D(item.unit_gross)) === 0) return "0.0";
+  return fmt(unitNetPrice(item), 6);
+}
+
+// One VAT combo per line at the summed rate of its tax items.
+function buildTax(item) {
+  const rate = totalRateDecimal(item.tax_items);
+  if (dCmp0(rate) > 0) return { cat: "VAT", key: "standard", percent: `${dStr(rate)}%`, ext: { "untdid-tax-category": "S" } };
   return { cat: "VAT", key: "outside-scope", ext: { "untdid-tax-category": "O", "cef-vatex": OUTSIDE_SCOPE_VATEX } };
 }
 
+// TotalsGoblBuilder: every amount summed from the lines, from "0.00"; a line's VAT
+// is its gross less its net. Lines group by the rate's value (15.0 and 15.00 are
+// one rate); the rate keeps the first line's percent string.
+function buildTotals(items) {
+  const add = (xs) => xs.reduce((acc, x) => dAdd(acc, x), D("0.00"));
+  const groups = new Map();
+  for (const item of items) {
+    const combo = buildTax(item);
+    const key = combo.percent ? `${combo.key}|${fmt(dec(combo.percent.replace(/%$/, "")), 6)}` : combo.key;
+    if (!groups.has(key)) groups.set(key, { combo, items: [] });
+    groups.get(key).items.push(item);
+  }
+  // A map keyed by the combo orders the smaller key (outside-scope, no percent) first.
+  const ordered = [...groups.values()].sort((a, b) => Object.keys(a.combo).length - Object.keys(b.combo).length);
+  const rates = ordered.map(({ combo, items: group }) => ({
+    key: combo.key,
+    ...(combo.percent ? { percent: combo.percent } : {}),
+    ext: combo.ext,
+    base: add(group.map((i) => D(i.total_net))),
+    amount: add(group.map((i) => dSub(D(i.total_gross), D(i.total_net)))),
+  }));
+  const tax = add(rates.map((r) => r.amount));
+  const net = add(items.map((i) => D(i.total_net)));
+  const gross = add(items.map((i) => D(i.total_gross)));
+  return {
+    sum: dStr(net),
+    total: dStr(net),
+    taxes: { categories: [{ code: "VAT", rates: rates.map((r) => ({ ...r, base: dStr(r.base), amount: dStr(r.amount) })), amount: dStr(tax) }], sum: dStr(tax) },
+    tax: dStr(tax),
+    total_with_tax: dStr(gross),
+    payable: dStr(gross),
+  };
+}
+
+// PartyGoblBuilder: the district is street_extra, the city locality; blank keys go.
 function buildAddress(party) {
   const a = { num: party.building_number, street: party.street, street_extra: party.district, locality: party.city, region: party.province, code: party.postal_code, country: party.country_code };
-  return Object.fromEntries(Object.entries(a).filter(([, v]) => !blank(v)));
+  return Object.fromEntries(Object.entries(a).filter(([, v]) => v !== null && v !== undefined && v !== ""));
 }
 
 const buildParty = (p) => ({ name: p.name, identities: [{ type: "CRN", code: p.company_registration_number }], addresses: [buildAddress(p)] });
 
-function buildGobl(k, issuer, issuee) {
-  const rates = k.summaryLines.map((s) => {
-    const combo = taxCombo(s.rate);
-    return { key: combo.key, ...(combo.percent ? { percent: combo.percent } : {}), ext: combo.ext, base: fmt(s.taxable, 2), amount: fmt(s.tax, 2) };
-  });
-  const rateTax = sum(k.summaryLines.map((s) => s.tax));
+// InvoiceGoblBuilder.build: a standard invoice tagged bypass. The invoice date
+// keeps its wall clock; a date alone is midnight, and midnight becomes 00:00:01
+// (GOBL-ENVELOPE-11).
+function buildGobl(doc, number, issuer) {
+  const [issueDate, time] = splitDate(doc.invoice_date);
   return {
     $schema: "https://gobl.org/draft-0/bill/invoice",
     $addons: ["sa-zatca-v1"],
@@ -334,33 +410,26 @@ function buildGobl(k, issuer, issuee) {
     $tags: ["bypass"],
     uuid: crypto.randomUUID(),
     type: "standard",
-    code: k.number,
-    issue_date: k.date,
-    issue_time: k.time === "00:00:00" ? "00:00:01" : k.time,
+    code: number,
+    issue_date: issueDate,
+    issue_time: time === "00:00:00" ? "00:00:01" : time,
     currency: "SAR",
     supplier: { ...buildParty(issuer), tax_id: { country: issuer.country_code, code: issuer.tax_number } },
-    customer: buildParty(issuee),
-    delivery: { date: k.date },
+    customer: buildParty(doc.issuee),
+    delivery: { date: issueDate },
     payment: {
       instructions: { key: "other", ext: { "untdid-payment-means": "42" } },
       terms: { key: "instant", notes: "Payment on receipt of invoice" },
     },
-    lines: k.lines.map((l) => ({
-      i: l.number,
-      quantity: fmt(l.quantity, 0),
-      item: { name: l.name, price: fmt(l.unitNetPrice, 6), unit: "piece" },
-      sum: fmt(l.net, 2),
-      total: fmt(l.net, 2),
-      taxes: [taxCombo(l.rate)],
+    lines: doc.items.map((item, i) => ({
+      i: i + 1,
+      quantity: String(item.quantity),
+      item: { name: item.name, price: goblUnitPrice(item), unit: "piece" },
+      sum: dStr(D(item.total_net)),
+      total: dStr(D(item.total_net)),
+      taxes: [buildTax(item)],
     })),
-    totals: {
-      sum: fmt(k.net, 2),
-      total: fmt(k.taxableBasis, 2),
-      taxes: { categories: [{ code: "VAT", rates, amount: fmt(rateTax, 2) }], sum: fmt(rateTax, 2) },
-      tax: fmt(k.tax, 2),
-      total_with_tax: fmt(k.gross, 2),
-      payable: fmt(k.payable, 2),
-    },
+    totals: buildTotals(doc.items),
   };
 }
 
@@ -941,7 +1010,7 @@ async function main() {
   const run = new Date().toISOString().replace(/\D/g, "").slice(2, 12);
   const docs = picked.map((d, i) => {
     const k = buildComarch(d, `${d.receipt_number}-T${run}`);
-    return { source: d, key: `zatca-comarch-parity-${run}-${i + 1}`, comarch: k, xml: comarchXml(d, k), gobl: buildGobl(k, issuer, d.issuee) };
+    return { source: d, key: `zatca-comarch-parity-${run}-${i + 1}`, comarch: k, xml: comarchXml(d, k), gobl: buildGobl(d, k.number, issuer) };
   });
 
   if (o.dryRun) {
