@@ -8,6 +8,7 @@ invoice-payloads-*.csv
 invoice-payloads-*.sql
 invopop-health-<regime>-<YYYY-MM-DD>.csv
 invopop-health-<regime>-<YYYY-MM-DD>.md
+invopop-parity-*
 invopop_entries_*.csv
 invopop_report_*.md
 it-receipt-errors-*.csv
